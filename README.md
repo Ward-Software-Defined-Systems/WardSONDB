@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/wardsondb-logo.png" alt="WardSONDB" width="100%">
+</p>
+
 # WardSONDB
 
 A lightweight, high-performance JSON document database built in Rust. Designed for SIEM and security event workloads — fast ingest, indexed queries, aggregation pipelines, and automatic data retention in a single binary.
