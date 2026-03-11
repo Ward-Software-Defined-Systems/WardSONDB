@@ -1,0 +1,34 @@
+# Rust build output
+/target
+
+# Database data directory (runtime data, not source)
+/data
+
+# Log files
+*.log
+
+# TLS certificates (auto-generated or custom)
+*.pem
+*.key
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# API key files
+*.keys
+keys.txt
+
+# Internal working docs
+CLAUDE.md
+ARCHITECTURE.md
+PHASE3-INSTRUCTIONS.md
+PHASE3-PERF-INSTRUCTIONS.md
+SECURITY-FIX-INSTRUCTIONS.md
+COMPACTION-STATUS-INSTRUCTIONS.md
+PRE-PUSH-CLEANUP.md
