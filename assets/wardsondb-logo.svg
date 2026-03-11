@@ -107,8 +107,8 @@
   <!-- GitHub URL -->
   <text x="433" y="505" font-family="JetBrains Mono, SF Mono, Consolas, monospace" font-size="12" fill="#3B82F6">github.com/Ward-Software-Defined-Systems/WardSONDB</text>
   
-  <!-- Rust logo mark (small, bottom right) -->
-  <g transform="translate(1100, 560)">
+  <!-- Rust logo mark (bottom right) -->
+  <g transform="translate(1020, 560)">
     <text x="0" y="0" font-family="Inter, SF Pro Display, sans-serif" font-size="12" fill="#64748B">Built with</text>
     <text x="70" y="0" font-family="Inter, SF Pro Display, sans-serif" font-size="12" font-weight="700" fill="#F74C00">Rust</text>
   </g>
