@@ -67,6 +67,7 @@ async fn main() {
 
     // Open storage
     let data_dir = Path::new(&config.data_dir);
+    std::fs::create_dir_all(data_dir).expect("Failed to create data directory");
     let storage = Storage::open(data_dir).expect("Failed to open database");
     info!(data_dir = %config.data_dir, "Database opened");
 
