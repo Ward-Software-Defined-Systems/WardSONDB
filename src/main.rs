@@ -68,7 +68,14 @@ async fn main() {
     // Open storage
     let data_dir = Path::new(&config.data_dir);
     std::fs::create_dir_all(data_dir).expect("Failed to create data directory");
-    let storage = Storage::open(data_dir).expect("Failed to open database");
+    let mem_config = engine::storage::MemoryConfig {
+        cache_size: config.cache_size_mb * 1024 * 1024,
+        max_write_buffer_size: config.write_buffer_mb * 1024 * 1024,
+        max_memtable_size: config.memtable_mb * 1024 * 1024,
+        flush_workers: config.flush_workers,
+        compaction_workers: config.compaction_workers,
+    };
+    let storage = Storage::open_with_config(data_dir, mem_config).expect("Failed to open database");
     info!(data_dir = %config.data_dir, "Database opened");
 
     let metrics = Arc::new(Metrics::new());

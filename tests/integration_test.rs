@@ -25,6 +25,11 @@ fn test_config(tmp: &TempDir, port: u16) -> Config {
         api_key_file: None,
         query_timeout: 30,
         metrics_public: false,
+        cache_size_mb: 64,
+        write_buffer_mb: 64,
+        memtable_mb: 8,
+        flush_workers: 2,
+        compaction_workers: 2,
     }
 }
 

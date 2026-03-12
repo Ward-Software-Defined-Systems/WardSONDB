@@ -58,7 +58,8 @@ cargo build --release
 
 # Production — TLS, custom port, API key auth
 ulimit -n 65536
-./target/release/wardsondb --tls --port 443 --data-dir /var/lib/wardsondb --api-key "your-secret-key"
+./target/release/wardsondb --tls --port 443 --data-dir /var/lib/wardsondb --api-key "your-secret-key" \
+  --cache-size-mb 512 --write-buffer-mb 512 --flush-workers 4 --compaction-workers 4
 ```
 
 ### Create a collection and insert data
@@ -173,6 +174,11 @@ curl -X PUT http://localhost:8080/events/ttl \
 | `--log-level` | `info` | Log level (trace/debug/info/warn/error) |
 | `--log-file` | `wardsondb.log` | Log file path |
 | `--verbose` | `false` | Show per-request logs in terminal |
+| `--cache-size-mb` | `64` | Block + blob cache size in MiB (shared across all partitions) |
+| `--write-buffer-mb` | `64` | Max write buffer size in MiB (total across all partitions) |
+| `--memtable-mb` | `8` | Max memtable size in MiB per partition (triggers flush when exceeded) |
+| `--flush-workers` | `2` | Number of background flush worker threads |
+| `--compaction-workers` | `2` | Number of background compaction worker threads |
 
 ## API Overview
 
@@ -218,6 +224,30 @@ Full API documentation: [API.md](API.md)
 | GET | `/{collection}/ttl` | Get retention policy |
 | DELETE | `/{collection}/ttl` | Remove retention policy |
 
+## Memory Tuning
+
+WardSONDB uses conservative defaults (64 MiB cache, 64 MiB write buffer, 2 flush/compaction workers) suitable for resource-constrained environments. For high-memory systems handling millions of documents, increase these values to avoid write buffer saturation and compaction bottlenecks.
+
+```bash
+# Recommended for systems with 32GB+ RAM and heavy write workloads
+./target/release/wardsondb --tls \
+  --cache-size-mb 512 \
+  --write-buffer-mb 512 \
+  --memtable-mb 32 \
+  --flush-workers 4 \
+  --compaction-workers 4
+```
+
+| Parameter | Default | High-Memory Recommendation | Purpose |
+|-----------|---------|---------------------------|---------|
+| `--cache-size-mb` | 64 | 512+ | Read cache — larger values reduce disk reads for repeated queries |
+| `--write-buffer-mb` | 64 | 512+ | Write buffer — prevents write saturation during sustained ingest |
+| `--memtable-mb` | 8 | 32 | Per-partition memtable — larger values reduce flush frequency |
+| `--flush-workers` | 2 | 4 | Parallel flush threads — scale with available CPU cores |
+| `--compaction-workers` | 2 | 4 | Parallel compaction threads — scale with available CPU cores |
+
+**Symptoms of undersized configuration:** Console floods with `write halt because of write buffer saturation`, query latencies spike, `/_health` reports `write_pressure: "high"`.
+
 ## File Descriptor Limit
 
 WardSONDB requires `ulimit -n` of at least **4096** for production use. The server will warn on startup if the limit is too low and attempt to auto-raise it.
@@ -246,7 +276,7 @@ WardSONDB is designed for trusted network environments. Below are security consi
 
 | Issue | Status | Description |
 |---|---|---|
-| High RSS memory usage at scale | **Expected behavior** | At 2M+ documents, the OS-reported RSS can grow to consume 80-90% of system memory. This is standard behavior across all mmap-based storage engines (RocksDB, LMDB, LevelDB) where memory-mapped SST files are counted as RSS by the OS kernel. The actual heap usage is bounded by the configured limits (64 MiB cache, 64 MiB write buffer). The inflated RSS number reflects OS page cache, not application memory consumption — macOS is particularly aggressive about reporting mmap regions as RSS. macOS may terminate the process under memory pressure (Jetsam). Workaround: ensure adequate system memory and avoid running memory-intensive applications alongside WardSONDB on the same host. |
+| High RSS memory usage at scale | **Expected behavior** | At 2M+ documents, the OS-reported RSS can grow to consume 80-90% of system memory. This is standard behavior across all mmap-based storage engines (RocksDB, LMDB, LevelDB) where memory-mapped SST files are counted as RSS by the OS kernel. The actual heap usage is bounded by the configured limits (see Memory Tuning section). The inflated RSS number reflects OS page cache, not application memory consumption — macOS is particularly aggressive about reporting mmap regions as RSS. macOS may terminate the process under memory pressure (Jetsam). Workaround: ensure adequate system memory and avoid running memory-intensive applications alongside WardSONDB on the same host. |
 | Full-scan queries slow at 2M+ documents | **Known limitation** | Queries on unindexed fields require a full collection scan. At 2M+ documents, unindexed queries can take 5-15 seconds depending on hardware and concurrent load. Concurrent full-scan queries compound the problem, potentially triggering the 30-second query timeout. Mitigation: create indexes on frequently queried fields and ensure SIEM dashboard queries include indexed filters (e.g., time ranges via `received_at`). |
 | Compaction storm during bulk ingest with many indexes | **Known limitation** | Creating multiple indexes before or during heavy bulk ingest can trigger a compaction storm — fjall's background compaction workers saturate all CPU cores, making the server unresponsive to queries and health checks. This occurs because each inserted document writes to every index, generating massive write amplification. The server remains alive but cannot serve requests until compaction completes. Mitigation: create indexes *after* initial bulk ingest completes, create them one at a time with pauses between each, and monitor the `write_pressure` field in `GET /_health` — defer queries while it reports `"high"`. |
 

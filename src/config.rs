@@ -63,4 +63,24 @@ pub struct Config {
     /// Make /_metrics endpoint publicly accessible (bypasses auth)
     #[arg(long, default_value_t = false)]
     pub metrics_public: bool,
+
+    /// Cache size in MiB (block + blob cache shared across all partitions)
+    #[arg(long, default_value = "64")]
+    pub cache_size_mb: u64,
+
+    /// Max write buffer size in MiB (total across all partitions)
+    #[arg(long, default_value = "64")]
+    pub write_buffer_mb: u64,
+
+    /// Max memtable size in MiB (per partition, triggers flush when exceeded)
+    #[arg(long, default_value = "8")]
+    pub memtable_mb: u32,
+
+    /// Number of background flush worker threads
+    #[arg(long, default_value = "2")]
+    pub flush_workers: usize,
+
+    /// Number of background compaction worker threads
+    #[arg(long, default_value = "2")]
+    pub compaction_workers: usize,
 }

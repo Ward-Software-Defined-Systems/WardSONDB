@@ -96,6 +96,7 @@ pub struct Storage {
 }
 
 impl Storage {
+    #[allow(dead_code)]
     pub fn open(data_dir: &Path) -> Result<Self, AppError> {
         Self::open_with_config(data_dir, MemoryConfig::default())
     }
