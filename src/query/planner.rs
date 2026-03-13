@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use serde_json::Value;
 
+use crate::engine::bitmap::ScanAccelerator;
 use crate::index::IndexManager;
 use crate::index::secondary::value_to_sortable_bytes;
 
@@ -39,6 +40,19 @@ pub enum ScanPlan {
     /// Compound equality scan — multiple equality fields covered by one compound index.
     CompoundEq { index_name: String, prefix: Vec<u8> },
 
+    /// Compound index: equality prefix + range on next field.
+    /// Example: event_type = "firewall" AND received_at >= "2026-03-12"
+    /// Uses idx_type_time to seek to "firewall" prefix, then range scan on received_at.
+    CompoundRange {
+        index_name: String,
+        /// Serialized prefix from equality fields (WITH trailing 0x01 separator)
+        eq_prefix: Vec<u8>,
+        /// Lower bound for the range field (sortable bytes), and whether inclusive
+        lower: Option<(Vec<u8>, bool)>,
+        /// Upper bound for the range field (sortable bytes), and whether inclusive
+        upper: Option<(Vec<u8>, bool)>,
+    },
+
     /// Sorted index scan with early termination.
     /// A compound index covers both the filter field(s) and the sort field,
     /// allowing us to iterate in sort order and stop after offset+limit docs.
@@ -47,6 +61,12 @@ pub enum ScanPlan {
         prefix: Vec<u8>,
         reverse: bool,
     },
+
+    /// Bitmap scan — scan accelerator covers the filter (or part of it).
+    /// BitmapScan does NOT help with sort order — after getting bitmap results,
+    /// matching docs are loaded and sorted in memory. For queries with sort + limit
+    /// where a compound index exists, IndexSorted (higher priority) will be chosen instead.
+    BitmapScan,
 }
 
 /// The result of planning: a scan strategy + optional residual filter.
@@ -66,6 +86,7 @@ pub fn plan_query(
     sort: &[SortField],
     limit: u64,
     count_only: bool,
+    scan_accelerator: &ScanAccelerator,
 ) -> QueryPlan {
     let Some(filter) = filter else {
         return QueryPlan {
@@ -95,6 +116,10 @@ pub fn plan_query(
                     original_filter: Some(filter.clone()),
                 };
             }
+            // Try bitmap scan before full scan
+            if let Some(plan) = try_bitmap_scan(scan_accelerator, filter) {
+                return plan;
+            }
             QueryPlan {
                 scan: ScanPlan::FullScan,
                 post_filter: None,
@@ -106,6 +131,11 @@ pub fn plan_query(
         FilterNode::And(children) => {
             // Try compound multi-field equality (Opt 3)
             if let Some(plan) = try_compound_eq(index_manager, collection, children, filter) {
+                return plan;
+            }
+
+            // Try compound equality prefix + range suffix
+            if let Some(plan) = try_compound_range(index_manager, collection, children, filter) {
                 return plan;
             }
 
@@ -176,6 +206,10 @@ pub fn plan_query(
                 };
             }
 
+            // Try bitmap scan before full scan
+            if let Some(plan) = try_bitmap_scan(scan_accelerator, filter) {
+                return plan;
+            }
             QueryPlan {
                 scan: ScanPlan::FullScan,
                 post_filter: None,
@@ -183,12 +217,17 @@ pub fn plan_query(
             }
         }
 
-        // OR and NOT cannot efficiently use indexes — fall back to full scan
-        _ => QueryPlan {
-            scan: ScanPlan::FullScan,
-            post_filter: None,
-            original_filter: Some(filter.clone()),
-        },
+        // OR and NOT cannot efficiently use indexes — try bitmap scan before full scan
+        _ => {
+            if let Some(plan) = try_bitmap_scan(scan_accelerator, filter) {
+                return plan;
+            }
+            QueryPlan {
+                scan: ScanPlan::FullScan,
+                post_filter: None,
+                original_filter: Some(filter.clone()),
+            }
+        }
     }
 }
 
@@ -392,6 +431,168 @@ fn build_remaining_filter(filter: &FilterNode, covered: &HashSet<&str>) -> Optio
         }
         other => Some(other.clone()),
     }
+}
+
+/// Try to use a compound index for "eq prefix + range suffix" patterns.
+/// Matches queries like: field1 = val1 AND field2 >= val2
+/// where a compound index exists on (field1, field2).
+fn try_compound_range(
+    index_manager: &IndexManager,
+    collection: &str,
+    children: &[FilterNode],
+    original: &FilterNode,
+) -> Option<QueryPlan> {
+    // Extract equality pairs
+    let eq_pairs: Vec<(String, Value)> = children
+        .iter()
+        .filter_map(|c| {
+            if let FilterNode::Comparison {
+                field,
+                op: FilterOp::Eq,
+                value,
+            } = c
+            {
+                Some((field.clone(), value.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if eq_pairs.is_empty() {
+        return None;
+    }
+
+    // Extract range conditions: field -> (lower, upper)
+    type Bound = Option<(Value, bool)>;
+    let mut range_bounds: std::collections::HashMap<String, (Bound, Bound)> =
+        std::collections::HashMap::new();
+
+    for child in children {
+        if let FilterNode::Comparison { field, op, value } = child {
+            match op {
+                FilterOp::Gt | FilterOp::Gte => {
+                    let inclusive = matches!(op, FilterOp::Gte);
+                    range_bounds.entry(field.clone()).or_insert((None, None)).0 =
+                        Some((value.clone(), inclusive));
+                }
+                FilterOp::Lt | FilterOp::Lte => {
+                    let inclusive = matches!(op, FilterOp::Lte);
+                    range_bounds.entry(field.clone()).or_insert((None, None)).1 =
+                        Some((value.clone(), inclusive));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if range_bounds.is_empty() {
+        return None;
+    }
+
+    let eq_field_names: Vec<&str> = eq_pairs.iter().map(|(f, _)| f.as_str()).collect();
+
+    // Try each range field to find a compound index covering eq fields + range field
+    let mut best: Option<(
+        crate::index::secondary::IndexDef,
+        usize,
+        String,
+        Bound,
+        Bound,
+    )> = None;
+
+    for (range_field, (lower, upper)) in &range_bounds {
+        if let Some((idx_def, _, n_matched)) =
+            index_manager.find_compound_range_index(collection, &eq_field_names, range_field)
+            && best.as_ref().is_none_or(|(_, bm, _, _, _)| n_matched > *bm)
+        {
+            best = Some((
+                idx_def,
+                n_matched,
+                range_field.clone(),
+                lower.clone(),
+                upper.clone(),
+            ));
+        }
+    }
+
+    let (idx_def, n_matched, range_field, lower, upper) = best?;
+
+    // Build eq_prefix from matched eq values in index field order
+    let mut eq_prefix = Vec::new();
+    for i in 0..n_matched {
+        let idx_field = &idx_def.fields[i];
+        let (_, val) = eq_pairs.iter().find(|(f, _)| f == idx_field)?;
+        if i > 0 {
+            eq_prefix.push(0x01); // field separator
+        }
+        eq_prefix.extend_from_slice(&value_to_sortable_bytes(val));
+    }
+    eq_prefix.push(0x01); // separator before range field
+
+    // Convert range bounds to sortable bytes
+    let lower_bytes = lower.map(|(v, incl)| (value_to_sortable_bytes(&v), incl));
+    let upper_bytes = upper.map(|(v, incl)| (value_to_sortable_bytes(&v), incl));
+
+    // Build post-filter from conditions not covered by the compound index
+    let covered_eq: HashSet<&str> = idx_def.fields[..n_matched]
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+    let remaining: Vec<FilterNode> = children
+        .iter()
+        .filter(|c| {
+            if let FilterNode::Comparison { field, op, .. } = c {
+                // Skip covered eq fields
+                if matches!(op, FilterOp::Eq) && covered_eq.contains(field.as_str()) {
+                    return false;
+                }
+                // Skip range conditions on the covered range field
+                if field == &range_field
+                    && matches!(
+                        op,
+                        FilterOp::Gt | FilterOp::Gte | FilterOp::Lt | FilterOp::Lte
+                    )
+                {
+                    return false;
+                }
+            }
+            true
+        })
+        .cloned()
+        .collect();
+
+    let post_filter = match remaining.len() {
+        0 => None,
+        1 => Some(remaining.into_iter().next().unwrap()),
+        _ => Some(FilterNode::And(remaining)),
+    };
+
+    Some(QueryPlan {
+        scan: ScanPlan::CompoundRange {
+            index_name: idx_def.name,
+            eq_prefix,
+            lower: lower_bytes,
+            upper: upper_bytes,
+        },
+        post_filter,
+        original_filter: Some(original.clone()),
+    })
+}
+
+/// Try to use the bitmap scan accelerator for a filter.
+fn try_bitmap_scan(scan_accelerator: &ScanAccelerator, filter: &FilterNode) -> Option<QueryPlan> {
+    if !scan_accelerator.is_ready() {
+        return None;
+    }
+    let result = scan_accelerator.bitmap_scan(filter)?;
+    // Only use bitmap scan if the bitmap has a reasonable size (not empty)
+    // or if it's a count_only query (where empty is a valid fast result)
+    Some(QueryPlan {
+        scan: ScanPlan::BitmapScan,
+        post_filter: result.residual_filter,
+        original_filter: Some(filter.clone()),
+    })
 }
 
 fn try_index_comparison(

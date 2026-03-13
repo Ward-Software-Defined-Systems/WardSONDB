@@ -159,6 +159,9 @@ impl Storage {
         // Remove doc counter
         self.doc_counts.remove(name);
 
+        // Clear scan accelerator
+        self.scan_accelerator.clear();
+
         self.persist()?;
         Ok(())
     }

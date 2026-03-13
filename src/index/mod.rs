@@ -185,6 +185,53 @@ impl IndexManager {
         best
     }
 
+    /// Find a compound index where leading N fields match equality conditions
+    /// and the field at position N matches the range field.
+    /// Returns (IndexDef, partition, number of eq fields matched).
+    pub fn find_compound_range_index(
+        &self,
+        collection: &str,
+        eq_field_names: &[&str],
+        range_field: &str,
+    ) -> Option<(IndexDef, TxPartitionHandle, usize)> {
+        let indexes = self.indexes.read();
+        let eq_set: std::collections::HashSet<&str> = eq_field_names.iter().copied().collect();
+
+        let mut best: Option<(IndexDef, TxPartitionHandle, usize)> = None;
+
+        for ((col, _), entry) in indexes.iter() {
+            if col != collection || !entry.def.is_compound() {
+                continue;
+            }
+
+            let idx_fields = &entry.def.fields;
+
+            // Count consecutive leading fields that appear in eq_set
+            let mut matched = 0;
+            for f in idx_fields {
+                if eq_set.contains(f.as_str()) {
+                    matched += 1;
+                } else {
+                    break;
+                }
+            }
+
+            if matched == 0 {
+                continue;
+            }
+
+            // The field at position `matched` must be the range field
+            if matched < idx_fields.len()
+                && idx_fields[matched] == range_field
+                && best.as_ref().is_none_or(|(_, _, bm)| matched > *bm)
+            {
+                best = Some((entry.def.clone(), entry.partition.clone(), matched));
+            }
+        }
+
+        best
+    }
+
     /// Get the partition handle for a specific index by name.
     pub fn get_index_partition(&self, collection: &str, name: &str) -> Option<TxPartitionHandle> {
         let indexes = self.indexes.read();

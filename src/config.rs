@@ -83,4 +83,20 @@ pub struct Config {
     /// Number of background compaction worker threads
     #[arg(long, default_value = "2")]
     pub compaction_workers: usize,
+
+    /// Comma-separated list of fields to track with bitmap indexes (auto-detected if empty)
+    #[arg(long, default_value = "")]
+    pub bitmap_fields: String,
+
+    /// Maximum distinct values per bitmap column before disabling (default: 1000)
+    #[arg(long, default_value = "1000")]
+    pub bitmap_max_cardinality: u32,
+
+    /// Number of inserts to sample for auto-detection of bitmap fields (default: 10000)
+    #[arg(long, default_value = "10000")]
+    pub bitmap_sample_size: u32,
+
+    /// Disable the scan accelerator entirely
+    #[arg(long, default_value_t = false)]
+    pub no_bitmap: bool,
 }

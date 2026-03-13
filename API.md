@@ -1,6 +1,6 @@
 # WardSONDB API Documentation
 
-> **Version:** 0.1.0 (Phase 1-3: MVP + Aggregation + TLS + Indexes + TTL + Auth + $collect + $distinct + Prometheus)
+> **Version:** 0.1.0 (Phase 1-3: MVP + Aggregation + TLS + Indexes + TTL + Auth + $collect + $distinct + Prometheus + Bitmap Scan Accelerator)
 
 ## Getting Started
 
@@ -51,6 +51,10 @@ wardsondb [OPTIONS]
 | `--api-key-file <PATH>` | | | File with API keys (one per line, # comments) |
 | `--metrics-public` | | `false` | Make `/_metrics` publicly accessible (bypasses auth) |
 | `--query-timeout <SECS>` | | `30` | Query/aggregation timeout in seconds (0 = no timeout) |
+| `--bitmap-fields <CSV>` | | `""` | Comma-separated fields for bitmap scan accelerator (skip auto-detection) |
+| `--bitmap-max-cardinality <N>` | | `1000` | Max distinct values per bitmap column before disabling |
+| `--bitmap-sample-size <N>` | | `10000` | Number of inserts to sample for auto-detection |
+| `--no-bitmap` | | `false` | Disable the bitmap scan accelerator entirely |
 | `--help` | `-h` | | Print help |
 | `--version` | `-V` | | Print version |
 
@@ -76,6 +80,15 @@ wardsondb --tls
 
 # TLS with custom certificate
 wardsondb --tls --tls-cert /etc/ssl/wardsondb.crt --tls-key /etc/ssl/wardsondb.key
+
+# Bitmap scan accelerator with explicit fields
+wardsondb --bitmap-fields "event_type,severity,network.action"
+
+# Bitmap with custom cardinality cap
+wardsondb --bitmap-fields "event_type,severity" --bitmap-max-cardinality 500
+
+# Disable bitmap scan accelerator
+wardsondb --no-bitmap
 ```
 
 ### Logging Behavior
@@ -191,7 +204,8 @@ curl http://localhost:8080/_health
   "ok": true,
   "data": {
     "status": "healthy",
-    "write_pressure": "normal"
+    "write_pressure": "normal",
+    "scan_accelerator_ready": true
   },
   "meta": {}
 }
@@ -203,7 +217,8 @@ curl http://localhost:8080/_health
   "ok": true,
   "data": {
     "status": "healthy",
-    "write_pressure": "high"
+    "write_pressure": "high",
+    "scan_accelerator_ready": true
   },
   "meta": {}
 }
@@ -213,6 +228,7 @@ curl http://localhost:8080/_health
 |-------|--------|-------------|
 | `status` | `"healthy"`, `"degraded"` | `"degraded"` only when storage engine is poisoned |
 | `write_pressure` | `"normal"`, `"high"` | `"high"` when average request latency exceeds 5000ms in recent intervals. Clients should defer non-essential queries. Returns to `"normal"` when latency drops below 500ms for 3 consecutive intervals. |
+| `scan_accelerator_ready` | `true`, `false` | Whether the bitmap scan accelerator is initialized and ready for queries |
 
 **Degraded response (storage engine poisoned):**
 ```json
@@ -221,6 +237,7 @@ curl http://localhost:8080/_health
   "data": {
     "status": "degraded",
     "write_pressure": "normal",
+    "scan_accelerator_ready": true,
     "warning": "Storage engine is poisoned: flush/compaction failure. Writes rejected, reads may continue. Restart required."
   },
   "meta": {}
@@ -255,6 +272,14 @@ curl http://localhost:8080/_stats
       "inserts": 15000,
       "queries": 29500,
       "deletes": 500
+    },
+    "scan_accelerator": {
+      "ready": true,
+      "total_positions": 15240,
+      "bitmap_columns": [
+        {"field": "event_type", "cardinality": 5, "memory_bytes": 65536},
+        {"field": "severity", "cardinality": 4, "memory_bytes": 32768}
+      ]
     }
   },
   "meta": {}
@@ -779,6 +804,76 @@ When a query uses a compound index that covers both the filter and sort fields, 
 - `scan_strategy` identifies the optimization used
 
 **When it activates:** Requires a compound index whose fields start with the equality filter field(s) and end with the sort field. For example, index `["event_type", "received_at"]` + query `event_type=firewall` sorted by `received_at desc`.
+
+### Compound Range Scan
+
+When a query combines equality on one field with a range on another, and a compound index covers both fields in order, WardSONDB uses a compound range scan. This is indicated by `scan_strategy: "compound_range"` in the response meta.
+
+```json
+{
+  "ok": true,
+  "data": [...],
+  "meta": {
+    "duration_ms": 3.5,
+    "returned_count": 50,
+    "total_count": 1200,
+    "docs_scanned": 1200,
+    "index_used": "idx_type_time",
+    "scan_strategy": "compound_range"
+  }
+}
+```
+
+**Example:** With index `["event_type", "received_at"]`, the query `event_type = "firewall" AND received_at >= "2026-03-12T14:00:00Z"` seeks to the `firewall` prefix and range-scans only the matching time window — instead of scanning all 3M firewall docs.
+
+**When it activates:** Requires a compound index where leading field(s) match equality conditions and the next field matches the range condition. Supports `$gt`, `$gte`, `$lt`, `$lte` (including dual-bound ranges like `$gte` + `$lt`). Uncovered conditions become a post-filter.
+
+**count_only optimization:** When `count_only: true` and no post-filter is needed, counts index keys directly with `docs_scanned: 0`.
+
+### Bitmap Scan Accelerator
+
+For queries on low-cardinality fields (e.g., `event_type`, `severity`, `network.action`), WardSONDB can use Roaring Bitmaps to skip full-collection JSON deserialization. This is indicated by `scan_strategy: "bitmap"` in the response meta.
+
+```json
+{
+  "ok": true,
+  "data": [...],
+  "meta": {
+    "duration_ms": 15.2,
+    "returned_count": 50,
+    "total_count": 420000,
+    "docs_scanned": 50,
+    "scan_strategy": "bitmap"
+  }
+}
+```
+
+**Bitmap count_only** — when all filter fields have bitmap columns and `count_only: true`, the count is computed entirely from bitmaps with zero document reads:
+
+```json
+{
+  "ok": true,
+  "data": { "count": 420000 },
+  "meta": {
+    "duration_ms": 0.3,
+    "total_count": 420000,
+    "docs_scanned": 0,
+    "scan_strategy": "bitmap"
+  }
+}
+```
+
+**Bitmap-accelerated aggregation** — `$group` by a bitmap field with only `$count` accumulators returns results with zero doc reads (`scan_strategy: "bitmap_aggregate"`). A `$match` + `$group` pipeline where both fields have bitmaps uses `scan_strategy: "bitmap_filtered_aggregate"`.
+
+**When it activates:**
+- The bitmap scan accelerator must be enabled and ready (not `--no-bitmap`)
+- The filtered field(s) must have bitmap columns (configured via `--bitmap-fields` or auto-detected)
+- The field's cardinality must be below `--bitmap-max-cardinality` (default: 1000)
+- No secondary index covers the query (indexes take priority over bitmaps)
+
+**Supported filter operators:** `$eq`, `$ne`, `$in`, `$exists`, `$and`, `$or`. For `$and` filters mixing bitmap and non-bitmap fields, the bitmap narrows the candidate set and a residual post-filter applies to the reduced set.
+
+**Sort caveat:** Bitmap scans do not provide sort order. For sort + limit queries where a compound index exists, `IndexSorted` is preferred.
 
 ### Query Examples
 
@@ -1390,13 +1485,20 @@ curl http://localhost:8080/events/storage
     "indexes": ["idx_event_type", "idx_src_ip"],
     "oldest_doc": "2026-03-09T23:49:57+00:00",
     "newest_doc": "2026-03-10T14:36:09+00:00",
-    "ttl": {"retention_days": 30, "field": "_created_at", "enabled": true}
+    "ttl": {"retention_days": 30, "field": "_created_at", "enabled": true},
+    "scan_accelerator": {
+      "total_positions": 2118648,
+      "bitmap_columns": [
+        {"field": "event_type", "cardinality": 9, "memory_bytes": 1835008},
+        {"field": "severity", "cardinality": 4, "memory_bytes": 524288}
+      ]
+    }
   },
   "meta": {}
 }
 ```
 
-`oldest_doc` and `newest_doc` are derived from UUIDv7 key timestamps (O(1) lookup, no full scan).
+`oldest_doc` and `newest_doc` are derived from UUIDv7 key timestamps (O(1) lookup, no full scan). The `scan_accelerator` section is only present when the accelerator is ready.
 
 ---
 

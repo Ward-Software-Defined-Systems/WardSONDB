@@ -40,6 +40,7 @@ impl Storage {
         self.check_fjall_result(tx.commit())?;
 
         self.doc_counts.increment(collection, 1);
+        self.scan_accelerator.on_insert(&id, &doc);
 
         Ok(doc)
     }
@@ -121,6 +122,8 @@ impl Storage {
             .add_index_entries_to_tx(&mut tx, collection, id, &doc);
         self.check_fjall_result(tx.commit())?;
 
+        self.scan_accelerator.on_update(id, &existing_doc, &doc);
+
         Ok(doc)
     }
 
@@ -152,6 +155,7 @@ impl Storage {
         self.check_fjall_result(tx.commit())?;
 
         self.doc_counts.increment(collection, -1);
+        self.scan_accelerator.on_delete(id, &existing_doc);
 
         Ok(())
     }
@@ -212,6 +216,10 @@ impl Storage {
             }
             self.check_fjall_result(tx.commit())?;
             self.doc_counts.increment(collection, inserted as i64);
+
+            for (id, _bytes, doc) in &to_write {
+                self.scan_accelerator.on_insert(id, doc);
+            }
         }
 
         Ok((inserted, errors))
@@ -262,6 +270,12 @@ impl Storage {
         self.check_fjall_result(tx.commit())?;
         self.doc_counts.increment(collection, -(count as i64));
 
+        for doc in &matching {
+            if let Some(id) = doc.get("_id").and_then(|v| v.as_str()) {
+                self.scan_accelerator.on_delete(id, doc);
+            }
+        }
+
         Ok(count)
     }
 
@@ -294,20 +308,25 @@ impl Storage {
         let now = Utc::now().to_rfc3339();
         let mut tx = self.db.write_tx();
 
-        for mut doc in matching {
-            let id = doc
+        // Track (id, old_doc, new_doc) for bitmap accelerator
+        let mut update_pairs: Vec<(String, Value, Value)> = Vec::new();
+
+        for doc in matching {
+            let old_doc = doc.clone();
+            let mut new_doc = doc;
+            let id = new_doc
                 .get("_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let old_rev = doc.get("_rev").and_then(|v| v.as_u64()).unwrap_or(0);
+            let old_rev = new_doc.get("_rev").and_then(|v| v.as_u64()).unwrap_or(0);
 
             // Remove old index entries
             self.index_manager
-                .remove_index_entries_from_tx(&mut tx, collection, &id, &doc);
+                .remove_index_entries_from_tx(&mut tx, collection, &id, &old_doc);
 
             // Apply $set fields
-            if let Some(obj) = doc.as_object_mut() {
+            if let Some(obj) = new_doc.as_object_mut() {
                 for (path, value) in &set_fields {
                     set_nested_field(obj, path, value.clone());
                 }
@@ -315,15 +334,21 @@ impl Storage {
                 obj.insert("_updated_at".to_string(), Value::String(now.clone()));
             }
 
-            let bytes = serde_json::to_vec(&doc)?;
+            let bytes = serde_json::to_vec(&new_doc)?;
             tx.insert(&docs_partition, id.as_str(), bytes.as_slice());
 
             // Write new index entries
             self.index_manager
-                .add_index_entries_to_tx(&mut tx, collection, &id, &doc);
+                .add_index_entries_to_tx(&mut tx, collection, &id, &new_doc);
+
+            update_pairs.push((id, old_doc, new_doc));
         }
 
         self.check_fjall_result(tx.commit())?;
+
+        for (id, old_doc, new_doc) in &update_pairs {
+            self.scan_accelerator.on_update(id, old_doc, new_doc);
+        }
 
         Ok(count)
     }

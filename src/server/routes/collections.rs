@@ -156,5 +156,25 @@ pub async fn get_storage_info(
         data["ttl"] = serde_json::to_value(&ttl_config)?;
     }
 
+    // Add bitmap scan accelerator info
+    if state.storage.scan_accelerator.is_ready() {
+        let stats = state.storage.scan_accelerator.stats();
+        let columns: Vec<serde_json::Value> = stats
+            .columns
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "field": c.field,
+                    "cardinality": c.cardinality,
+                    "memory_bytes": c.memory_bytes,
+                })
+            })
+            .collect();
+        data["scan_accelerator"] = serde_json::json!({
+            "total_positions": stats.total_positions,
+            "bitmap_columns": columns,
+        });
+    }
+
     Ok(Json(ApiResponse::success(data)))
 }

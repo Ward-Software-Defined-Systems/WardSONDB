@@ -78,6 +78,37 @@ async fn main() {
     let storage = Storage::open_with_config(data_dir, mem_config).expect("Failed to open database");
     info!(data_dir = %config.data_dir, "Database opened");
 
+    // Configure scan accelerator
+    if !config.no_bitmap {
+        let bitmap_fields: Vec<String> = config
+            .bitmap_fields
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if !bitmap_fields.is_empty() {
+            storage
+                .scan_accelerator
+                .configure_fields(bitmap_fields.clone());
+            {
+                let mut cfg = storage.scan_accelerator.config_mut();
+                cfg.max_cardinality = config.bitmap_max_cardinality;
+            }
+
+            // Try loading from disk first, then rebuild from storage
+            let loaded = storage.scan_accelerator.load_from_disk(data_dir, "_all");
+            if !loaded {
+                rebuild_all_accelerators(&storage);
+            }
+            storage.scan_accelerator.set_ready(true);
+            info!(fields = ?bitmap_fields, "Scan accelerator configured");
+        }
+        // If no explicit fields, auto-detection happens during inserts
+    } else {
+        info!("Scan accelerator disabled (--no-bitmap)");
+    }
+
     let metrics = Arc::new(Metrics::new());
 
     // Load API keys from CLI flags and key file
@@ -96,6 +127,29 @@ async fn main() {
 
     // Spawn periodic stats reporter (every 10 seconds)
     server::metrics::spawn_stats_reporter(metrics.clone(), 10);
+
+    // Spawn bitmap persistence task (every 60 seconds)
+    if !config.no_bitmap {
+        let persist_state = state.clone();
+        let data_dir_owned = config.data_dir.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(tokio::time::Duration::from_secs(60));
+            tick.tick().await; // Skip first immediate tick
+            loop {
+                tick.tick().await;
+                if persist_state.storage.scan_accelerator.is_ready() {
+                    let dir = std::path::Path::new(&data_dir_owned);
+                    if let Err(e) = persist_state
+                        .storage
+                        .scan_accelerator
+                        .persist_to_disk(dir, "_all")
+                    {
+                        warn!(error = %e, "Failed to persist scan accelerator");
+                    }
+                }
+            }
+        });
+    }
 
     // Spawn TTL cleanup worker
     {
@@ -222,6 +276,39 @@ fn resolve_tls_paths(config: &Config) -> (String, String) {
         cert_path.to_string_lossy().to_string(),
         key_path.to_string_lossy().to_string(),
     )
+}
+
+/// Rebuild scan accelerator from all existing collections.
+fn rebuild_all_accelerators(storage: &Storage) {
+    let collections = match storage.list_collections() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "Failed to list collections for accelerator rebuild");
+            return;
+        }
+    };
+    let mut all_docs: Vec<(String, serde_json::Value)> = Vec::new();
+    for col in &collections {
+        match storage.scan_all_documents(&col.name) {
+            Ok(docs) => {
+                for doc in docs {
+                    if let Some(id) = doc.get("_id").and_then(|v| v.as_str()) {
+                        all_docs.push((id.to_string(), doc));
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    collection = col.name,
+                    error = %e,
+                    "Failed to scan collection for accelerator rebuild"
+                );
+            }
+        }
+    }
+    if !all_docs.is_empty() {
+        storage.scan_accelerator.rebuild_from_storage(&all_docs);
+    }
 }
 
 /// Check the OS file descriptor limit and warn if too low.

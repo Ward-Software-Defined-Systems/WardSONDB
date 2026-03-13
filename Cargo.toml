@@ -28,6 +28,9 @@ rcgen = "0.13"
 # Crypto
 subtle = "2"
 
+# Bitmap
+roaring = "0.10"
+
 # Concurrency
 parking_lot = "0.12"
 
@@ -53,4 +56,8 @@ rand = "0.8"
 
 [[bench]]
 name = "storage_bench"
+harness = false
+
+[[bench]]
+name = "bitmap_bench"
 harness = false

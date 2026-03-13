@@ -11,6 +11,8 @@ A lightweight, high-performance JSON document database built in Rust. Designed f
 - **Single binary, zero dependencies** — no JVM, no cluster setup, no external services
 - **High-throughput ingest** — 76,000+ single inserts/sec, 278,000+ docs/sec bulk
 - **Secondary & compound indexes** — sub-millisecond indexed lookups at millions of documents
+- **Bitmap Scan Accelerator** *(Alpha)* — sub-millisecond aggregation and filtered counts on categorical fields without touching documents
+- **Compound Range Scans** *(Alpha)* — equality prefix + range suffix on compound indexes for fast time-windowed queries
 - **Aggregation pipelines** — `$match`, `$group`, `$sort`, `$limit`, `$skip` with index-accelerated execution
 - **Index-only query paths** — count, distinct, and aggregation operations that never touch documents
 - **TTL / auto-expiry** — per-collection retention policies with background cleanup
@@ -21,23 +23,25 @@ A lightweight, high-performance JSON document database built in Rust. Designed f
 
 ## Performance
 
-Benchmarked at **2.1 million SIEM events** on a Mac Studio (M4 Max, 128GB RAM, 1.8TB SSD):
+Benchmarked at **3.45 million SIEM events** on a Mac Studio (M4 Max, 128GB RAM, 1.8TB SSD):
 
-| Query Type | Time | Docs Scanned |
-|-----------|------|-------------|
-| Indexed equality + sort + limit 50 | **9.5ms** | 50 |
-| Indexed count (1.87M matches) | **200ms** | 0 |
-| Indexed range count | **28ms** | 0 |
-| Compound filter count (type + action) | **18ms** | 0 |
-| Aggregation: top event types (index-only) | **248ms** | 0 |
-| Aggregation: top blocked IPs (index-narrowed) | **270ms** | 48,400 |
-| Distinct values (indexed field) | **8ms** | 0 |
-| Get by ID | **<1ms** | — |
-| Bulk insert (500 docs) | **1.8ms** | — |
-| Single doc insert throughput | **76,000+/sec** | — |
-| Bulk insert throughput | **278,000+ docs/sec** | — |
+| Query Type | Time | Docs Scanned | Strategy |
+|-----------|------|-------------|----------|
+| Bitmap aggregate: count by event_type | **0.096ms** | 0 | bitmap_aggregate |
+| Bitmap count: unindexed field (severity=6) | **0.17ms** | 0 | bitmap |
+| Bitmap NOT: event_type \u2260 firewall | **0.12ms** | 0 | bitmap |
+| Compound range: type + time \u2265 6h (851K matches) | **137ms** | 0 | compound_range |
+| Compound range: action + time \u2265 6h (32K matches) | **5.5ms** | 0 | compound_range |
+| Compound range: type + time \u2265 1h (0 matches) | **0.042ms** | 0 | compound_range |
+| Compound EQ: type + action (2.9M matches) | **485ms** | 0 | compound_eq |
+| Indexed equality + sort + limit 50 | **9.5ms** | 50 | index_sorted |
+| Indexed count (3M matches) | **432ms** | 0 | index_eq |
+| Distinct values (indexed field) | **8ms** | 0 | index_eq |
+| Get by ID | **<1ms** | \u2014 | primary |
+| Single doc insert throughput | **76,000+/sec** | \u2014 | \u2014 |
+| Bulk insert throughput | **278,000+ docs/sec** | \u2014 | \u2014 |
 
-All numbers measured against 2.1 million production SIEM events (firewall, threat, DHCP, DNS, WiFi) on a Mac Studio M4 Max. Run `cargo bench` for reproducible synthetic benchmarks.
+All numbers measured against 3.45 million production SIEM events (firewall, threat, DHCP, DNS, WiFi) on a Mac Studio M4 Max. Run `cargo bench` for reproducible synthetic benchmarks.
 
 ## Quick Start
 
@@ -56,10 +60,11 @@ cargo build --release
 # With TLS (auto-generated self-signed cert)
 ./target/release/wardsondb --tls
 
-# Production — TLS, custom port, API key auth
+# Production — TLS, custom port, API key auth, bitmap acceleration
 ulimit -n 65536
 ./target/release/wardsondb --tls --port 443 --data-dir /var/lib/wardsondb --api-key "your-secret-key" \
-  --cache-size-mb 512 --write-buffer-mb 512 --flush-workers 4 --compaction-workers 4
+  --cache-size-mb 512 --write-buffer-mb 512 --flush-workers 4 --compaction-workers 4 \
+  --bitmap-fields "event_type,severity,status"
 ```
 
 ### Create a collection and insert data
@@ -173,6 +178,7 @@ curl -X PUT http://localhost:8080/events/ttl \
 | `--metrics-public` | `false` | Allow unauthenticated access to `/_metrics` |
 | `--log-level` | `info` | Log level (trace/debug/info/warn/error) |
 | `--log-file` | `wardsondb.log` | Log file path |
+| `--bitmap-fields` | | Comma-separated fields for bitmap scan acceleration *(Alpha)* |
 | `--verbose` | `false` | Show per-request logs in terminal |
 | `--cache-size-mb` | `64` | Block + blob cache size in MiB (shared across all partitions) |
 | `--write-buffer-mb` | `64` | Max write buffer size in MiB (total across all partitions) |
@@ -223,6 +229,62 @@ Full API documentation: [API.md](API.md)
 | PUT | `/{collection}/ttl` | Set retention policy |
 | GET | `/{collection}/ttl` | Get retention policy |
 | DELETE | `/{collection}/ttl` | Remove retention policy |
+
+## Bitmap Scan Accelerator *(Alpha)*
+
+The bitmap scan accelerator eliminates full-collection scans for queries on low-cardinality categorical fields (e.g., `event_type`, `severity`, `network.action`). It maintains in-memory bitmaps that map field values to document positions, enabling sub-millisecond filtered counts and aggregations at any scale — without touching a single document.
+
+### Enabling
+
+```bash
+./target/release/wardsondb --tls \
+  --bitmap-fields "event_type,network.action,severity,network.protocol,source_format"
+```
+
+### What It Accelerates
+
+| Operation | Without Bitmap | With Bitmap |
+|-----------|---------------|-------------|
+| Count by event_type (3.45M docs) | 5-15 seconds | **0.096ms** |
+| Count where severity = 6 (no index) | 5-15 seconds | **0.17ms** |
+| Count where event_type != firewall | 5-15 seconds | **0.12ms** |
+| Aggregation: group by event_type | ~250ms (index) | **0.096ms** |
+
+### How It Works
+
+- On startup with `--bitmap-fields`, WardSONDB builds a position map (doc ID to sequential position) and per-field bitmaps from storage
+- New inserts/updates automatically maintain the bitmaps after commit
+- The query planner uses bitmaps when all filter fields are bitmap-covered and the query is count-only or aggregation
+- Bitmap AND/OR/NOT operations run entirely in memory with zero document reads
+- Bitmaps are rebuilt from storage on restart — fjall is always the source of truth
+
+### Memory Usage
+
+At 3.45M documents with 5 bitmap fields: **~6.4 MB total** (position map + bitmaps). Memory scales linearly with document count and number of distinct values per field.
+
+### Changing Bitmap Fields
+
+To add, remove, or change bitmap fields, update the `--bitmap-fields` flag and restart WardSONDB. All bitmaps are rebuilt from storage on startup — there is no incremental migration. Rebuild time scales with document count (expect ~30-60 seconds per million documents depending on hardware).
+
+**There is no warning when bitmap fields change between restarts.** Verify bitmaps loaded correctly by checking `GET /_stats` — the `scan_accelerator.bitmap_columns` array should list all expected fields with their cardinality and memory usage.
+
+### Limitations
+
+- **Alpha feature** — API and behavior may change
+- Only effective for low-cardinality fields (< ~100 distinct values)
+- `--bitmap-fields` must be specified to enable; auto-detection only profiles new inserts and won't trigger on existing data
+- Bitmap scan is used for count-only queries and aggregations; document-return queries may still use index paths
+
+### Query Planner Priority
+
+The planner selects the best strategy in this order:
+
+1. **IndexSorted** — compound index covers filter + sort, early termination with limit
+2. **CompoundEq** — compound index with multiple equality fields
+3. **CompoundRange** — compound index: equality prefix + range suffix *(Alpha)*
+4. **IndexEq / IndexRange / IndexIn** — single-field index scans
+5. **BitmapScan** — bitmap accelerator for categorical field filters
+6. **FullScan** — last resort, scans all documents
 
 ## Memory Tuning
 
@@ -277,7 +339,7 @@ WardSONDB is designed for trusted network environments. Below are security consi
 | Issue | Status | Description |
 |---|---|---|
 | High RSS memory usage at scale | **Expected behavior** | At 2M+ documents, the OS-reported RSS can grow to consume 80-90% of system memory. This is standard behavior across all mmap-based storage engines (RocksDB, LMDB, LevelDB) where memory-mapped SST files are counted as RSS by the OS kernel. The actual heap usage is bounded by the configured limits (see Memory Tuning section). The inflated RSS number reflects OS page cache, not application memory consumption — macOS is particularly aggressive about reporting mmap regions as RSS. macOS may terminate the process under memory pressure (Jetsam). Workaround: ensure adequate system memory and avoid running memory-intensive applications alongside WardSONDB on the same host. |
-| Full-scan queries slow at 2M+ documents | **Known limitation** | Queries on unindexed fields require a full collection scan. At 2M+ documents, unindexed queries can take 5-15 seconds depending on hardware and concurrent load. Concurrent full-scan queries compound the problem, potentially triggering the 30-second query timeout. Mitigation: create indexes on frequently queried fields and ensure SIEM dashboard queries include indexed filters (e.g., time ranges via `received_at`). |
+| Full-scan queries slow at 2M+ documents | **Mitigated** | Queries on unindexed fields require a full collection scan. At 2M+ documents, unindexed queries can take 5-15 seconds. **Mitigation:** enable the bitmap scan accelerator (`--bitmap-fields`) for categorical fields — reduces unindexed count queries from seconds to sub-millisecond. For remaining unindexed fields, create secondary indexes. |
 | Compaction storm during bulk ingest with many indexes | **Known limitation** | Creating multiple indexes before or during heavy bulk ingest can trigger a compaction storm — fjall's background compaction workers saturate all CPU cores, making the server unresponsive to queries and health checks. This occurs because each inserted document writes to every index, generating massive write amplification. The server remains alive but cannot serve requests until compaction completes. Mitigation: create indexes *after* initial bulk ingest completes, create them one at a time with pauses between each, and monitor the `write_pressure` field in `GET /_health` — defer queries while it reports `"high"`. |
 
 ## Roadmap
@@ -292,6 +354,8 @@ WardSONDB is designed for trusted network environments. Below are security consi
 - [x] Storage info endpoint
 - [x] Query performance optimization (early termination, index-only aggregation)
 - [x] Security hardening (regex, timing attacks, resource limits, timeouts)
+- [x] Bitmap scan accelerator — sub-millisecond categorical field queries *(Alpha)*
+- [x] Compound range scans — equality prefix + range suffix on compound indexes *(Alpha)*
 - [ ] RSS memory optimization — investigate fjall mmap behavior at scale
 - [ ] Streaming/cursors — large result sets beyond limit/offset
 - [ ] Query explain — show scan strategy and index usage

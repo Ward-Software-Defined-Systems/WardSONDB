@@ -43,6 +43,11 @@ pub fn execute_aggregate(
         )));
     }
 
+    // Try bitmap-only aggregation (group by bitmap field with $count only)
+    if let Some(result) = try_bitmap_aggregate(storage, collection, &request.pipeline)? {
+        return Ok(result);
+    }
+
     // Try index-only aggregation (Opt 2: group by indexed field with $count only)
     if let Some(result) = try_index_only_aggregate(storage, collection, &request.pipeline)? {
         return Ok(result);
@@ -606,6 +611,189 @@ fn try_index_only_aggregate(
         index_used: Some(def.name),
         scan_strategy: Some("index_only_aggregate".to_string()),
     }))
+}
+
+/// Try to execute an aggregation entirely from bitmap columns (0 docs scanned).
+/// Handles two patterns:
+/// 1. $group by bitmap field with $count only (no $match)
+/// 2. $match on bitmap field(s) + $group by bitmap field with $count only
+fn try_bitmap_aggregate(
+    storage: &Storage,
+    _collection: &str,
+    pipeline: &[Value],
+) -> Result<Option<AggregateResult>, AppError> {
+    let accelerator = &storage.scan_accelerator;
+    if !accelerator.is_ready() {
+        return Ok(None);
+    }
+
+    // Determine if first stage is $match or $group
+    let first = pipeline.first().and_then(|v| v.as_object());
+    let first = match first {
+        Some(o) if o.len() == 1 => o,
+        _ => return Ok(None),
+    };
+
+    let (match_filter, group_stage_idx) = if let Some(match_spec) = first.get("$match") {
+        // Pattern 2: $match + $group
+        if pipeline.len() < 2 {
+            return Ok(None);
+        }
+        let filter = parse_filter(match_spec)?;
+        (Some(filter), 1)
+    } else if first.contains_key("$group") {
+        // Pattern 1: $group only
+        (None, 0)
+    } else {
+        return Ok(None);
+    };
+
+    // Get the $group spec
+    let group_stage = pipeline
+        .get(group_stage_idx)
+        .and_then(|v| v.as_object())
+        .and_then(|o| if o.len() == 1 { o.get("$group") } else { None });
+    let group_obj = match group_stage.and_then(|v| v.as_object()) {
+        Some(o) => o,
+        None => return Ok(None),
+    };
+
+    // _id must be a string (single field path)
+    let group_field = match group_obj.get("_id").and_then(|v| v.as_str()) {
+        Some(f) => f,
+        None => return Ok(None),
+    };
+
+    // Must have a bitmap column for the group field
+    if !accelerator.has_column(group_field) {
+        return Ok(None);
+    }
+
+    // All accumulators must be $count
+    let mut acc_names: Vec<String> = Vec::new();
+    for (key, value) in group_obj {
+        if key == "_id" {
+            continue;
+        }
+        let acc_obj = match value.as_object() {
+            Some(o) if o.len() == 1 && o.contains_key("$count") => o,
+            _ => return Ok(None),
+        };
+        let _ = acc_obj;
+        acc_names.push(key.clone());
+    }
+
+    // Execute bitmap aggregation
+    let counts = if let Some(ref filter) = match_filter {
+        // Pattern 2: $match + $group
+        let bitmap_result = match accelerator.bitmap_scan(filter) {
+            Some(r) if r.residual_filter.is_none() => r,
+            _ => return Ok(None), // Can't fully resolve $match via bitmaps
+        };
+        match accelerator.count_by_field_filtered(group_field, &bitmap_result.bitmap) {
+            Some(c) => c,
+            None => return Ok(None),
+        }
+    } else {
+        // Pattern 1: $group only
+        match accelerator.count_by_field(group_field) {
+            Some(c) => c,
+            None => return Ok(None),
+        }
+    };
+
+    // Build result documents
+    let mut docs: Vec<Value> = counts
+        .iter()
+        .map(|(value_key, count)| {
+            let group_value = string_key_to_value(value_key);
+            let mut doc = serde_json::Map::new();
+            doc.insert("_id".to_string(), group_value);
+            for name in &acc_names {
+                doc.insert(name.clone(), Value::Number((*count).into()));
+            }
+            Value::Object(doc)
+        })
+        .collect();
+
+    let groups = docs.len() as u64;
+
+    let strategy = if match_filter.is_some() {
+        "bitmap_filtered_aggregate"
+    } else {
+        "bitmap_aggregate"
+    };
+
+    // Apply remaining pipeline stages ($sort, $limit, $skip)
+    let remaining_start = group_stage_idx + 1;
+    for (raw_i, stage) in pipeline[remaining_start..].iter().enumerate() {
+        let i = raw_i + remaining_start;
+        let obj = stage
+            .as_object()
+            .ok_or_else(|| AppError::InvalidPipeline(format!("Stage {i} must be an object")))?;
+        if obj.len() != 1 {
+            return Err(AppError::InvalidPipeline(format!(
+                "Stage {i} must have exactly one key"
+            )));
+        }
+        let (stage_name, stage_spec) = obj.iter().next().unwrap();
+        match stage_name.as_str() {
+            "$sort" => {
+                let sort_spec = parse_sort_stage(stage_spec, i)?;
+                sort_documents(&mut docs, &sort_spec);
+            }
+            "$limit" => {
+                let limit = stage_spec.as_u64().ok_or_else(|| {
+                    AppError::InvalidPipeline(format!(
+                        "Stage {i}: $limit must be a positive integer"
+                    ))
+                })? as usize;
+                docs.truncate(limit);
+            }
+            "$skip" => {
+                let skip = stage_spec.as_u64().ok_or_else(|| {
+                    AppError::InvalidPipeline(format!(
+                        "Stage {i}: $skip must be a positive integer"
+                    ))
+                })? as usize;
+                docs = docs.into_iter().skip(skip).collect();
+            }
+            other => {
+                return Err(AppError::InvalidPipeline(format!(
+                    "Stage {i}: unknown stage '{other}'"
+                )));
+            }
+        }
+    }
+
+    Ok(Some(AggregateResult {
+        docs,
+        docs_scanned: 0,
+        groups,
+        index_used: None,
+        scan_strategy: Some(strategy.to_string()),
+    }))
+}
+
+/// Convert a bitmap string key back to a JSON Value.
+fn string_key_to_value(key: &str) -> Value {
+    match key {
+        "__null__" => Value::Null,
+        "__true__" => Value::Bool(true),
+        "__false__" => Value::Bool(false),
+        s => {
+            // Try number first
+            if let Ok(n) = s.parse::<i64>() {
+                Value::Number(n.into())
+            } else if let Ok(n) = s.parse::<f64>() {
+                serde_json::Number::from_f64(n)
+                    .map(Value::Number)
+                    .unwrap_or(Value::String(s.to_string()))
+            } else {
+                Value::String(s.to_string())
+            }
+        }
+    }
 }
 
 fn parse_sort_stage(

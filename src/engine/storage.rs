@@ -9,6 +9,7 @@ use tracing::{error, info};
 
 use uuid::Uuid;
 
+use crate::engine::bitmap::{AcceleratorConfig, ScanAccelerator};
 use crate::error::AppError;
 use crate::index::IndexManager;
 
@@ -93,6 +94,8 @@ pub struct Storage {
     pub memory_config: MemoryConfig,
     /// Default partition options with memory limits applied.
     partition_opts: PartitionCreateOptions,
+    /// Bitmap scan accelerator for fast unindexed queries.
+    pub scan_accelerator: ScanAccelerator,
 }
 
 impl Storage {
@@ -129,6 +132,8 @@ impl Storage {
         let index_manager = IndexManager::new();
         let doc_counts = DocCounters::new();
 
+        let scan_accelerator = ScanAccelerator::new(AcceleratorConfig::default());
+
         let storage = Storage {
             db,
             meta,
@@ -137,6 +142,7 @@ impl Storage {
             poisoned: AtomicBool::new(false),
             memory_config: mem,
             partition_opts,
+            scan_accelerator,
         };
 
         // Load indexes from meta

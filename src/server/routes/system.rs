@@ -26,9 +26,11 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Json<ApiResponse> {
     let poisoned = state.storage.is_poisoned();
     let status = if poisoned { "degraded" } else { "healthy" };
     let write_pressure = state.metrics.write_pressure();
+    let scan_accel_ready = state.storage.scan_accelerator.is_ready();
     let mut data = serde_json::json!({
         "status": status,
         "write_pressure": write_pressure,
+        "scan_accelerator_ready": scan_accel_ready,
     });
 
     if poisoned {
@@ -49,6 +51,7 @@ pub async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<ApiRespons
 
     let ttl_configs = state.storage.get_all_ttl_configs().unwrap_or_default();
     let last_ttl_run = LAST_TTL_RUN.load(Ordering::Relaxed);
+    let accel_stats = state.storage.scan_accelerator.stats();
 
     let data = serde_json::json!({
         "collection_count": collections.len(),
@@ -71,6 +74,15 @@ pub async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<ApiRespons
         "ttl": {
             "active_policies": ttl_configs.len(),
             "last_cleanup_run": if last_ttl_run > 0 { Some(last_ttl_run) } else { None },
+        },
+        "scan_accelerator": {
+            "ready": accel_stats.ready,
+            "total_positions": accel_stats.total_positions,
+            "bitmap_columns": accel_stats.columns.iter().map(|c| serde_json::json!({
+                "field": c.field,
+                "cardinality": c.cardinality,
+                "memory_bytes": c.memory_bytes,
+            })).collect::<Vec<_>>(),
         }
     });
     Ok(Json(ApiResponse::success(data)))
