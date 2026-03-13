@@ -51,6 +51,11 @@ wardsondb [OPTIONS]
 | `--api-key-file <PATH>` | | | File with API keys (one per line, # comments) |
 | `--metrics-public` | | `false` | Make `/_metrics` publicly accessible (bypasses auth) |
 | `--query-timeout <SECS>` | | `30` | Query/aggregation timeout in seconds (0 = no timeout) |
+| `--cache-size-mb <N>` | | `64` | Block cache size in MiB (read cache for all partitions) |
+| `--write-buffer-mb <N>` | | `64` | Total write buffer budget in MiB across all partitions |
+| `--memtable-mb <N>` | | `8` | Max memtable size per partition in MiB before flush |
+| `--flush-workers <N>` | | `2` | Background threads for flushing memtables to disk |
+| `--compaction-workers <N>` | | `2` | Background threads for LSM-tree compaction |
 | `--bitmap-fields <CSV>` | | `""` | Comma-separated fields for bitmap scan accelerator (skip auto-detection) |
 | `--bitmap-max-cardinality <N>` | | `1000` | Max distinct values per bitmap column before disabling |
 | `--bitmap-sample-size <N>` | | `10000` | Number of inserts to sample for auto-detection |
@@ -1570,19 +1575,22 @@ By default follows auth policy. Use `--metrics-public` to allow unauthenticated 
 
 ## Performance
 
-Benchmarked against 2.1 million production SIEM events on Mac Studio (M4 Max, 128GB RAM, 1.8TB SSD), release build.
+Benchmarked against 3.45 million production SIEM events on Mac Studio (M4 Max, 128GB RAM, 1.8TB SSD), release build.
 
 | Operation | Time | Notes |
 |-----------|------|-------|
+| Bitmap aggregate: count by event_type | 0.096ms | 0 docs scanned (bitmap_aggregate) |
+| Bitmap count: severity = 6 (no index) | 0.17ms | 0 docs scanned (bitmap) |
+| Compound range: type + time ≥ 6h (32K matches) | 5.5ms | 0 docs scanned (compound_range) |
+| Indexed equality + sort + limit 50 | 9.5ms | 50 docs scanned (index_sorted) |
+| Indexed count (3M matches) | 432ms | 0 docs scanned (index_eq) |
+| Compound EQ: type + action (2.9M matches) | 485ms | 0 docs scanned (compound_eq) |
+| Get by ID | <1ms | Direct key lookup |
 | Single doc insert | ~13 µs | 76,000+/sec throughput |
-| Bulk insert (500 docs) | ~1.8 ms | 278,000+ docs/sec throughput |
-| Get by ID | <1 ms | Direct key lookup |
-| Indexed equality + sort + limit 50 | ~9.5 ms | At 2.1M docs, 50 docs scanned |
-| Indexed count (1.87M matches) | ~200 ms | 0 docs scanned (index-only) |
-| Compound filter count | ~18 ms | 0 docs scanned (index-only) |
-| Aggregation: top event types | ~248 ms | 0 docs scanned (index-only) |
-| Aggregation: top blocked IPs | ~270 ms | 48,400 docs scanned (index-narrowed) |
-| Unindexed full scan (2M docs) | 5-15 sec | Create indexes on frequently queried fields |
+| Bulk insert (500 docs) | ~1.8ms | 278,000+ docs/sec throughput |
+| Unindexed full scan (3.45M docs) | 5-15 sec | Create indexes or enable bitmaps |
+
+All numbers measured against 3.45 million production SIEM events. Run `cargo bench` for reproducible synthetic benchmarks.
 
 Run benchmarks yourself:
 ```bash
@@ -1599,15 +1607,17 @@ The database uses `parking_lot` for internal synchronization (RwLock, Mutex). Un
 
 ### fjall Memory Configuration
 
-The storage engine (fjall) is configured with the following memory limits to keep WardSONDB lightweight while maintaining good throughput:
+The storage engine (fjall) is configured with the following memory limits, all configurable via CLI flags:
 
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| `cache_size` | 64 MiB | Unified block + blob cache shared across all partitions |
-| `max_write_buffer_size` | 64 MiB | Total write buffer cap across all partitions |
-| `max_memtable_size` | 8 MiB | Maximum memtable size per partition before flush |
-| `flush_workers` | 2 | Background threads for flushing memtables to disk |
-| `compaction_workers` | 2 | Background threads for LSM-tree compaction |
+| Parameter | Default | CLI Flag | Description |
+|-----------|---------|----------|-------------|
+| `cache_size` | 64 MiB | `--cache-size-mb` | Unified block + blob cache shared across all partitions |
+| `max_write_buffer_size` | 64 MiB | `--write-buffer-mb` | Total write buffer cap across all partitions |
+| `max_memtable_size` | 8 MiB | `--memtable-mb` | Maximum memtable size per partition before flush |
+| `flush_workers` | 2 | `--flush-workers` | Background threads for flushing memtables to disk |
+| `compaction_workers` | 2 | `--compaction-workers` | Background threads for LSM-tree compaction |
+
+For high-memory systems handling millions of documents, see the Memory Tuning section in the README for recommended production values.
 
 These values are reported in the `GET /_stats` response under `memory_config`. If the storage engine encounters a fatal error during flush or compaction, it enters a **poisoned** state: new writes are rejected (returning `503 STORAGE_POISONED`), but reads may continue to serve from cached data. A server restart is required to recover.
 

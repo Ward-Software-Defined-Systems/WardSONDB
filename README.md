@@ -272,7 +272,7 @@ To add, remove, or change bitmap fields, update the `--bitmap-fields` flag and r
 
 - **Alpha feature** — API and behavior may change
 - Only effective for low-cardinality fields (< ~100 distinct values)
-- `--bitmap-fields` must be specified to enable; auto-detection only profiles new inserts and won't trigger on existing data
+- Auto-detection profiles field cardinality from new inserts only during the sample window (default 10,000 inserts). Existing documents loaded from storage on restart are not profiled. If you restart with millions of existing documents and no `--bitmap-fields` flag, auto-detection won't activate until 10,000 new documents are inserted. For existing datasets, always specify `--bitmap-fields` explicitly
 - Bitmap scan is used for count-only queries and aggregations; document-return queries may still use index paths
 
 ### Query Planner Priority
@@ -359,7 +359,8 @@ WardSONDB is designed for trusted network environments. Below are security consi
 - [ ] RSS memory optimization — investigate fjall mmap behavior at scale
 - [ ] Streaming/cursors — large result sets beyond limit/offset
 - [ ] Query explain — show scan strategy and index usage
-- [ ] Schema validation — optional JSON Schema on collections- [ ] Performance profiling on Linux and Windows — current benchmarks are macOS only (Apple Silicon)
+- [ ] Schema validation — optional JSON Schema on collections
+- [ ] Performance profiling on Linux and Windows — current benchmarks are macOS only (Apple Silicon)
 
 ## Built With
 
