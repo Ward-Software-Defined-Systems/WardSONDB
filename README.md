@@ -356,6 +356,8 @@ WardSONDB is designed for trusted network environments. Below are security consi
 - [x] Security hardening (regex, timing attacks, resource limits, timeouts)
 - [x] Bitmap scan accelerator — sub-millisecond categorical field queries *(Alpha)*
 - [x] Compound range scans — equality prefix + range suffix on compound indexes *(Alpha)*
+- [ ] Bitmap planner priority — prefer bitmap over secondary index for count_only queries on bitmap-enabled fields
+- [ ] Bitmap-accelerated aggregation — aggregate executor should read bitmap counts directly instead of full-scanning
 - [ ] RSS memory optimization — investigate fjall mmap behavior at scale
 - [ ] Streaming/cursors — large result sets beyond limit/offset
 - [ ] Query explain — show scan strategy and index usage
