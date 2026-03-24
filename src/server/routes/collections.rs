@@ -141,7 +141,11 @@ pub async fn get_storage_info(
     let ttl = state.storage.get_ttl(&collection)?;
 
     // Get oldest/newest doc timestamps from first/last UUIDv7 keys
-    let (oldest_doc, newest_doc) = state.storage.get_doc_time_range(&collection)?;
+    // doc_count guard in get_doc_time_range prevents hang on empty partitions
+    let (oldest_doc, newest_doc) = state
+        .storage
+        .get_doc_time_range(&collection)
+        .unwrap_or((None, None));
 
     let mut data = serde_json::json!({
         "name": info.name,

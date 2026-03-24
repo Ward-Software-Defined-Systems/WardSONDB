@@ -257,6 +257,7 @@ The bitmap scan accelerator eliminates full-collection scans for queries on low-
 - The query planner uses bitmaps when all filter fields are bitmap-covered and the query is count-only or aggregation
 - Bitmap AND/OR/NOT operations run entirely in memory with zero document reads
 - Bitmaps are rebuilt from storage on restart — fjall is always the source of truth
+- Dropping and recreating a collection re-arms the accelerator automatically — no restart needed
 
 ### Memory Usage
 
@@ -279,11 +280,12 @@ To add, remove, or change bitmap fields, update the `--bitmap-fields` flag and r
 
 The planner selects the best strategy in this order:
 
+0. **BitmapScan** (count_only) — when `count_only: true` and all filter fields have bitmap columns, bitmap wins over indexes (~2500x faster)
 1. **IndexSorted** — compound index covers filter + sort, early termination with limit
 2. **CompoundEq** — compound index with multiple equality fields
 3. **CompoundRange** — compound index: equality prefix + range suffix *(Alpha)*
 4. **IndexEq / IndexRange / IndexIn** — single-field index scans
-5. **BitmapScan** — bitmap accelerator for categorical field filters
+5. **BitmapScan** — bitmap accelerator for categorical field filters (document-returning queries)
 6. **FullScan** — last resort, scans all documents
 
 ## Memory Tuning
@@ -356,8 +358,8 @@ WardSONDB is designed for trusted network environments. Below are security consi
 - [x] Security hardening (regex, timing attacks, resource limits, timeouts)
 - [x] Bitmap scan accelerator — sub-millisecond categorical field queries *(Alpha)*
 - [x] Compound range scans — equality prefix + range suffix on compound indexes *(Alpha)*
-- [ ] Bitmap planner priority — prefer bitmap over secondary index for count_only queries on bitmap-enabled fields
-- [ ] Bitmap-accelerated aggregation — aggregate executor should read bitmap counts directly instead of full-scanning
+- [x] Bitmap planner priority — prefer bitmap over secondary index for count_only queries on bitmap-enabled fields
+- [x] Bitmap-accelerated aggregation — aggregate executor reads bitmap counts directly (zero doc reads)
 - [ ] RSS memory optimization — investigate fjall mmap behavior at scale
 - [ ] Streaming/cursors — large result sets beyond limit/offset
 - [ ] Query explain — show scan strategy and index usage

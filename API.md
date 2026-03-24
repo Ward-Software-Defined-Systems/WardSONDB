@@ -874,7 +874,8 @@ For queries on low-cardinality fields (e.g., `event_type`, `severity`, `network.
 - The bitmap scan accelerator must be enabled and ready (not `--no-bitmap`)
 - The filtered field(s) must have bitmap columns (configured via `--bitmap-fields` or auto-detected)
 - The field's cardinality must be below `--bitmap-max-cardinality` (default: 1000)
-- No secondary index covers the query (indexes take priority over bitmaps)
+- For `count_only` queries: bitmap is preferred over indexes when all filter fields have bitmap columns (~2500x faster than index counting at scale)
+- For document-returning queries: indexes take priority over bitmaps
 
 **Supported filter operators:** `$eq`, `$ne`, `$in`, `$exists`, `$and`, `$or`. For `$and` filters mixing bitmap and non-bitmap fields, the bitmap narrows the candidate set and a residual post-filter applies to the reduced set.
 

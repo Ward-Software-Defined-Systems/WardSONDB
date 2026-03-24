@@ -106,6 +106,15 @@ pub fn plan_query(
         return plan;
     }
 
+    // For count_only queries, bitmap is ~2500x faster than index counting.
+    // Try bitmap before indexes when all filter fields have bitmap columns.
+    if count_only
+        && let Some(plan) = try_bitmap_scan(scan_accelerator, filter)
+        && plan.post_filter.is_none()
+    {
+        return plan;
+    }
+
     match filter {
         // Simple comparison — check if the field is indexed
         FilterNode::Comparison { field, op, value } => {

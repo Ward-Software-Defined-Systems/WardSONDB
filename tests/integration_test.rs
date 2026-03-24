@@ -3959,3 +3959,341 @@ async fn test_compound_range_planner_priority() {
         assert!(doc["timestamp"].as_str().unwrap() >= "2026-03-12T10:00:00Z");
     }
 }
+
+// ── Storage Endpoint Fix Tests ──────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_storage_info_empty_collection() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    // Create empty collection
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "empty"}))
+        .send()
+        .await
+        .unwrap();
+
+    // Storage info must return immediately (not hang) with null timestamps
+    let start = std::time::Instant::now();
+    let resp = client
+        .get(format!("{base_url}/empty/storage"))
+        .send()
+        .await
+        .unwrap();
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed.as_millis() < 2000,
+        "Storage info on empty collection took {}ms, expected <2000ms",
+        elapsed.as_millis()
+    );
+
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["data"]["doc_count"], 0);
+    assert_eq!(body["data"]["oldest_doc"], Value::Null);
+    assert_eq!(body["data"]["newest_doc"], Value::Null);
+}
+
+#[tokio::test]
+async fn test_storage_info_with_docs_and_index() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    // Create collection with docs and an index
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "logs"}))
+        .send()
+        .await
+        .unwrap();
+
+    for i in 0..5 {
+        client
+            .post(format!("{base_url}/logs/docs"))
+            .json(&json!({"level": "info", "seq": i}))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    client
+        .post(format!("{base_url}/logs/indexes"))
+        .json(&json!({"name": "idx_level", "fields": ["level"]}))
+        .send()
+        .await
+        .unwrap();
+
+    // Storage info should return with valid data, not hang
+    let start = std::time::Instant::now();
+    let resp = client
+        .get(format!("{base_url}/logs/storage"))
+        .send()
+        .await
+        .unwrap();
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed.as_millis() < 2000,
+        "Storage info took {}ms, expected <2000ms",
+        elapsed.as_millis()
+    );
+
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["data"]["doc_count"], 5);
+    assert!(body["data"]["oldest_doc"].is_string());
+    assert!(body["data"]["newest_doc"].is_string());
+    assert_eq!(body["data"]["index_count"], 1);
+    let indexes = body["data"]["indexes"].as_array().unwrap();
+    assert_eq!(indexes.len(), 1);
+    assert_eq!(indexes[0], "idx_level");
+}
+
+// ── Bitmap Fixes Tests ──────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_bitmap_drop_collection_clears_persistence() {
+    let (base_url, _tmp) = start_test_server_with_bitmap("category").await;
+    let client = Client::new();
+
+    // Create collection and insert docs to populate bitmap
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "events"}))
+        .send()
+        .await
+        .unwrap();
+
+    for i in 0..10 {
+        let cat = if i % 2 == 0 { "A" } else { "B" };
+        client
+            .post(format!("{base_url}/events/docs"))
+            .json(&json!({"category": cat}))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    // Verify bitmap is populated
+    let resp = client
+        .get(format!("{base_url}/_stats"))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    let positions = body["data"]["scan_accelerator"]["total_positions"]
+        .as_u64()
+        .unwrap_or(0);
+    assert!(positions > 0, "Bitmap should be populated before drop");
+
+    // Drop the collection
+    client
+        .delete(format!("{base_url}/events"))
+        .send()
+        .await
+        .unwrap();
+
+    // Re-create with same name
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "events"}))
+        .send()
+        .await
+        .unwrap();
+
+    // Verify bitmap state is clean — total_positions should be 0
+    let resp = client
+        .get(format!("{base_url}/_stats"))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    let positions = body["data"]["scan_accelerator"]["total_positions"]
+        .as_u64()
+        .unwrap_or(0);
+    assert_eq!(
+        positions, 0,
+        "Bitmap positions should be 0 after drop + re-create"
+    );
+}
+
+#[tokio::test]
+async fn test_bitmap_count_only_priority_over_index() {
+    let (base_url, _tmp) = start_test_server_with_bitmap("category").await;
+    let client = Client::new();
+
+    // Create collection with both an index and bitmap on the same field
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "events"}))
+        .send()
+        .await
+        .unwrap();
+
+    for i in 0..20 {
+        let cat = if i % 4 == 0 {
+            "A"
+        } else if i % 4 == 1 {
+            "B"
+        } else if i % 4 == 2 {
+            "C"
+        } else {
+            "D"
+        };
+        client
+            .post(format!("{base_url}/events/docs"))
+            .json(&json!({"category": cat}))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    // Create a secondary index on the same field
+    client
+        .post(format!("{base_url}/events/indexes"))
+        .json(&json!({"name": "idx_category", "fields": ["category"]}))
+        .send()
+        .await
+        .unwrap();
+
+    // count_only query should prefer bitmap over index
+    let resp = client
+        .post(format!("{base_url}/events/query"))
+        .json(&json!({
+            "filter": {"category": "A"},
+            "count_only": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["data"]["count"], 5);
+    assert_eq!(body["meta"]["docs_scanned"], 0);
+    assert_eq!(
+        body["meta"]["scan_strategy"], "bitmap",
+        "count_only should prefer bitmap over index"
+    );
+
+    // Non-count_only query should still use the index
+    let resp = client
+        .post(format!("{base_url}/events/query"))
+        .json(&json!({
+            "filter": {"category": "A"},
+            "limit": 50
+        }))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], true);
+    let docs = body["data"].as_array().unwrap();
+    assert_eq!(docs.len(), 5);
+    // Should use index, not bitmap, for document-returning queries
+    let strategy = body["meta"]["scan_strategy"].as_str().unwrap_or("");
+    assert_ne!(
+        strategy, "bitmap",
+        "Non-count_only should not use bitmap when index available"
+    );
+}
+
+#[tokio::test]
+async fn test_bitmap_rearm_after_drop_recreate() {
+    let (base_url, _tmp) = start_test_server_with_bitmap("category").await;
+    let client = Client::new();
+
+    // Create collection and insert docs
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "events"}))
+        .send()
+        .await
+        .unwrap();
+
+    for i in 0..20 {
+        let cat = if i % 2 == 0 { "A" } else { "B" };
+        client
+            .post(format!("{base_url}/events/docs"))
+            .json(&json!({"category": cat}))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    // Verify bitmap is populated
+    let resp = client
+        .get(format!("{base_url}/_stats"))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    let positions = body["data"]["scan_accelerator"]["total_positions"]
+        .as_u64()
+        .unwrap_or(0);
+    assert_eq!(positions, 20, "Bitmap should have 20 positions before drop");
+
+    // Drop collection
+    client
+        .delete(format!("{base_url}/events"))
+        .send()
+        .await
+        .unwrap();
+
+    // Recreate same collection and insert new docs
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "events"}))
+        .send()
+        .await
+        .unwrap();
+
+    for i in 0..20 {
+        let cat = if i % 4 == 0 {
+            "X"
+        } else if i % 4 == 1 {
+            "Y"
+        } else {
+            "Z"
+        };
+        client
+            .post(format!("{base_url}/events/docs"))
+            .json(&json!({"category": cat}))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    // Verify bitmap is re-armed with new data
+    let resp = client
+        .get(format!("{base_url}/_stats"))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    let positions = body["data"]["scan_accelerator"]["total_positions"]
+        .as_u64()
+        .unwrap_or(0);
+    assert_eq!(
+        positions, 20,
+        "Bitmap should have 20 positions after drop + recreate + insert"
+    );
+
+    // Verify bitmap scan actually works
+    let resp = client
+        .post(format!("{base_url}/events/query"))
+        .json(&json!({
+            "filter": {"category": "X"},
+            "count_only": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["data"]["count"], 5);
+    assert_eq!(body["meta"]["scan_strategy"], "bitmap");
+    assert_eq!(body["meta"]["docs_scanned"], 0);
+}

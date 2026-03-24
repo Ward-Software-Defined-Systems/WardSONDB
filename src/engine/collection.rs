@@ -46,6 +46,12 @@ impl Storage {
         // Initialize doc counter
         self.doc_counts.initialize(name, 0);
 
+        // Re-arm scan accelerator if bitmap columns are configured
+        // (columns survive clear() on drop — they're emptied, not removed)
+        if self.scan_accelerator.has_columns() {
+            self.scan_accelerator.set_ready(true);
+        }
+
         Ok(CollectionInfo {
             name: name.to_string(),
             doc_count: 0,
@@ -159,8 +165,16 @@ impl Storage {
         // Remove doc counter
         self.doc_counts.remove(name);
 
-        // Clear scan accelerator
+        // Clear scan accelerator in-memory state
         self.scan_accelerator.clear();
+
+        // Delete persisted bitmap files (accelerator is global, persisted under "_all")
+        let bitmap_dir = self.data_dir.join("bitmap").join("_all");
+        if bitmap_dir.exists()
+            && let Err(e) = std::fs::remove_dir_all(&bitmap_dir)
+        {
+            tracing::debug!("Failed to remove bitmap dir: {e}");
+        }
 
         self.persist()?;
         Ok(())

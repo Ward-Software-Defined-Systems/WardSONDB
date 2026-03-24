@@ -96,6 +96,8 @@ pub struct Storage {
     partition_opts: PartitionCreateOptions,
     /// Bitmap scan accelerator for fast unindexed queries.
     pub scan_accelerator: ScanAccelerator,
+    /// Data directory path (for bitmap persistence cleanup).
+    pub data_dir: std::path::PathBuf,
 }
 
 impl Storage {
@@ -143,6 +145,7 @@ impl Storage {
             memory_config: mem,
             partition_opts,
             scan_accelerator,
+            data_dir: data_dir.to_path_buf(),
         };
 
         // Load indexes from meta
@@ -215,6 +218,11 @@ impl Storage {
         &self,
         collection: &str,
     ) -> Result<(Option<String>, Option<String>), AppError> {
+        // Skip iterator on empty collections — fjall iter blocks on empty partitions
+        if self.doc_counts.get(collection) <= 0 {
+            return Ok((None, None));
+        }
+
         let docs_partition = self.get_docs_partition(collection)?;
         let read_tx = self.db.read_tx();
 
