@@ -136,14 +136,10 @@ pub fn decode_sortable_bytes(bytes: &[u8]) -> Option<Value> {
 /// Extract the doc_id from an index key by splitting on the \x00 separator.
 /// The doc_id is everything after the last \x00.
 pub fn extract_doc_id_from_key(key: &[u8]) -> Option<String> {
-    // UUIDv7 format (36 chars): "01234567-89ab-7cde-8f01-234567890abc"
-    // This is always 36 bytes at the end of the key.
-    if key.len() < 37 {
-        return None; // Too short: need at least 1 byte prefix + \x00 + 36 byte UUID
-    }
-    // The separator is at position key.len() - 37
-    let sep_pos = key.len() - 37;
-    if key[sep_pos] != 0x00 {
+    // Key format: {encoded_value}\x00{doc_id}
+    // Find the last \x00 separator (doc_id is guaranteed to not contain \x00)
+    let sep_pos = key.iter().rposition(|&b| b == 0x00)?;
+    if sep_pos + 1 >= key.len() {
         return None;
     }
     String::from_utf8(key[sep_pos + 1..].to_vec()).ok()

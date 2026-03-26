@@ -19,6 +19,7 @@ A lightweight, high-performance JSON document database built in Rust. Designed f
 - **TLS support** — auto-generated self-signed certs or bring your own
 - **API key authentication** — simple token-based auth for production deployments
 - **Prometheus metrics** — `/_metrics` endpoint for monitoring integration
+- **Custom document IDs** — optionally provide your own `_id` on insert, or let WardSONDB auto-generate UUIDv7
 - **Optimistic concurrency** — `_rev`-based conflict detection on updates
 
 ## Performance
@@ -75,13 +76,22 @@ curl -X POST http://localhost:8080/_collections \
   -H "Content-Type: application/json" \
   -d '{"name": "events"}'
 
-# Insert a document
+# Insert a document (auto-generated UUIDv7 ID)
 curl -X POST http://localhost:8080/events/docs \
   -H "Content-Type: application/json" \
   -d '{
     "event_type": "firewall",
     "network": {"src_ip": "10.0.0.1", "action": "block"},
     "severity": "high"
+  }'
+
+# Insert with custom ID
+curl -X POST http://localhost:8080/events/docs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "_id": "evt-firewall-2026-03-25-001",
+    "event_type": "firewall",
+    "network": {"src_ip": "192.168.1.100", "action": "block"}
   }'
 
 # Bulk insert
@@ -203,8 +213,8 @@ Full API documentation: [API.md](API.md)
 ### Documents
 | Method | Path | Description |
 |--------|------|-------------|
-| POST | `/{collection}/docs` | Insert document |
-| POST | `/{collection}/docs/_bulk` | Bulk insert |
+| POST | `/{collection}/docs` | Insert document (optional custom `_id`) |
+| POST | `/{collection}/docs/_bulk` | Bulk insert (optional custom `_id` per doc) |
 | GET | `/{collection}/docs/{id}` | Get by ID |
 | PUT | `/{collection}/docs/{id}` | Replace document |
 | PATCH | `/{collection}/docs/{id}` | Partial update (JSON Merge Patch) |

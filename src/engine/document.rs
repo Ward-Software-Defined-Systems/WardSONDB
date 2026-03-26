@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use chrono::Utc;
 use serde_json::Value;
 use uuid::Uuid;
@@ -9,18 +11,61 @@ use super::storage::Storage;
 
 const MAX_DOCUMENT_SIZE: usize = 16 * 1024 * 1024; // 16 MB
 const MAX_BULK_INSERT: usize = 10_000;
+const MAX_CUSTOM_ID_LENGTH: usize = 512;
+
+/// Validate a custom _id value. Returns the validated string or an error.
+fn validate_custom_id(value: &Value) -> Result<String, AppError> {
+    let s = match value {
+        Value::String(s) if !s.is_empty() => s,
+        _ => {
+            return Err(AppError::InvalidDocument(
+                "_id must be a non-empty string".into(),
+            ));
+        }
+    };
+    if s.len() > MAX_CUSTOM_ID_LENGTH {
+        return Err(AppError::InvalidDocument(
+            "_id exceeds maximum length of 512 bytes".into(),
+        ));
+    }
+    if s.starts_with('_') {
+        return Err(AppError::InvalidDocument(
+            "_id must not start with underscore".into(),
+        ));
+    }
+    if s.contains('\x00') {
+        return Err(AppError::InvalidDocument(
+            "_id contains invalid characters".into(),
+        ));
+    }
+    Ok(s.clone())
+}
 
 impl Storage {
     pub fn insert_document(&self, collection: &str, mut doc: Value) -> Result<Value, AppError> {
         self.check_not_poisoned()?;
         self.ensure_collection_exists(collection)?;
 
-        let id = Uuid::now_v7().to_string();
-        let now = Utc::now().to_rfc3339();
-
         let obj = doc
             .as_object_mut()
             .ok_or_else(|| AppError::InvalidDocument("Document must be a JSON object".into()))?;
+
+        // Determine ID: use custom _id if provided, otherwise generate UUIDv7
+        let id = if let Some(raw_id) = obj.remove("_id") {
+            let custom_id = validate_custom_id(&raw_id)?;
+            // Check for duplicate
+            let docs_partition = self.get_docs_partition(collection)?;
+            if docs_partition.get(&custom_id)?.is_some() {
+                return Err(AppError::DocumentConflict(format!(
+                    "Document already exists: {custom_id}"
+                )));
+            }
+            custom_id
+        } else {
+            Uuid::now_v7().to_string()
+        };
+
+        let now = Utc::now().to_rfc3339();
         obj.insert("_id".to_string(), Value::String(id.clone()));
         obj.insert("_rev".to_string(), Value::Number(1.into()));
         obj.insert("_created_at".to_string(), Value::String(now.clone()));
@@ -178,32 +223,70 @@ impl Storage {
         let mut errors = Vec::new();
         // (id, bytes, doc) — keep doc around for index writes
         let mut to_write: Vec<(String, Vec<u8>, Value)> = Vec::new();
+        let mut seen_ids: HashSet<String> = HashSet::new();
 
         for (i, mut doc) in documents.into_iter().enumerate() {
-            let id = Uuid::now_v7().to_string();
-            let now = Utc::now().to_rfc3339();
+            let obj = match doc.as_object_mut() {
+                Some(obj) => obj,
+                None => {
+                    errors.push(format!("Document {i}: must be a JSON object"));
+                    continue;
+                }
+            };
 
-            match doc.as_object_mut() {
-                Some(obj) => {
-                    obj.insert("_id".to_string(), Value::String(id.clone()));
-                    obj.insert("_rev".to_string(), Value::Number(1.into()));
-                    obj.insert("_created_at".to_string(), Value::String(now.clone()));
-                    obj.insert("_updated_at".to_string(), Value::String(now.clone()));
-                    obj.insert("_received_at".to_string(), Value::String(now));
-
-                    match serde_json::to_vec(&doc) {
-                        Ok(bytes) => {
-                            if bytes.len() > MAX_DOCUMENT_SIZE {
-                                errors.push(format!("Document {i}: exceeds 16 MB size limit"));
-                            } else {
-                                to_write.push((id, bytes, doc));
-                                inserted += 1;
+            // Determine ID: use custom _id if provided, otherwise generate UUIDv7
+            let id = if let Some(raw_id) = obj.remove("_id") {
+                match validate_custom_id(&raw_id) {
+                    Ok(custom_id) => {
+                        // Check for intra-batch duplicate
+                        if seen_ids.contains(&custom_id) {
+                            errors
+                                .push(format!("Document {i}: duplicate _id in batch: {custom_id}"));
+                            continue;
+                        }
+                        // Check for existing document in collection
+                        match docs_partition.get(&custom_id) {
+                            Ok(Some(_)) => {
+                                errors.push(format!(
+                                    "Document {i}: document already exists: {custom_id}"
+                                ));
+                                continue;
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                errors.push(format!("Document {i}: {e}"));
+                                continue;
                             }
                         }
-                        Err(e) => errors.push(format!("Document {i}: {e}")),
+                        custom_id
+                    }
+                    Err(e) => {
+                        errors.push(format!("Document {i}: {e}"));
+                        continue;
                     }
                 }
-                None => errors.push(format!("Document {i}: must be a JSON object")),
+            } else {
+                Uuid::now_v7().to_string()
+            };
+
+            let now = Utc::now().to_rfc3339();
+            obj.insert("_id".to_string(), Value::String(id.clone()));
+            obj.insert("_rev".to_string(), Value::Number(1.into()));
+            obj.insert("_created_at".to_string(), Value::String(now.clone()));
+            obj.insert("_updated_at".to_string(), Value::String(now.clone()));
+            obj.insert("_received_at".to_string(), Value::String(now));
+
+            match serde_json::to_vec(&doc) {
+                Ok(bytes) => {
+                    if bytes.len() > MAX_DOCUMENT_SIZE {
+                        errors.push(format!("Document {i}: exceeds 16 MB size limit"));
+                    } else {
+                        seen_ids.insert(id.clone());
+                        to_write.push((id, bytes, doc));
+                        inserted += 1;
+                    }
+                }
+                Err(e) => errors.push(format!("Document {i}: {e}")),
             }
         }
 

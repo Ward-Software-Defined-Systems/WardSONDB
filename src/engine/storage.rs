@@ -213,7 +213,8 @@ impl Storage {
         Ok(())
     }
 
-    /// Get the oldest and newest document timestamps from UUIDv7 keys.
+    /// Get the oldest and newest document timestamps from first/last keys.
+    /// Tries UUIDv7 timestamp extraction first; falls back to reading `_received_at`.
     pub fn get_doc_time_range(
         &self,
         collection: &str,
@@ -230,13 +231,13 @@ impl Storage {
             .iter(&docs_partition)
             .next()
             .and_then(|kv| kv.ok())
-            .and_then(|(k, _)| uuid_key_to_timestamp(k.as_ref()));
+            .and_then(|(k, _)| key_to_timestamp(k.as_ref(), &docs_partition));
 
         let newest = read_tx
             .iter(&docs_partition)
             .next_back()
             .and_then(|kv| kv.ok())
-            .and_then(|(k, _)| uuid_key_to_timestamp(k.as_ref()));
+            .and_then(|(k, _)| key_to_timestamp(k.as_ref(), &docs_partition));
 
         Ok((oldest, newest))
     }
@@ -248,12 +249,27 @@ impl Storage {
     }
 }
 
-/// Extract ISO 8601 timestamp from a UUIDv7 string key.
-fn uuid_key_to_timestamp(key_bytes: &[u8]) -> Option<String> {
+/// Extract timestamp from a partition key.
+/// Tries UUIDv7 first (no document read); falls back to reading `_received_at` from the document.
+fn key_to_timestamp(key_bytes: &[u8], partition: &fjall::TxPartitionHandle) -> Option<String> {
     let key_str = std::str::from_utf8(key_bytes).ok()?;
-    let uuid = Uuid::parse_str(key_str).ok()?;
-    let ts = uuid.get_timestamp()?;
-    let (secs, _nanos) = ts.to_unix();
-    let dt = chrono::DateTime::from_timestamp(secs as i64, 0)?;
-    Some(dt.to_rfc3339())
+    // Try UUIDv7 path first (no document read needed)
+    if let Ok(uuid) = Uuid::parse_str(key_str)
+        && let Some(ts) = uuid.get_timestamp()
+    {
+        let (secs, _nanos) = ts.to_unix();
+        if let Some(dt) = chrono::DateTime::from_timestamp(secs as i64, 0) {
+            return Some(dt.to_rfc3339());
+        }
+    }
+    // Fall back to reading the document's _received_at field
+    if let Ok(Some(doc_bytes)) = partition.get(key_str)
+        && let Ok(doc) = serde_json::from_slice::<serde_json::Value>(doc_bytes.as_ref())
+    {
+        return doc
+            .get("_received_at")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+    }
+    None
 }

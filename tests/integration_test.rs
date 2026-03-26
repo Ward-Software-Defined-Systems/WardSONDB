@@ -4297,3 +4297,481 @@ async fn test_bitmap_rearm_after_drop_recreate() {
     assert_eq!(body["meta"]["scan_strategy"], "bitmap");
     assert_eq!(body["meta"]["docs_scanned"], 0);
 }
+
+// ============================================================
+// Custom _id tests
+// ============================================================
+
+#[tokio::test]
+async fn test_custom_id_insert() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    // Create collection
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "events"}))
+        .send()
+        .await
+        .unwrap();
+
+    // Insert with custom _id
+    let resp = client
+        .post(format!("{base_url}/events/docs"))
+        .json(&json!({
+            "_id": "evt-firewall-001",
+            "event_type": "firewall",
+            "action": "block"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["data"]["_id"], "evt-firewall-001");
+    assert_eq!(body["data"]["_rev"], 1);
+    assert!(body["data"]["_created_at"].is_string());
+    assert!(body["data"]["_received_at"].is_string());
+
+    // GET by custom ID
+    let resp = client
+        .get(format!("{base_url}/events/docs/evt-firewall-001"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["data"]["_id"], "evt-firewall-001");
+    assert_eq!(body["data"]["event_type"], "firewall");
+}
+
+#[tokio::test]
+async fn test_custom_id_duplicate_rejected() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "events"}))
+        .send()
+        .await
+        .unwrap();
+
+    // First insert
+    let resp = client
+        .post(format!("{base_url}/events/docs"))
+        .json(&json!({"_id": "abc", "val": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+
+    // Duplicate insert → 409
+    let resp = client
+        .post(format!("{base_url}/events/docs"))
+        .json(&json!({"_id": "abc", "val": 2}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["error"]["code"], "DOCUMENT_CONFLICT");
+    assert!(body["error"]["message"].as_str().unwrap().contains("abc"));
+}
+
+#[tokio::test]
+async fn test_custom_id_validation() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "events"}))
+        .send()
+        .await
+        .unwrap();
+
+    // Empty string
+    let resp = client
+        .post(format!("{base_url}/events/docs"))
+        .json(&json!({"_id": "", "val": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("non-empty string")
+    );
+
+    // Non-string (number)
+    let resp = client
+        .post(format!("{base_url}/events/docs"))
+        .json(&json!({"_id": 42, "val": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("non-empty string")
+    );
+
+    // Starts with underscore
+    let resp = client
+        .post(format!("{base_url}/events/docs"))
+        .json(&json!({"_id": "_reserved", "val": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("underscore")
+    );
+
+    // Exceeds 512 bytes
+    let long_id = "x".repeat(513);
+    let resp = client
+        .post(format!("{base_url}/events/docs"))
+        .json(&json!({"_id": long_id, "val": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("maximum length")
+    );
+
+    // Contains null byte
+    let resp = client
+        .post(format!("{base_url}/events/docs"))
+        .json(&json!({"_id": "has\x00null", "val": 1}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid characters")
+    );
+}
+
+#[tokio::test]
+async fn test_custom_id_auto_generate_when_absent() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "events"}))
+        .send()
+        .await
+        .unwrap();
+
+    // Insert without _id
+    let resp = client
+        .post(format!("{base_url}/events/docs"))
+        .json(&json!({"event_type": "login"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let body: Value = resp.json().await.unwrap();
+    let auto_id = body["data"]["_id"].as_str().unwrap();
+    // UUIDv7 format: 8-4-4-4-12 hex chars
+    assert_eq!(auto_id.len(), 36);
+    assert!(auto_id.contains('-'));
+}
+
+#[tokio::test]
+async fn test_custom_id_bulk_insert() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "events"}))
+        .send()
+        .await
+        .unwrap();
+
+    // Bulk: one custom, one auto, one duplicate within batch
+    let resp = client
+        .post(format!("{base_url}/events/docs/_bulk"))
+        .json(&json!({
+            "documents": [
+                {"_id": "custom-1", "val": 1},
+                {"val": 2},
+                {"_id": "custom-1", "val": 3}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["data"]["inserted"], 2);
+    let errors = body["data"]["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].as_str().unwrap().contains("duplicate _id"));
+
+    // Verify the custom-id doc was inserted
+    let resp = client
+        .get(format!("{base_url}/events/docs/custom-1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["data"]["val"], 1);
+}
+
+#[tokio::test]
+async fn test_custom_id_bulk_duplicate_existing() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "events"}))
+        .send()
+        .await
+        .unwrap();
+
+    // Pre-insert a document
+    client
+        .post(format!("{base_url}/events/docs"))
+        .json(&json!({"_id": "existing-1", "val": 1}))
+        .send()
+        .await
+        .unwrap();
+
+    // Bulk insert with conflicting _id
+    let resp = client
+        .post(format!("{base_url}/events/docs/_bulk"))
+        .json(&json!({
+            "documents": [
+                {"_id": "existing-1", "val": 2},
+                {"_id": "new-1", "val": 3}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["data"]["inserted"], 1);
+    let errors = body["data"]["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1);
+    assert!(errors[0].as_str().unwrap().contains("existing-1"));
+
+    // Original doc unchanged
+    let resp = client
+        .get(format!("{base_url}/events/docs/existing-1"))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["data"]["val"], 1);
+}
+
+#[tokio::test]
+async fn test_custom_id_index_maintenance() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "events"}))
+        .send()
+        .await
+        .unwrap();
+
+    // Create index on event_type
+    client
+        .post(format!("{base_url}/events/indexes"))
+        .json(&json!({"name": "idx_type", "fields": ["event_type"]}))
+        .send()
+        .await
+        .unwrap();
+
+    // Insert with custom _id
+    client
+        .post(format!("{base_url}/events/docs"))
+        .json(&json!({"_id": "evt-001", "event_type": "login", "user": "alice"}))
+        .send()
+        .await
+        .unwrap();
+
+    // Query using the indexed field
+    let resp = client
+        .post(format!("{base_url}/events/query"))
+        .json(&json!({"filter": {"event_type": "login"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let docs = body["data"].as_array().unwrap();
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0]["_id"], "evt-001");
+    // Verify index was used
+    assert!(
+        body["meta"]["index_used"].is_string(),
+        "Expected index to be used"
+    );
+}
+
+#[tokio::test]
+async fn test_custom_id_update_and_delete() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "events"}))
+        .send()
+        .await
+        .unwrap();
+
+    // Insert with custom _id
+    client
+        .post(format!("{base_url}/events/docs"))
+        .json(&json!({"_id": "doc-1", "val": 1, "extra": "a"}))
+        .send()
+        .await
+        .unwrap();
+
+    // PUT replace
+    let resp = client
+        .put(format!("{base_url}/events/docs/doc-1"))
+        .json(&json!({"val": 2}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["data"]["_id"], "doc-1");
+    assert_eq!(body["data"]["_rev"], 2);
+    assert_eq!(body["data"]["val"], 2);
+    // extra field should be gone (full replace)
+    assert!(body["data"]["extra"].is_null());
+
+    // PATCH partial update
+    let resp = client
+        .patch(format!("{base_url}/events/docs/doc-1"))
+        .json(&json!({"val": 3}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["data"]["_rev"], 3);
+    assert_eq!(body["data"]["val"], 3);
+
+    // DELETE
+    let resp = client
+        .delete(format!("{base_url}/events/docs/doc-1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    // Verify gone
+    let resp = client
+        .get(format!("{base_url}/events/docs/doc-1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+#[tokio::test]
+async fn test_custom_id_bitmap_maintenance() {
+    let (base_url, _tmp) = start_test_server_with_bitmap("category").await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "events"}))
+        .send()
+        .await
+        .unwrap();
+
+    // Insert docs with custom _id and bitmap-tracked field
+    for i in 0..5 {
+        let resp = client
+            .post(format!("{base_url}/events/docs"))
+            .json(&json!({
+                "_id": format!("bm-{i}"),
+                "category": "A",
+                "val": i
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201, "Insert bm-{i} failed");
+    }
+    // Insert some with category B
+    for i in 5..8 {
+        client
+            .post(format!("{base_url}/events/docs"))
+            .json(&json!({
+                "_id": format!("bm-{i}"),
+                "category": "B",
+                "val": i
+            }))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    // Bitmap count query
+    let resp = client
+        .post(format!("{base_url}/events/query"))
+        .json(&json!({
+            "filter": {"category": "A"},
+            "count_only": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["data"]["count"], 5);
+    assert_eq!(body["meta"]["scan_strategy"], "bitmap");
+
+    // Verify full query returns the correct custom-ID docs
+    let resp = client
+        .post(format!("{base_url}/events/query"))
+        .json(&json!({"filter": {"category": "B"}}))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    let docs = body["data"].as_array().unwrap();
+    assert_eq!(docs.len(), 3);
+    let ids: Vec<&str> = docs.iter().map(|d| d["_id"].as_str().unwrap()).collect();
+    assert!(ids.contains(&"bm-5"));
+    assert!(ids.contains(&"bm-6"));
+    assert!(ids.contains(&"bm-7"));
+}

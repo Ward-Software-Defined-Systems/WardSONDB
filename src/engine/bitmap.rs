@@ -11,17 +11,6 @@ use uuid::Uuid;
 
 use crate::query::filter::{FilterNode, FilterOp, resolve_json_path};
 
-/// Compact UUID storage — 16 bytes instead of 36-byte hex string.
-type DocIdBytes = [u8; 16];
-
-fn doc_id_to_bytes(id: &str) -> Option<DocIdBytes> {
-    Uuid::parse_str(id).ok().map(|u| *u.as_bytes())
-}
-
-fn bytes_to_doc_id(bytes: &DocIdBytes) -> String {
-    Uuid::from_bytes(*bytes).to_string()
-}
-
 /// Convert a JSON value to a deterministic string key for bitmap HashMap lookup.
 pub fn value_to_string_key(value: &Value) -> String {
     match value {
@@ -38,8 +27,8 @@ pub fn value_to_string_key(value: &Value) -> String {
 
 /// Bidirectional mapping between document IDs and row positions (u32).
 pub struct RowPositionMap {
-    id_to_pos: RwLock<HashMap<DocIdBytes, u32>>,
-    pos_to_id: RwLock<Vec<Option<DocIdBytes>>>,
+    id_to_pos: RwLock<HashMap<String, u32>>,
+    pos_to_id: RwLock<Vec<Option<String>>>,
     next_pos: AtomicU32,
 }
 
@@ -60,40 +49,34 @@ impl RowPositionMap {
 
     /// Assign the next row position to a document ID.
     pub fn assign(&self, doc_id: &str) -> Option<u32> {
-        let bytes = doc_id_to_bytes(doc_id)?;
         let pos = self.next_pos.fetch_add(1, Ordering::Relaxed);
-        self.id_to_pos.write().insert(bytes, pos);
+        self.id_to_pos.write().insert(doc_id.to_string(), pos);
         let mut vec = self.pos_to_id.write();
         if pos as usize >= vec.len() {
             vec.resize(pos as usize + 1, None);
         }
-        vec[pos as usize] = Some(bytes);
+        vec[pos as usize] = Some(doc_id.to_string());
         Some(pos)
     }
 
     /// Lookup row position by document ID.
     pub fn get_position(&self, doc_id: &str) -> Option<u32> {
-        let bytes = doc_id_to_bytes(doc_id)?;
-        self.id_to_pos.read().get(&bytes).copied()
+        self.id_to_pos.read().get(doc_id).copied()
     }
 
     /// Lookup document ID by row position.
     pub fn get_doc_id(&self, pos: u32) -> Option<String> {
         let vec = self.pos_to_id.read();
-        vec.get(pos as usize)
-            .and_then(|opt| opt.as_ref())
-            .map(bytes_to_doc_id)
+        vec.get(pos as usize).and_then(|opt| opt.as_ref()).cloned()
     }
 
     /// Remove a document from id_to_pos (position stays allocated; bitmap handles the hole).
     pub fn remove(&self, doc_id: &str) {
-        if let Some(bytes) = doc_id_to_bytes(doc_id) {
-            let pos = self.id_to_pos.write().remove(&bytes);
-            if let Some(pos) = pos {
-                let mut vec = self.pos_to_id.write();
-                if let Some(slot) = vec.get_mut(pos as usize) {
-                    *slot = None;
-                }
+        let pos = self.id_to_pos.write().remove(doc_id);
+        if let Some(pos) = pos {
+            let mut vec = self.pos_to_id.write();
+            if let Some(slot) = vec.get_mut(pos as usize) {
+                *slot = None;
             }
         }
     }
@@ -728,30 +711,21 @@ impl ScanAccelerator {
             serde_json::to_string_pretty(&meta).unwrap_or_default(),
         )?;
 
-        // Write position map as binary (16 bytes per entry, with 1 byte present flag)
-        let mut pos_data = Vec::with_capacity(positions_vec.len() * 17);
-        for slot in positions_vec.iter() {
-            match slot {
-                Some(bytes) => {
-                    pos_data.push(1u8);
-                    pos_data.extend_from_slice(bytes);
-                }
-                None => {
-                    pos_data.push(0u8);
-                    pos_data.extend_from_slice(&[0u8; 16]);
-                }
-            }
-        }
-        fs::write(bitmap_dir.join("positions.map.bin"), &pos_data)?;
+        // Write position map as JSON (supports variable-length string IDs)
+        let pos_entries: Vec<Option<&str>> =
+            positions_vec.iter().map(|slot| slot.as_deref()).collect();
+        fs::write(
+            bitmap_dir.join("positions.map.json"),
+            serde_json::to_string(&pos_entries).unwrap_or_default(),
+        )?;
 
-        // Persist id_to_pos as well (for fast lookup reconstruction)
+        // Persist id_to_pos as JSON
         let id_map = self.positions.id_to_pos.read();
-        let mut id_data = Vec::with_capacity(id_map.len() * 20);
-        for (bytes, pos) in id_map.iter() {
-            id_data.extend_from_slice(bytes);
-            id_data.extend_from_slice(&pos.to_le_bytes());
-        }
-        fs::write(bitmap_dir.join("positions.ids.bin"), &id_data)?;
+        let id_entries: HashMap<&str, u32> = id_map.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        fs::write(
+            bitmap_dir.join("positions.ids.json"),
+            serde_json::to_string(&id_entries).unwrap_or_default(),
+        )?;
 
         // Persist bitmap columns
         let columns = self.columns.read();
@@ -822,47 +796,62 @@ impl ScanAccelerator {
         };
         let next_pos = meta.get("next_pos").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
 
-        // Load position map
-        let pos_data = match fs::read(bitmap_dir.join("positions.map.bin")) {
-            Ok(d) => d,
-            Err(_) => return false,
-        };
-
-        let mut pos_vec = Vec::new();
-        let mut i = 0;
-        while i + 17 <= pos_data.len() {
-            let present = pos_data[i];
-            i += 1;
-            if present == 1 {
-                let mut bytes = [0u8; 16];
-                bytes.copy_from_slice(&pos_data[i..i + 16]);
-                pos_vec.push(Some(bytes));
-            } else {
-                pos_vec.push(None);
+        // Load position map (JSON format — supports variable-length string IDs)
+        // Try new JSON format first, fall back to legacy binary format
+        let (pos_vec, id_map) = if let Ok(json_data) =
+            fs::read_to_string(bitmap_dir.join("positions.map.json"))
+        {
+            let pos_vec: Vec<Option<String>> = match serde_json::from_str(&json_data) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            let id_json = match fs::read_to_string(bitmap_dir.join("positions.ids.json")) {
+                Ok(d) => d,
+                Err(_) => return false,
+            };
+            let id_map: HashMap<String, u32> = match serde_json::from_str(&id_json) {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+            (pos_vec, id_map)
+        } else {
+            // Legacy binary format (UUID-only, 16 bytes per entry)
+            let pos_data = match fs::read(bitmap_dir.join("positions.map.bin")) {
+                Ok(d) => d,
+                Err(_) => return false,
+            };
+            let mut pos_vec = Vec::new();
+            let mut i = 0;
+            while i + 17 <= pos_data.len() {
+                let present = pos_data[i];
+                i += 1;
+                if present == 1 {
+                    let uuid = Uuid::from_bytes(pos_data[i..i + 16].try_into().unwrap_or([0; 16]));
+                    pos_vec.push(Some(uuid.to_string()));
+                } else {
+                    pos_vec.push(None);
+                }
+                i += 16;
             }
-            i += 16;
-        }
-
-        // Load id_to_pos
-        let id_data = match fs::read(bitmap_dir.join("positions.ids.bin")) {
-            Ok(d) => d,
-            Err(_) => return false,
+            let id_data = match fs::read(bitmap_dir.join("positions.ids.bin")) {
+                Ok(d) => d,
+                Err(_) => return false,
+            };
+            let mut id_map = HashMap::new();
+            let mut j = 0;
+            while j + 20 <= id_data.len() {
+                let uuid = Uuid::from_bytes(id_data[j..j + 16].try_into().unwrap_or([0; 16]));
+                let pos = u32::from_le_bytes([
+                    id_data[j + 16],
+                    id_data[j + 17],
+                    id_data[j + 18],
+                    id_data[j + 19],
+                ]);
+                id_map.insert(uuid.to_string(), pos);
+                j += 20;
+            }
+            (pos_vec, id_map)
         };
-
-        let mut id_map = HashMap::new();
-        let mut j = 0;
-        while j + 20 <= id_data.len() {
-            let mut bytes = [0u8; 16];
-            bytes.copy_from_slice(&id_data[j..j + 16]);
-            let pos = u32::from_le_bytes([
-                id_data[j + 16],
-                id_data[j + 17],
-                id_data[j + 18],
-                id_data[j + 19],
-            ]);
-            id_map.insert(bytes, pos);
-            j += 20;
-        }
 
         // Install position data
         *self.positions.id_to_pos.write() = id_map;

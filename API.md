@@ -381,7 +381,9 @@ curl -X DELETE http://localhost:8080/events
 
 ### POST /{collection}/docs — Insert Document
 
-Insert a JSON document. System fields are added automatically: `_id` (UUIDv7), `_rev`, `_created_at`, `_updated_at`, and `_received_at` (server-side ingest timestamp, immutable on updates).
+Insert a JSON document. If the request body includes an `_id` field with a non-empty string value, it is used as the document ID. Otherwise, a UUIDv7 is auto-generated. Other system fields are added automatically: `_rev`, `_created_at`, `_updated_at`, and `_received_at` (server-side ingest timestamp, immutable on updates).
+
+**Custom `_id` rules:** must be a non-empty string, max 512 bytes, must not start with `_`, must not contain null bytes.
 
 ```bash
 curl -X POST http://localhost:8080/events/docs \
@@ -394,6 +396,17 @@ curl -X POST http://localhost:8080/events/docs \
       "dst_port": 443
     },
     "severity": "high"
+  }'
+```
+
+**Insert with custom ID:**
+```bash
+curl -X POST http://localhost:8080/events/docs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "_id": "evt-firewall-2026-03-25-001",
+    "event_type": "firewall",
+    "network": {"src_ip": "192.168.1.100", "action": "block"}
   }'
 ```
 
@@ -420,11 +433,14 @@ curl -X POST http://localhost:8080/events/docs \
 
 **Errors:**
 - `404 COLLECTION_NOT_FOUND`
-- `400 INVALID_DOCUMENT` — malformed JSON
+- `400 INVALID_DOCUMENT` — malformed JSON or invalid custom `_id`
+- `409 DOCUMENT_CONFLICT` — a document with the provided `_id` already exists
 
 ### POST /{collection}/docs/_bulk — Bulk Insert
 
 Insert multiple documents (maximum 10,000 per request). Uses **partial success** semantics: each document is validated individually, and invalid documents are skipped with per-document errors. All valid documents are committed atomically in a single transaction.
+
+Documents may include a custom `_id` field. If provided, it must be a unique non-empty string. Duplicate `_id` values (within the batch or against existing documents) are skipped with per-document errors.
 
 ```bash
 curl -X POST http://localhost:8080/events/docs/_bulk \
