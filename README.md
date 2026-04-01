@@ -68,6 +68,24 @@ ulimit -n 65536
   --bitmap-fields "event_type,severity,status"
 ```
 
+### Linux: use jemalloc to avoid RSS bloat
+
+On Linux, glibc's default allocator (ptmalloc2) holds onto freed memory in per-thread arenas. With Tokio's multi-threaded runtime, RSS climbs continuously even though the application isn't leaking — the allocator is hoarding fragmented memory. This does not occur on macOS, where libmalloc returns freed memory aggressively.
+
+If you are deploying on Linux, add jemalloc to `Cargo.toml`:
+
+```toml
+[dependencies]
+tikv-jemallocator = "0.6"
+```
+
+And in `main.rs`:
+
+```rust
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+```
+
 ### Create a collection and insert data
 
 ```bash
