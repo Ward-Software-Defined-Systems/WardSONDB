@@ -33,6 +33,7 @@ fn test_config(tmp: &TempDir, port: u16) -> Config {
         bitmap_fields: String::new(),
         bitmap_max_cardinality: 1000,
         bitmap_sample_size: 100,
+        bitmap_memory_mb: 0,
         no_bitmap: false,
     }
 }

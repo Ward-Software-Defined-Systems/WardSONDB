@@ -94,6 +94,7 @@ async fn main() {
             {
                 let mut cfg = storage.scan_accelerator.config_mut();
                 cfg.max_cardinality = config.bitmap_max_cardinality;
+                cfg.max_memory_bytes = resolve_bitmap_memory_limit(config.bitmap_memory_mb);
             }
 
             // Try loading from disk first, then rebuild from storage
@@ -128,7 +129,7 @@ async fn main() {
     // Spawn periodic stats reporter (every 10 seconds)
     server::metrics::spawn_stats_reporter(metrics.clone(), 10);
 
-    // Spawn bitmap persistence task (every 60 seconds)
+    // Spawn bitmap persistence + compaction task (every 60 seconds)
     if !config.no_bitmap {
         let persist_state = state.clone();
         let data_dir_owned = config.data_dir.clone();
@@ -145,6 +146,16 @@ async fn main() {
                         .persist_to_disk(dir, "_all")
                     {
                         warn!(error = %e, "Failed to persist scan accelerator");
+                    }
+
+                    // Compact if >25% holes from TTL deletes
+                    if persist_state.storage.scan_accelerator.needs_compaction() {
+                        info!("Bitmap position map has >25% holes, triggering compaction rebuild");
+                        let compact_state = persist_state.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            rebuild_all_accelerators(&compact_state.storage);
+                        })
+                        .await;
                     }
                 }
             }
@@ -278,8 +289,11 @@ fn resolve_tls_paths(config: &Config) -> (String, String) {
     )
 }
 
-/// Rebuild scan accelerator from all existing collections.
+/// Rebuild scan accelerator from all existing collections using batched iteration.
+/// Peak memory: ~BATCH_SIZE documents instead of all documents.
 fn rebuild_all_accelerators(storage: &Storage) {
+    const BATCH_SIZE: usize = 10_000;
+
     let collections = match storage.list_collections() {
         Ok(c) => c,
         Err(e) => {
@@ -287,28 +301,62 @@ fn rebuild_all_accelerators(storage: &Storage) {
             return;
         }
     };
-    let mut all_docs: Vec<(String, serde_json::Value)> = Vec::new();
+
+    storage.scan_accelerator.set_ready(false);
+    storage.scan_accelerator.clear();
+
+    // Re-create columns after clear
+    let fields = storage.scan_accelerator.config_read().bitmap_fields.clone();
+    if !fields.is_empty() {
+        storage.scan_accelerator.configure_fields(fields);
+    }
+
+    let start = std::time::Instant::now();
+    let mut total_docs: usize = 0;
+
     for col in &collections {
-        match storage.scan_all_documents(&col.name) {
-            Ok(docs) => {
-                for doc in docs {
-                    if let Some(id) = doc.get("_id").and_then(|v| v.as_str()) {
-                        all_docs.push((id.to_string(), doc));
-                    }
+        let docs_partition = match storage.get_docs_partition(&col.name) {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(collection = col.name, error = %e, "Skipping collection for rebuild");
+                continue;
+            }
+        };
+        let read_tx = storage.db.read_tx();
+        let mut batch: Vec<(String, serde_json::Value)> = Vec::with_capacity(BATCH_SIZE);
+
+        for kv in read_tx.iter(&docs_partition) {
+            if let Ok((_, value)) = kv
+                && let Ok(doc) = serde_json::from_slice::<serde_json::Value>(value.as_ref())
+                && let Some(id) = doc.get("_id").and_then(|v| v.as_str())
+            {
+                batch.push((id.to_string(), doc));
+            }
+            if batch.len() >= BATCH_SIZE {
+                total_docs += batch.len();
+                storage.scan_accelerator.rebuild_batch(&batch);
+                batch.clear();
+                if storage.scan_accelerator.is_over_budget() {
+                    info!(
+                        docs_indexed = total_docs,
+                        "Bitmap rebuild stopped early: memory budget exceeded"
+                    );
+                    break;
                 }
             }
-            Err(e) => {
-                warn!(
-                    collection = col.name,
-                    error = %e,
-                    "Failed to scan collection for accelerator rebuild"
-                );
-            }
+        }
+        if !batch.is_empty() {
+            total_docs += batch.len();
+            storage.scan_accelerator.rebuild_batch(&batch);
         }
     }
-    if !all_docs.is_empty() {
-        storage.scan_accelerator.rebuild_from_storage(&all_docs);
-    }
+
+    info!(
+        docs = total_docs,
+        elapsed_ms = start.elapsed().as_millis(),
+        "Scan accelerator rebuilt (batched)"
+    );
+    storage.scan_accelerator.set_ready(true);
 }
 
 /// Check the OS file descriptor limit and warn if too low.
@@ -365,4 +413,69 @@ fn check_file_descriptor_limit() {
             );
         }
     }
+}
+
+/// Resolve the bitmap memory limit from the CLI flag.
+/// 0 = auto: min(4GB, 10% of system RAM).
+fn resolve_bitmap_memory_limit(configured_mb: u64) -> u64 {
+    if configured_mb > 0 {
+        let bytes = configured_mb * 1024 * 1024;
+        info!(
+            bitmap_memory_mb = configured_mb,
+            "Bitmap memory budget set (explicit)"
+        );
+        return bytes;
+    }
+    let four_gb: u64 = 4 * 1024 * 1024 * 1024;
+    let budget = match system_ram_bytes() {
+        Some(ram) => std::cmp::min(four_gb, ram / 10),
+        None => four_gb,
+    };
+    info!(
+        bitmap_memory_mb = budget / (1024 * 1024),
+        "Bitmap memory budget set (auto)"
+    );
+    budget
+}
+
+/// Detect total system RAM in bytes.
+fn system_ram_bytes() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::mem;
+        let mut size: u64 = 0;
+        let mut len = mem::size_of::<u64>();
+        let mut mib: [libc::c_int; 2] = [libc::CTL_HW, libc::HW_MEMSIZE];
+        let ret = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                2,
+                &mut size as *mut u64 as *mut libc::c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if ret == 0 && size > 0 {
+            return Some(size);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(contents) = std::fs::read_to_string("/proc/meminfo") {
+            for line in contents.lines() {
+                if let Some(rest) = line.strip_prefix("MemTotal:") {
+                    let rest = rest.trim();
+                    if let Some(kb_str) = rest.strip_suffix("kB") {
+                        if let Ok(kb) = kb_str.trim().parse::<u64>() {
+                            return Some(kb * 1024);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }

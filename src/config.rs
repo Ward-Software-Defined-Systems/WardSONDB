@@ -96,6 +96,10 @@ pub struct Config {
     #[arg(long, default_value = "10000")]
     pub bitmap_sample_size: u32,
 
+    /// Maximum memory for bitmap scan accelerator in MiB (0 = auto: min(4096, 10% system RAM))
+    #[arg(long, default_value = "0")]
+    pub bitmap_memory_mb: u64,
+
     /// Disable the scan accelerator entirely
     #[arg(long, default_value_t = false)]
     pub no_bitmap: bool,

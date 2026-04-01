@@ -189,6 +189,7 @@ curl -X PUT http://localhost:8080/events/ttl \
 | `--log-level` | `info` | Log level (trace/debug/info/warn/error) |
 | `--log-file` | `wardsondb.log` | Log file path |
 | `--bitmap-fields` | | Comma-separated fields for bitmap scan acceleration *(Alpha)* |
+| `--bitmap-memory-mb` | `0` | Bitmap memory budget in MiB (0 = auto: min(4096, 10% system RAM)) |
 | `--verbose` | `false` | Show per-request logs in terminal |
 | `--cache-size-mb` | `64` | Block + blob cache size in MiB (shared across all partitions) |
 | `--write-buffer-mb` | `64` | Max write buffer size in MiB (total across all partitions) |
@@ -262,16 +263,26 @@ The bitmap scan accelerator eliminates full-collection scans for queries on low-
 
 ### How It Works
 
-- On startup with `--bitmap-fields`, WardSONDB builds a position map (doc ID to sequential position) and per-field bitmaps from storage
+- On startup with `--bitmap-fields`, WardSONDB builds a position map (doc ID to sequential position) and per-field bitmaps from storage in **10K-document batches** (constant peak memory regardless of collection size)
 - New inserts/updates automatically maintain the bitmaps after commit
 - The query planner uses bitmaps when all filter fields are bitmap-covered and the query is count-only or aggregation
 - Bitmap AND/OR/NOT operations run entirely in memory with zero document reads
 - Bitmaps are rebuilt from storage on restart — fjall is always the source of truth
 - Dropping and recreating a collection re-arms the accelerator automatically — no restart needed
+- A **memory budget** (default: auto-sized to min(4GB, 10% system RAM)) prevents OOM — when exceeded, new inserts skip bitmap tracking and queries fall back to full scan for uncovered documents
+- **Automatic compaction**: when TTL deletes create >25% holes in the position map, a background rebuild reclaims memory
 
-### Memory Usage
+### Memory Usage & Governance
 
 At 3.45M documents with 5 bitmap fields: **~6.4 MB total** (position map + bitmaps). Memory scales linearly with document count and number of distinct values per field.
+
+The bitmap accelerator enforces a configurable memory ceiling to prevent unbounded growth at scale:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--bitmap-memory-mb` | `0` (auto) | Memory budget in MiB. `0` = auto: min(4096, 10% of system RAM) |
+
+When the budget is exceeded, the accelerator stops tracking new documents in bitmap columns but continues to serve queries for already-indexed documents. Queries on untracked documents fall back to the normal index or full scan path. The `/_system` endpoint reports `scan_accelerator.over_budget` and `scan_accelerator.memory_bytes` for monitoring.
 
 ### Changing Bitmap Fields
 

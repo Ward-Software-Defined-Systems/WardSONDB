@@ -78,6 +78,9 @@ pub async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<ApiRespons
         "scan_accelerator": {
             "ready": accel_stats.ready,
             "total_positions": accel_stats.total_positions,
+            "memory_bytes": accel_stats.memory_bytes,
+            "memory_budget_bytes": accel_stats.memory_budget_bytes,
+            "over_budget": accel_stats.over_budget,
             "bitmap_columns": accel_stats.columns.iter().map(|c| serde_json::json!({
                 "field": c.field,
                 "cardinality": c.cardinality,

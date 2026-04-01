@@ -632,7 +632,7 @@ fn execute_bitmap_scan(
 
     for pos in bitmap.iter() {
         if let Some(doc_id) = storage.scan_accelerator.positions.get_doc_id(pos)
-            && let Ok(Some(bytes)) = docs_partition.get(doc_id.as_str())
+            && let Ok(Some(bytes)) = docs_partition.get(&*doc_id)
             && let Ok(doc) = serde_json::from_slice::<Value>(bytes.as_ref())
         {
             docs_scanned += 1;

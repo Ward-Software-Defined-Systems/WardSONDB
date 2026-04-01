@@ -59,6 +59,7 @@ wardsondb [OPTIONS]
 | `--bitmap-fields <CSV>` | | `""` | Comma-separated fields for bitmap scan accelerator (skip auto-detection) |
 | `--bitmap-max-cardinality <N>` | | `1000` | Max distinct values per bitmap column before disabling |
 | `--bitmap-sample-size <N>` | | `10000` | Number of inserts to sample for auto-detection |
+| `--bitmap-memory-mb <N>` | | `0` | Bitmap memory budget in MiB (`0` = auto: min(4096, 10% system RAM)) |
 | `--no-bitmap` | | `false` | Disable the bitmap scan accelerator entirely |
 | `--help` | `-h` | | Print help |
 | `--version` | `-V` | | Print version |
@@ -91,6 +92,9 @@ wardsondb --bitmap-fields "event_type,severity,network.action"
 
 # Bitmap with custom cardinality cap
 wardsondb --bitmap-fields "event_type,severity" --bitmap-max-cardinality 500
+
+# Bitmap with explicit memory budget (2 GiB)
+wardsondb --bitmap-fields "event_type,severity" --bitmap-memory-mb 2048
 
 # Disable bitmap scan accelerator
 wardsondb --no-bitmap
@@ -281,6 +285,9 @@ curl http://localhost:8080/_stats
     "scan_accelerator": {
       "ready": true,
       "total_positions": 15240,
+      "memory_bytes": 98304,
+      "memory_budget_bytes": 4294967296,
+      "over_budget": false,
       "bitmap_columns": [
         {"field": "event_type", "cardinality": 5, "memory_bytes": 65536},
         {"field": "severity", "cardinality": 4, "memory_bytes": 32768}

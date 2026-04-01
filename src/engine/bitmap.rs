@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use parking_lot::RwLock;
@@ -27,9 +28,10 @@ pub fn value_to_string_key(value: &Value) -> String {
 
 /// Bidirectional mapping between document IDs and row positions (u32).
 pub struct RowPositionMap {
-    id_to_pos: RwLock<HashMap<String, u32>>,
-    pos_to_id: RwLock<Vec<Option<String>>>,
+    id_to_pos: RwLock<HashMap<Arc<str>, u32>>,
+    pos_to_id: RwLock<Vec<Option<Arc<str>>>>,
     next_pos: AtomicU32,
+    hole_count: AtomicU32,
 }
 
 impl Default for RowPositionMap {
@@ -44,18 +46,20 @@ impl RowPositionMap {
             id_to_pos: RwLock::new(HashMap::new()),
             pos_to_id: RwLock::new(Vec::new()),
             next_pos: AtomicU32::new(0),
+            hole_count: AtomicU32::new(0),
         }
     }
 
     /// Assign the next row position to a document ID.
     pub fn assign(&self, doc_id: &str) -> Option<u32> {
         let pos = self.next_pos.fetch_add(1, Ordering::Relaxed);
-        self.id_to_pos.write().insert(doc_id.to_string(), pos);
+        let shared: Arc<str> = Arc::from(doc_id);
+        self.id_to_pos.write().insert(Arc::clone(&shared), pos);
         let mut vec = self.pos_to_id.write();
         if pos as usize >= vec.len() {
             vec.resize(pos as usize + 1, None);
         }
-        vec[pos as usize] = Some(doc_id.to_string());
+        vec[pos as usize] = Some(shared);
         Some(pos)
     }
 
@@ -65,9 +69,9 @@ impl RowPositionMap {
     }
 
     /// Lookup document ID by row position.
-    pub fn get_doc_id(&self, pos: u32) -> Option<String> {
+    pub fn get_doc_id(&self, pos: u32) -> Option<Arc<str>> {
         let vec = self.pos_to_id.read();
-        vec.get(pos as usize).and_then(|opt| opt.as_ref()).cloned()
+        vec.get(pos as usize).and_then(|opt| opt.clone())
     }
 
     /// Remove a document from id_to_pos (position stays allocated; bitmap handles the hole).
@@ -78,6 +82,7 @@ impl RowPositionMap {
             if let Some(slot) = vec.get_mut(pos as usize) {
                 *slot = None;
             }
+            self.hole_count.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -95,6 +100,32 @@ impl RowPositionMap {
         self.id_to_pos.write().clear();
         self.pos_to_id.write().clear();
         self.next_pos.store(0, Ordering::Relaxed);
+        self.hole_count.store(0, Ordering::Relaxed);
+    }
+
+    /// Ratio of deleted (None) holes to total allocated positions.
+    pub fn hole_ratio(&self) -> f32 {
+        let total = self.next_pos.load(Ordering::Relaxed);
+        if total == 0 {
+            return 0.0;
+        }
+        let holes = self.hole_count.load(Ordering::Relaxed);
+        holes as f32 / total as f32
+    }
+
+    /// Estimated memory usage in bytes, accounting for variable-length IDs.
+    pub fn memory_bytes(&self) -> usize {
+        let id_map = self.id_to_pos.read();
+        let pos_vec = self.pos_to_id.read();
+        // HashMap per-entry overhead: hash + bucket pointer + key (Arc ptr 8 bytes) + u32 value ≈ 48 bytes
+        // Plus actual string bytes + Arc header (16 bytes) per unique ID
+        let mut id_bytes: usize = id_map.len() * 48;
+        for key in id_map.keys() {
+            id_bytes += key.len() + 16; // string bytes + Arc header
+        }
+        // Vec: each slot is Option<Arc<str>> = 8 bytes (pointer-sized)
+        let vec_bytes = pos_vec.len() * std::mem::size_of::<Option<Arc<str>>>();
+        id_bytes + vec_bytes
     }
 }
 
@@ -148,6 +179,8 @@ pub struct AcceleratorConfig {
     pub bitmap_fields: Vec<String>,
     /// Maximum distinct values per column before disabling that column.
     pub max_cardinality: u32,
+    /// Maximum memory budget in bytes for all bitmap data. 0 = unlimited.
+    pub max_memory_bytes: u64,
 }
 
 impl Default for AcceleratorConfig {
@@ -155,6 +188,7 @@ impl Default for AcceleratorConfig {
         AcceleratorConfig {
             bitmap_fields: Vec::new(),
             max_cardinality: 1000,
+            max_memory_bytes: 0,
         }
     }
 }
@@ -170,6 +204,8 @@ pub struct ScanAccelerator {
     ready: AtomicBool,
     /// Cardinality profiler for auto-detection.
     profiler: CardinalityProfiler,
+    /// true when memory budget is exceeded; skips bitmap column tracking.
+    over_budget: AtomicBool,
 }
 
 impl ScanAccelerator {
@@ -189,11 +225,26 @@ impl ScanAccelerator {
             config: RwLock::new(config),
             ready: AtomicBool::new(false),
             profiler: CardinalityProfiler::new(has_fields),
+            over_budget: AtomicBool::new(false),
         }
     }
 
     pub fn config_mut(&self) -> parking_lot::RwLockWriteGuard<'_, AcceleratorConfig> {
         self.config.write()
+    }
+
+    pub fn config_read(&self) -> parking_lot::RwLockReadGuard<'_, AcceleratorConfig> {
+        self.config.read()
+    }
+
+    /// Total estimated memory usage across all bitmap data.
+    pub fn total_memory_bytes(&self) -> usize {
+        let columns = self.columns.read();
+        let mut total: usize = self.positions.memory_bytes();
+        for column in columns.values() {
+            total += column.memory_bytes();
+        }
+        total
     }
 
     pub fn is_ready(&self) -> bool {
@@ -202,6 +253,10 @@ impl ScanAccelerator {
 
     pub fn set_ready(&self, ready: bool) {
         self.ready.store(ready, Ordering::Release);
+    }
+
+    pub fn is_over_budget(&self) -> bool {
+        self.over_budget.load(Ordering::Relaxed)
     }
 
     /// Configure bitmap fields and create columns.
@@ -224,6 +279,11 @@ impl ScanAccelerator {
     #[allow(dead_code)]
     pub fn needs_rebuild(&self) -> bool {
         !self.is_ready() && self.has_columns() && self.profiler.is_done()
+    }
+
+    /// Check if position map has excessive holes from TTL deletes (>25%).
+    pub fn needs_compaction(&self) -> bool {
+        self.positions.hole_ratio() > 0.25
     }
 
     // ── CRUD Hooks ──────────────────────────────────────────────────────
@@ -266,6 +326,30 @@ impl ScanAccelerator {
                 }
                 self.profiler.finish();
             }
+        }
+
+        // Check memory budget every 1000 inserts
+        if pos % 1000 == 0 {
+            let budget = self.config.read().max_memory_bytes;
+            if budget > 0 {
+                let used = self.total_memory_bytes();
+                let was_over = self.over_budget.load(Ordering::Relaxed);
+                let is_over = used as u64 > budget;
+                if is_over != was_over {
+                    self.over_budget.store(is_over, Ordering::Relaxed);
+                    if is_over {
+                        tracing::warn!(
+                            used_mb = used / (1024 * 1024),
+                            budget_mb = budget / (1024 * 1024),
+                            "Bitmap memory budget exceeded, pausing column tracking"
+                        );
+                    }
+                }
+            }
+        }
+
+        if self.over_budget.load(Ordering::Relaxed) {
+            return;
         }
 
         let columns = self.columns.read();
@@ -399,10 +483,12 @@ impl ScanAccelerator {
             column.cardinality.store(0, Ordering::Relaxed);
         }
         self.ready.store(false, Ordering::Release);
+        self.over_budget.store(false, Ordering::Relaxed);
         self.profiler.reset();
     }
 
-    /// Rebuild the accelerator from all documents in storage.
+    /// Rebuild the accelerator from all documents in storage (used by benchmarks).
+    #[allow(dead_code)]
     pub fn rebuild_from_storage(&self, docs: &[(String, Value)]) {
         self.ready.store(false, Ordering::Release);
 
@@ -423,6 +509,17 @@ impl ScanAccelerator {
         );
 
         self.ready.store(true, Ordering::Release);
+    }
+
+    /// Process a batch of documents during incremental rebuild.
+    /// Stops early if the memory budget is exceeded.
+    pub fn rebuild_batch(&self, docs: &[(String, Value)]) {
+        for (doc_id, doc) in docs {
+            if self.over_budget.load(Ordering::Relaxed) {
+                return;
+            }
+            self.on_insert(doc_id, doc);
+        }
     }
 
     // ── Query (bitmap_scan) ─────────────────────────────────────────────
@@ -678,6 +775,9 @@ impl ScanAccelerator {
             ready: self.is_ready(),
             total_positions: self.positions.len(),
             columns: column_stats,
+            memory_bytes: self.total_memory_bytes(),
+            memory_budget_bytes: self.config.read().max_memory_bytes,
+            over_budget: self.over_budget.load(Ordering::Relaxed),
         }
     }
 
@@ -721,7 +821,7 @@ impl ScanAccelerator {
 
         // Persist id_to_pos as JSON
         let id_map = self.positions.id_to_pos.read();
-        let id_entries: HashMap<&str, u32> = id_map.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+        let id_entries: HashMap<&str, u32> = id_map.iter().map(|(k, v)| (&**k, *v)).collect();
         fs::write(
             bitmap_dir.join("positions.ids.json"),
             serde_json::to_string(&id_entries).unwrap_or_default(),
@@ -853,9 +953,15 @@ impl ScanAccelerator {
             (pos_vec, id_map)
         };
 
-        // Install position data
-        *self.positions.id_to_pos.write() = id_map;
-        *self.positions.pos_to_id.write() = pos_vec;
+        // Install position data (convert String → Arc<str>)
+        *self.positions.id_to_pos.write() = id_map
+            .into_iter()
+            .map(|(k, v)| (Arc::from(k.as_str()), v))
+            .collect();
+        *self.positions.pos_to_id.write() = pos_vec
+            .into_iter()
+            .map(|opt| opt.map(|s| Arc::from(s.as_str())))
+            .collect();
         self.positions.next_pos.store(next_pos, Ordering::Relaxed);
 
         // Load columns metadata
@@ -952,6 +1058,9 @@ pub struct AcceleratorStats {
     pub ready: bool,
     pub total_positions: u32,
     pub columns: Vec<ColumnStat>,
+    pub memory_bytes: usize,
+    pub memory_budget_bytes: u64,
+    pub over_budget: bool,
 }
 
 pub struct ColumnStat {
