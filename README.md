@@ -8,7 +8,7 @@ A lightweight, high-performance JSON document database built in Rust. Designed f
 
 ## Key Features
 
-- **Single binary, zero dependencies** — no JVM, no cluster setup, no external services
+- **Single self-contained binary** — no JVM, no cluster setup, no external services at runtime (build-time requires a C toolchain, `cmake`, and `libclang` for the RocksDB backend — see Quick Start)
 - **High-throughput ingest** — 76,000+ single inserts/sec, 278,000+ docs/sec bulk
 - **Secondary & compound indexes** — sub-millisecond indexed lookups at millions of documents
 - **Bitmap Scan Accelerator** *(Alpha)* — sub-millisecond aggregation and filtered counts on categorical fields without touching documents
