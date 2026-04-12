@@ -8,7 +8,7 @@ A lightweight, high-performance JSON document database built in Rust. Designed f
 
 ## Key Features
 
-- **Single self-contained binary** — no JVM, no cluster setup, no external services at runtime (build-time requires a C toolchain, `cmake`, and `libclang` for the RocksDB backend — see Quick Start)
+- **Single self-contained binary** — no JVM, no cluster setup, no external services at runtime (build-time requires a C/C++ toolchain, `cmake`, `clang`, and `libclang` for the RocksDB backend — see Quick Start)
 - **High-throughput ingest** — 76,000+ single inserts/sec, 278,000+ docs/sec bulk
 - **Secondary & compound indexes** — sub-millisecond indexed lookups at millions of documents
 - **Bitmap Scan Accelerator** *(Alpha)* — sub-millisecond aggregation and filtered counts on categorical fields without touching documents
@@ -52,11 +52,18 @@ All numbers measured against 3.45 million production SIEM events (firewall, thre
 cargo build --release
 ```
 
-RocksDB is the default storage backend and requires `cmake` and `libclang`
-(for `bindgen`) at build time:
+RocksDB is the default storage backend and needs a C/C++ toolchain plus
+`cmake`, `clang`, and `libclang` at build time (bindgen uses libclang to
+preprocess RocksDB / zstd headers):
 
-- **Ubuntu/Debian:** `sudo apt install cmake libclang-dev`
+- **Ubuntu/Debian:** `sudo apt install build-essential clang cmake libclang-dev`
 - **macOS:** `xcode-select --install`
+
+On Ubuntu, both `clang` and `libclang-dev` are needed: `libclang-dev` ships
+the shared library that bindgen loads at runtime, while the `clang` package
+installs clang's builtin header directory (`/usr/lib/clang/<version>/include/`)
+that provides `stddef.h` and friends. Without the `clang` package you'll see
+`fatal error: 'stddef.h' file not found` when `zstd-sys` builds.
 
 Select a backend with `--storage-engine rocksdb|fjall` (default `rocksdb`). The
 engine is locked to the data directory on first open via a `.engine` marker
@@ -80,7 +87,7 @@ ulimit -n 65536
 
 ### Linux allocator
 
-On Linux, WardSONDB links `tikv-jemallocator` automatically and installs it as the process-wide `#[global_allocator]` via a `cfg(target_os = "linux")` gate in `src/main.rs`. This avoids the RSS-climb behaviour you see under Tokio's multi-threaded runtime with glibc's ptmalloc2 (which retains freed memory in per-thread arenas). No user action needed — a standard `cargo build --release` on Linux pulls in jemalloc's `cc` build, which requires a working C toolchain (already present if you installed `cmake`/`libclang-dev` for RocksDB).
+On Linux, WardSONDB links `tikv-jemallocator` automatically and installs it as the process-wide `#[global_allocator]` via a `cfg(target_os = "linux")` gate in `src/main.rs`. This avoids the RSS-climb behaviour you see under Tokio's multi-threaded runtime with glibc's ptmalloc2 (which retains freed memory in per-thread arenas). No user action needed — a standard `cargo build --release` on Linux pulls in jemalloc's `cc` build, which uses the same C toolchain already listed in the Quick Start build prereqs above.
 
 On macOS the dependency isn't downloaded and the system allocator is used — libmalloc already returns freed memory to the OS aggressively, so jemalloc wouldn't add much.
 
