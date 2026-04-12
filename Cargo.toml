@@ -13,6 +13,7 @@ tower-http = { version = "0.6", features = ["trace", "compression-gzip", "cors"]
 
 # Storage
 fjall = "2"
+rust-rocksdb = { version = "0.46", features = ["multi-threaded-cf", "lz4", "zstd"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -61,3 +62,10 @@ harness = false
 [[bench]]
 name = "bitmap_bench"
 harness = false
+
+# Allocator — Linux only. glibc's ptmalloc2 holds freed memory in per-thread
+# arenas under Tokio's multi-threaded runtime, causing RSS to climb without
+# an actual leak. jemalloc returns memory to the OS aggressively. macOS's
+# libmalloc already does this, so we don't need jemalloc there.
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = "0.6"

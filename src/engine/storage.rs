@@ -1,19 +1,21 @@
 use std::collections::HashMap;
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use parking_lot::RwLock;
 
-use fjall::{Config, PartitionCreateOptions, PersistMode, TxKeyspace, TxPartitionHandle};
-use tracing::{error, info};
+use tracing::info;
 
 use uuid::Uuid;
 
+use crate::engine::backend::{
+    Engine, EngineConfig, PartitionId, StorageBackend, WriteBatchWrapper,
+};
 use crate::engine::bitmap::{AcceleratorConfig, ScanAccelerator};
 use crate::error::AppError;
 use crate::index::IndexManager;
 
-/// Memory configuration for fjall storage engine.
+/// Memory configuration for the storage backend.
 /// Prevents unbounded memory growth under sustained write load.
 pub struct MemoryConfig {
     /// Unified block + blob cache size (default: 64 MiB)
@@ -31,9 +33,9 @@ pub struct MemoryConfig {
 impl Default for MemoryConfig {
     fn default() -> Self {
         MemoryConfig {
-            cache_size: 64 * 1024 * 1024,            // 64 MiB
-            max_write_buffer_size: 64 * 1024 * 1024, // 64 MiB
-            max_memtable_size: 8 * 1024 * 1024,      // 8 MiB
+            cache_size: 64 * 1024 * 1024,
+            max_write_buffer_size: 64 * 1024 * 1024,
+            max_memtable_size: 8 * 1024 * 1024,
             flush_workers: 2,
             compaction_workers: 2,
         }
@@ -84,76 +86,72 @@ impl DocCounters {
 }
 
 pub struct Storage {
-    pub db: TxKeyspace,
-    pub meta: TxPartitionHandle,
+    pub engine: Engine,
+    pub meta: PartitionId,
     pub index_manager: IndexManager,
     pub doc_counts: DocCounters,
-    /// Set to true when fjall reports a poisoned keyspace (fatal flush/compaction failure).
-    pub poisoned: AtomicBool,
-    /// Memory config used for this instance (for stats reporting).
     pub memory_config: MemoryConfig,
-    /// Default partition options with memory limits applied.
-    partition_opts: PartitionCreateOptions,
-    /// Bitmap scan accelerator for fast unindexed queries.
     pub scan_accelerator: ScanAccelerator,
-    /// Data directory path (for bitmap persistence cleanup).
-    pub data_dir: std::path::PathBuf,
+    pub data_dir: PathBuf,
+    pub engine_name: &'static str,
 }
 
 impl Storage {
     #[allow(dead_code)]
     pub fn open(data_dir: &Path) -> Result<Self, AppError> {
-        Self::open_with_config(data_dir, MemoryConfig::default())
+        Self::open_with_config(data_dir, "rocksdb", MemoryConfig::default())
     }
 
-    pub fn open_with_config(data_dir: &Path, mem: MemoryConfig) -> Result<Self, AppError> {
+    pub fn open_with_config(
+        data_dir: &Path,
+        engine_type: &str,
+        mem: MemoryConfig,
+    ) -> Result<Self, AppError> {
         info!(
+            engine = engine_type,
             cache_mb = mem.cache_size / (1024 * 1024),
             write_buffer_mb = mem.max_write_buffer_size / (1024 * 1024),
             memtable_mb = mem.max_memtable_size / (1024 * 1024),
             flush_workers = mem.flush_workers,
             compaction_workers = mem.compaction_workers,
-            "Opening database with memory limits"
+            "Opening database"
         );
 
-        let db = Config::new(data_dir)
-            .cache_size(mem.cache_size)
-            .max_write_buffer_size(mem.max_write_buffer_size)
-            .flush_workers(mem.flush_workers)
-            .compaction_workers(mem.compaction_workers)
-            .open_transactional()
-            .map_err(|e| AppError::Internal(format!("Failed to open database: {e}")))?;
+        check_engine_marker(data_dir, engine_type)?;
 
-        let partition_opts =
-            PartitionCreateOptions::default().max_memtable_size(mem.max_memtable_size);
+        let engine_config = EngineConfig {
+            cache_size_bytes: mem.cache_size,
+            write_buffer_bytes: mem.max_write_buffer_size,
+            memtable_bytes: mem.max_memtable_size,
+            flush_workers: mem.flush_workers,
+            compaction_workers: mem.compaction_workers,
+        };
 
-        let meta = db
-            .open_partition("_meta", partition_opts.clone())
-            .map_err(|e| AppError::Internal(format!("Failed to open meta partition: {e}")))?;
+        let engine = Engine::open(engine_type, data_dir, &engine_config)?;
+        let engine_name = engine.engine_name();
+
+        write_engine_marker(data_dir, engine_name)?;
+
+        let meta = engine.create_or_open_partition("_meta")?;
 
         let index_manager = IndexManager::new();
         let doc_counts = DocCounters::new();
-
         let scan_accelerator = ScanAccelerator::new(AcceleratorConfig::default());
 
         let storage = Storage {
-            db,
+            engine,
             meta,
             index_manager,
             doc_counts,
-            poisoned: AtomicBool::new(false),
             memory_config: mem,
-            partition_opts,
             scan_accelerator,
             data_dir: data_dir.to_path_buf(),
+            engine_name,
         };
 
-        // Load indexes from meta
         storage
             .index_manager
-            .load_indexes(&storage.db, &storage.meta)?;
-
-        // Initialize doc counters for all existing collections
+            .load_indexes(&storage.engine, &storage.meta)?;
         storage.initialize_doc_counts()?;
 
         Ok(storage)
@@ -161,48 +159,34 @@ impl Storage {
 
     /// Check if the storage engine is in a poisoned state.
     pub fn is_poisoned(&self) -> bool {
-        self.poisoned.load(Ordering::Relaxed)
+        self.engine.is_poisoned()
     }
 
     fn initialize_doc_counts(&self) -> Result<(), AppError> {
-        let read_tx = self.db.read_tx();
-        for kv in read_tx.prefix(&self.meta, "collection:") {
+        for kv in self.engine.prefix_iterator(&self.meta, b"collection:")? {
             let (key_bytes, _) = kv?;
-            let key_str = std::str::from_utf8(key_bytes.as_ref())
+            let key_str = std::str::from_utf8(&key_bytes)
                 .map_err(|e| AppError::Internal(format!("Invalid key: {e}")))?;
             let col_name = key_str.strip_prefix("collection:").unwrap_or(key_str);
 
             let docs_partition = self.create_partition(&format!("{col_name}#docs"))?;
-            let count_tx = self.db.read_tx();
-            let count = count_tx.iter(&docs_partition).count() as i64;
+            let count = self.engine.full_iterator(&docs_partition)?.count() as i64;
             self.doc_counts.initialize(col_name, count);
         }
         Ok(())
     }
 
-    pub fn create_partition(&self, name: &str) -> Result<TxPartitionHandle, AppError> {
-        self.db
-            .open_partition(name, self.partition_opts.clone())
-            .map_err(|e| AppError::Internal(format!("Failed to create partition '{name}': {e}")))
+    pub fn create_partition(&self, name: &str) -> Result<PartitionId, AppError> {
+        Ok(self.engine.create_or_open_partition(name)?)
     }
 
-    /// Check a fjall result and detect poisoning. Sets the poisoned flag
-    /// so the health endpoint can report degraded state.
-    pub fn check_fjall_result<T>(&self, result: Result<T, fjall::Error>) -> Result<T, AppError> {
-        match result {
-            Ok(v) => Ok(v),
-            Err(e) => {
-                let msg = e.to_string();
-                if msg.contains("oison") {
-                    self.poisoned.store(true, Ordering::Relaxed);
-                    error!(
-                        "Storage engine POISONED — fatal background worker failure. \
-                         Writes rejected, reads may continue. Restart required."
-                    );
-                }
-                Err(e.into())
-            }
-        }
+    pub fn write_batch(&self) -> WriteBatchWrapper {
+        self.engine.write_batch()
+    }
+
+    pub fn commit_batch(&self, batch: WriteBatchWrapper) -> Result<(), AppError> {
+        self.engine.commit_batch(batch)?;
+        Ok(())
     }
 
     /// Guard that rejects writes immediately if the storage is already poisoned.
@@ -219,57 +203,76 @@ impl Storage {
         &self,
         collection: &str,
     ) -> Result<(Option<String>, Option<String>), AppError> {
-        // Skip iterator on empty collections — fjall iter blocks on empty partitions
         if self.doc_counts.get(collection) <= 0 {
             return Ok((None, None));
         }
 
         let docs_partition = self.get_docs_partition(collection)?;
-        let read_tx = self.db.read_tx();
 
-        let oldest = read_tx
-            .iter(&docs_partition)
-            .next()
-            .and_then(|kv| kv.ok())
-            .and_then(|(k, _)| key_to_timestamp(k.as_ref(), &docs_partition));
-
-        let newest = read_tx
-            .iter(&docs_partition)
-            .next_back()
-            .and_then(|kv| kv.ok())
-            .and_then(|(k, _)| key_to_timestamp(k.as_ref(), &docs_partition));
+        let oldest = self
+            .engine
+            .first_key(&docs_partition)?
+            .and_then(|k| self.key_to_timestamp(&k, &docs_partition));
+        let newest = self
+            .engine
+            .last_key(&docs_partition)?
+            .and_then(|k| self.key_to_timestamp(&k, &docs_partition));
 
         Ok((oldest, newest))
     }
 
+    fn key_to_timestamp(&self, key_bytes: &[u8], partition: &PartitionId) -> Option<String> {
+        let key_str = std::str::from_utf8(key_bytes).ok()?;
+        if let Ok(uuid) = Uuid::parse_str(key_str)
+            && let Some(ts) = uuid.get_timestamp()
+        {
+            let (secs, _nanos) = ts.to_unix();
+            if let Some(dt) = chrono::DateTime::from_timestamp(secs as i64, 0) {
+                return Some(dt.to_rfc3339());
+            }
+        }
+        if let Ok(Some(doc_bytes)) = self.engine.get(partition, key_str.as_bytes())
+            && let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&doc_bytes)
+        {
+            return doc
+                .get("_received_at")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+        }
+        None
+    }
+
     pub fn persist(&self) -> Result<(), AppError> {
-        self.db
-            .persist(PersistMode::Buffer)
-            .map_err(|e| AppError::Internal(format!("Failed to persist: {e}")))
+        self.engine.flush()?;
+        Ok(())
     }
 }
 
-/// Extract timestamp from a partition key.
-/// Tries UUIDv7 first (no document read); falls back to reading `_received_at` from the document.
-fn key_to_timestamp(key_bytes: &[u8], partition: &fjall::TxPartitionHandle) -> Option<String> {
-    let key_str = std::str::from_utf8(key_bytes).ok()?;
-    // Try UUIDv7 path first (no document read needed)
-    if let Ok(uuid) = Uuid::parse_str(key_str)
-        && let Some(ts) = uuid.get_timestamp()
-    {
-        let (secs, _nanos) = ts.to_unix();
-        if let Some(dt) = chrono::DateTime::from_timestamp(secs as i64, 0) {
-            return Some(dt.to_rfc3339());
-        }
+/// Check that the engine marker matches what the caller asked for.
+/// Hard error on mismatch — never silently switch engines on existing data.
+fn check_engine_marker(data_dir: &Path, engine_type: &str) -> Result<(), AppError> {
+    let marker = data_dir.join(".engine");
+    if !marker.exists() {
+        return Ok(());
     }
-    // Fall back to reading the document's _received_at field
-    if let Ok(Some(doc_bytes)) = partition.get(key_str)
-        && let Ok(doc) = serde_json::from_slice::<serde_json::Value>(doc_bytes.as_ref())
-    {
-        return doc
-            .get("_received_at")
-            .and_then(|v| v.as_str())
-            .map(String::from);
+    let existing = std::fs::read_to_string(&marker)
+        .map_err(|e| AppError::Internal(format!("Failed to read engine marker: {e}")))?;
+    let existing = existing.trim();
+    if existing != engine_type {
+        return Err(AppError::Internal(format!(
+            "Data directory was created with engine '{existing}' but '{engine_type}' was requested. \
+             Cannot switch engines on existing data; use a different --data-dir or re-create with \
+             the desired engine."
+        )));
     }
-    None
+    Ok(())
+}
+
+fn write_engine_marker(data_dir: &Path, engine_name: &str) -> Result<(), AppError> {
+    let marker = data_dir.join(".engine");
+    if marker.exists() {
+        return Ok(());
+    }
+    std::fs::write(&marker, engine_name)
+        .map_err(|e| AppError::Internal(format!("Failed to write engine marker: {e}")))
 }

@@ -5,9 +5,9 @@ use std::collections::HashMap;
 
 use parking_lot::RwLock;
 
-use fjall::{PartitionCreateOptions, TxKeyspace, TxPartitionHandle};
 use serde_json::Value;
 
+use crate::engine::backend::{Engine, PartitionId, StorageBackend, WriteBatchWrapper};
 use crate::error::AppError;
 use crate::query::filter::resolve_json_path;
 
@@ -16,10 +16,10 @@ use self::secondary::{
     value_to_sortable_bytes,
 };
 
-/// Cached index: definition + open partition handle.
+/// Cached index: definition + opaque partition handle.
 struct IndexEntry {
     def: IndexDef,
-    partition: TxPartitionHandle,
+    partition: PartitionId,
 }
 
 pub struct IndexManager {
@@ -41,16 +41,15 @@ impl IndexManager {
     }
 
     /// Load all index definitions from _meta on startup.
-    pub fn load_indexes(&self, db: &TxKeyspace, meta: &TxPartitionHandle) -> Result<(), AppError> {
-        let read_tx = db.read_tx();
+    pub fn load_indexes(&self, engine: &Engine, meta: &PartitionId) -> Result<(), AppError> {
         let mut indexes = self.indexes.write();
 
-        for kv in read_tx.prefix(meta, "index:") {
+        for kv in engine.prefix_iterator(meta, b"index:")? {
             let (key_bytes, value_bytes) = kv?;
-            let _key_str = std::str::from_utf8(key_bytes.as_ref())
+            let _key_str = std::str::from_utf8(&key_bytes)
                 .map_err(|e| AppError::Internal(format!("Invalid index meta key: {e}")))?;
 
-            let mut def: IndexDef = serde_json::from_slice(value_bytes.as_ref())
+            let mut def: IndexDef = serde_json::from_slice(&value_bytes)
                 .map_err(|e| AppError::Internal(format!("Invalid index meta value: {e}")))?;
 
             // Backward compat: old indexes stored `field` but not `fields`
@@ -59,9 +58,7 @@ impl IndexManager {
             }
 
             let partition_name = format!("{}#idx#{}", def.collection, def.name);
-            let partition = db
-                .open_partition(&partition_name, PartitionCreateOptions::default())
-                .map_err(|e| AppError::Internal(format!("Failed to open index partition: {e}")))?;
+            let partition = engine.create_or_open_partition(&partition_name)?;
 
             indexes.insert(
                 (def.collection.clone(), def.name.clone()),
@@ -73,7 +70,7 @@ impl IndexManager {
     }
 
     /// Register an index (called after backfill + meta write).
-    pub fn register(&self, def: IndexDef, partition: TxPartitionHandle) {
+    pub fn register(&self, def: IndexDef, partition: PartitionId) {
         let mut indexes = self.indexes.write();
         indexes.insert(
             (def.collection.clone(), def.name.clone()),
@@ -103,10 +100,9 @@ impl IndexManager {
         &self,
         collection: &str,
         field: &str,
-    ) -> Option<(IndexDef, TxPartitionHandle)> {
+    ) -> Option<(IndexDef, PartitionId)> {
         let indexes = self.indexes.read();
 
-        // First try exact single-field index
         let single = indexes
             .iter()
             .find(|((col, _), entry)| {
@@ -118,7 +114,6 @@ impl IndexManager {
             return single;
         }
 
-        // Fall back to first field of a compound index
         indexes
             .iter()
             .find(|((col, _), entry)| {
@@ -127,23 +122,17 @@ impl IndexManager {
             .map(|(_, entry)| (entry.def.clone(), entry.partition.clone()))
     }
 
-    /// Find a compound index whose leading fields match `eq_fields` (in order),
-    /// optionally followed by `sort_field`.
-    ///
-    /// For sorted scan (Opt 1): pass `sort_field = Some(field)`.
-    /// For compound equality (Opt 3): pass `sort_field = None`, requires >= 2 matched fields.
-    ///
-    /// Returns (IndexDef, partition, number of eq fields matched).
+    /// Find a compound index whose leading fields match `eq_fields`, optionally followed by `sort_field`.
     pub fn find_compound_index(
         &self,
         collection: &str,
         eq_field_names: &[&str],
         sort_field: Option<&str>,
-    ) -> Option<(IndexDef, TxPartitionHandle, usize)> {
+    ) -> Option<(IndexDef, PartitionId, usize)> {
         let indexes = self.indexes.read();
         let eq_set: std::collections::HashSet<&str> = eq_field_names.iter().copied().collect();
 
-        let mut best: Option<(IndexDef, TxPartitionHandle, usize)> = None;
+        let mut best: Option<(IndexDef, PartitionId, usize)> = None;
 
         for ((col, _), entry) in indexes.iter() {
             if col != collection || !entry.def.is_compound() {
@@ -152,7 +141,6 @@ impl IndexManager {
 
             let idx_fields = &entry.def.fields;
 
-            // Count consecutive leading fields that appear in eq_set
             let mut matched = 0;
             for f in idx_fields {
                 if eq_set.contains(f.as_str()) {
@@ -167,37 +155,30 @@ impl IndexManager {
             }
 
             if let Some(sf) = sort_field {
-                // For IndexSorted: need the field at position `matched` to be the sort field
                 if matched < idx_fields.len()
                     && idx_fields[matched] == sf
                     && best.as_ref().is_none_or(|(_, _, bm)| matched > *bm)
                 {
                     best = Some((entry.def.clone(), entry.partition.clone(), matched));
                 }
-            } else {
-                // For CompoundEq: need at least 2 matched fields
-                if matched >= 2 && best.as_ref().is_none_or(|(_, _, bm)| matched > *bm) {
-                    best = Some((entry.def.clone(), entry.partition.clone(), matched));
-                }
+            } else if matched >= 2 && best.as_ref().is_none_or(|(_, _, bm)| matched > *bm) {
+                best = Some((entry.def.clone(), entry.partition.clone(), matched));
             }
         }
 
         best
     }
 
-    /// Find a compound index where leading N fields match equality conditions
-    /// and the field at position N matches the range field.
-    /// Returns (IndexDef, partition, number of eq fields matched).
     pub fn find_compound_range_index(
         &self,
         collection: &str,
         eq_field_names: &[&str],
         range_field: &str,
-    ) -> Option<(IndexDef, TxPartitionHandle, usize)> {
+    ) -> Option<(IndexDef, PartitionId, usize)> {
         let indexes = self.indexes.read();
         let eq_set: std::collections::HashSet<&str> = eq_field_names.iter().copied().collect();
 
-        let mut best: Option<(IndexDef, TxPartitionHandle, usize)> = None;
+        let mut best: Option<(IndexDef, PartitionId, usize)> = None;
 
         for ((col, _), entry) in indexes.iter() {
             if col != collection || !entry.def.is_compound() {
@@ -206,7 +187,6 @@ impl IndexManager {
 
             let idx_fields = &entry.def.fields;
 
-            // Count consecutive leading fields that appear in eq_set
             let mut matched = 0;
             for f in idx_fields {
                 if eq_set.contains(f.as_str()) {
@@ -220,7 +200,6 @@ impl IndexManager {
                 continue;
             }
 
-            // The field at position `matched` must be the range field
             if matched < idx_fields.len()
                 && idx_fields[matched] == range_field
                 && best.as_ref().is_none_or(|(_, _, bm)| matched > *bm)
@@ -233,17 +212,17 @@ impl IndexManager {
     }
 
     /// Get the partition handle for a specific index by name.
-    pub fn get_index_partition(&self, collection: &str, name: &str) -> Option<TxPartitionHandle> {
+    pub fn get_index_partition(&self, collection: &str, name: &str) -> Option<PartitionId> {
         let indexes = self.indexes.read();
         indexes
             .get(&(collection.to_string(), name.to_string()))
             .map(|entry| entry.partition.clone())
     }
 
-    /// Write index entries for a newly inserted document.
-    pub fn add_index_entries_to_tx(
+    /// Stage index inserts for a newly written document into the given batch.
+    pub fn add_index_entries_to_batch(
         &self,
-        tx: &mut fjall::WriteTransaction,
+        batch: &mut WriteBatchWrapper,
         collection: &str,
         doc_id: &str,
         doc: &Value,
@@ -254,7 +233,6 @@ impl IndexManager {
                 continue;
             }
             if entry.def.is_compound() {
-                // Compound index: all fields must be present
                 let values: Vec<&Value> = entry
                     .def
                     .fields
@@ -263,19 +241,19 @@ impl IndexManager {
                     .collect();
                 if values.len() == entry.def.fields.len() {
                     let key = make_compound_index_key(&values, doc_id);
-                    tx.insert(&entry.partition, key, b"");
+                    batch.insert(&entry.partition, &key, b"");
                 }
             } else if let Some(field_val) = resolve_json_path(doc, &entry.def.fields[0]) {
                 let key = make_index_key(field_val, doc_id);
-                tx.insert(&entry.partition, key, b"");
+                batch.insert(&entry.partition, &key, b"");
             }
         }
     }
 
-    /// Remove index entries for a document being deleted/updated.
-    pub fn remove_index_entries_from_tx(
+    /// Stage index removes for a document being deleted/updated into the given batch.
+    pub fn remove_index_entries_from_batch(
         &self,
-        tx: &mut fjall::WriteTransaction,
+        batch: &mut WriteBatchWrapper,
         collection: &str,
         doc_id: &str,
         doc: &Value,
@@ -294,11 +272,11 @@ impl IndexManager {
                     .collect();
                 if values.len() == entry.def.fields.len() {
                     let key = make_compound_index_key(&values, doc_id);
-                    tx.remove(&entry.partition, key);
+                    batch.remove(&entry.partition, &key);
                 }
             } else if let Some(field_val) = resolve_json_path(doc, &entry.def.fields[0]) {
                 let key = make_index_key(field_val, doc_id);
-                tx.remove(&entry.partition, key);
+                batch.remove(&entry.partition, &key);
             }
         }
     }
@@ -306,15 +284,13 @@ impl IndexManager {
     /// Equality lookup: get all doc IDs where field == value.
     pub fn lookup_eq(
         &self,
-        db: &TxKeyspace,
+        engine: &Engine,
         collection: &str,
         field: &str,
         value: &Value,
     ) -> Option<Vec<String>> {
         let (def, partition) = self.get_index_for_field(collection, field)?;
 
-        // For compound indexes querying only the first field, use \x01 separator
-        // (field separator) instead of \x00 (doc_id separator)
         let separator = if def.is_compound() { 0x01 } else { 0x00 };
         let prefix = {
             let mut p = value_to_sortable_bytes(value);
@@ -322,10 +298,11 @@ impl IndexManager {
             p
         };
 
-        let read_tx = db.read_tx();
+        let iter = engine.prefix_iterator(&partition, &prefix).ok()?;
         let mut doc_ids = Vec::new();
-        for (key, _) in read_tx.prefix(&partition, prefix).flatten() {
-            if let Some(id) = extract_doc_id_from_key(key.as_ref()) {
+        for item in iter.flatten() {
+            let (key, _) = item;
+            if let Some(id) = extract_doc_id_from_key(&key) {
                 doc_ids.push(id);
             }
         }
@@ -335,7 +312,7 @@ impl IndexManager {
     /// Range lookup: get all doc IDs where field is in the given range.
     pub fn lookup_range(
         &self,
-        db: &TxKeyspace,
+        engine: &Engine,
         collection: &str,
         field: &str,
         lower: Option<(&Value, bool)>,
@@ -353,14 +330,10 @@ impl IndexManager {
             b
         });
 
-        let read_tx = db.read_tx();
+        let start: &[u8] = lower_bytes.as_deref().unwrap_or(&[]);
+        let default_end: [u8; 10] = [0xFF; 10];
+        let end: &[u8] = upper_bytes.as_deref().unwrap_or(&default_end);
 
-        let start = lower_bytes.as_deref().unwrap_or(&[]);
-        let end = upper_bytes
-            .as_deref()
-            .unwrap_or(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
-
-        // Build a set of excluded doc_ids for non-inclusive lower bound
         let lower_exact_prefix = if let Some((lower_val, false)) = lower {
             let mut p = value_to_sortable_bytes(lower_val);
             p.push(0x00);
@@ -370,17 +343,17 @@ impl IndexManager {
         };
 
         let mut doc_ids = Vec::new();
-        for (key, _) in read_tx.range(&partition, start..end).flatten() {
-            let key_ref = key.as_ref();
+        let iter = engine.range_iterator(&partition, start, end).ok()?;
+        for item in iter.flatten() {
+            let (key, _) = item;
 
-            // Skip entries that match the lower bound exactly when not inclusive
             if let Some(ref prefix) = lower_exact_prefix
-                && key_ref.starts_with(prefix)
+                && key.starts_with(prefix)
             {
                 continue;
             }
 
-            if let Some(id) = extract_doc_id_from_key(key_ref) {
+            if let Some(id) = extract_doc_id_from_key(&key) {
                 doc_ids.push(id);
             }
         }
@@ -391,7 +364,7 @@ impl IndexManager {
     /// Count index entries for an equality match (optimized count_only).
     pub fn count_eq(
         &self,
-        db: &TxKeyspace,
+        engine: &Engine,
         collection: &str,
         field: &str,
         value: &Value,
@@ -404,28 +377,28 @@ impl IndexManager {
             p
         };
 
-        let read_tx = db.read_tx();
-        let count = read_tx.prefix(&partition, prefix).flatten().count() as u64;
+        let iter = engine.prefix_iterator(&partition, &prefix).ok()?;
+        let count = iter.flatten().count() as u64;
         Some(count)
     }
 
     /// Count all index entries in a range.
     pub fn count_range(
         &self,
-        db: &TxKeyspace,
+        engine: &Engine,
         collection: &str,
         field: &str,
         lower: Option<(&Value, bool)>,
         upper: Option<(&Value, bool)>,
     ) -> Option<u64> {
-        self.lookup_range(db, collection, field, lower, upper)
+        self.lookup_range(engine, collection, field, lower, upper)
             .map(|ids| ids.len() as u64)
     }
 
-    /// Get doc IDs for $in operator: union of equality lookups.
+    /// $in: union of equality lookups.
     pub fn lookup_in(
         &self,
-        db: &TxKeyspace,
+        engine: &Engine,
         collection: &str,
         field: &str,
         values: &[Value],
@@ -434,7 +407,7 @@ impl IndexManager {
 
         let mut all_ids = Vec::new();
         for value in values {
-            if let Some(ids) = self.lookup_eq(db, collection, field, value) {
+            if let Some(ids) = self.lookup_eq(engine, collection, field, value) {
                 all_ids.extend(ids);
             }
         }

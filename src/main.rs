@@ -1,3 +1,7 @@
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 mod config;
 mod engine;
 mod error;
@@ -75,8 +79,9 @@ async fn main() {
         flush_workers: config.flush_workers,
         compaction_workers: config.compaction_workers,
     };
-    let storage = Storage::open_with_config(data_dir, mem_config).expect("Failed to open database");
-    info!(data_dir = %config.data_dir, "Database opened");
+    let storage = Storage::open_with_config(data_dir, &config.storage_engine, mem_config)
+        .expect("Failed to open database");
+    info!(data_dir = %config.data_dir, engine = storage.engine_name, "Database opened");
 
     // Configure scan accelerator
     if !config.no_bitmap {
@@ -322,12 +327,19 @@ fn rebuild_all_accelerators(storage: &Storage) {
                 continue;
             }
         };
-        let read_tx = storage.db.read_tx();
+        use engine::backend::StorageBackend;
+        let iter = match storage.engine.full_iterator(&docs_partition) {
+            Ok(it) => it,
+            Err(e) => {
+                warn!(collection = col.name, error = ?e, "Skipping collection for rebuild");
+                continue;
+            }
+        };
         let mut batch: Vec<(String, serde_json::Value)> = Vec::with_capacity(BATCH_SIZE);
 
-        for kv in read_tx.iter(&docs_partition) {
+        for kv in iter {
             if let Ok((_, value)) = kv
-                && let Ok(doc) = serde_json::from_slice::<serde_json::Value>(value.as_ref())
+                && let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&value)
                 && let Some(id) = doc.get("_id").and_then(|v| v.as_str())
             {
                 batch.push((id.to_string(), doc));

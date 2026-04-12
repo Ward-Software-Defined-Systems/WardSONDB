@@ -1,3 +1,4 @@
+pub mod backend;
 pub mod bitmap;
 pub mod collection;
 pub mod document;

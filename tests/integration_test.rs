@@ -14,6 +14,7 @@ fn test_config(tmp: &TempDir, port: u16) -> Config {
     Config {
         port,
         data_dir: tmp.path().to_string_lossy().to_string(),
+        storage_engine: "rocksdb".to_string(),
         log_level: "error".to_string(),
         log_file: tmp.path().join("test.log").to_string_lossy().to_string(),
         verbose: false,
@@ -4775,4 +4776,57 @@ async fn test_custom_id_bitmap_maintenance() {
     assert!(ids.contains(&"bm-5"));
     assert!(ids.contains(&"bm-6"));
     assert!(ids.contains(&"bm-7"));
+}
+
+#[tokio::test]
+async fn test_engine_marker_file() {
+    use wardsondb::engine::storage::MemoryConfig;
+
+    let tmp = TempDir::new().unwrap();
+
+    // First open with rocksdb: marker written.
+    {
+        let _storage =
+            Storage::open_with_config(tmp.path(), "rocksdb", MemoryConfig::default()).unwrap();
+    }
+    let marker = tmp.path().join(".engine");
+    assert!(marker.exists(), "marker file should exist after first open");
+    let contents = std::fs::read_to_string(&marker).unwrap();
+    assert_eq!(contents.trim(), "rocksdb");
+
+    // Reopening with a different engine on existing data must fail.
+    let result = Storage::open_with_config(tmp.path(), "fjall", MemoryConfig::default());
+    assert!(
+        result.is_err(),
+        "opening with mismatched engine must fail, got Ok"
+    );
+    let err = format!("{:?}", result.err().unwrap());
+    assert!(
+        err.contains("rocksdb") && err.contains("fjall"),
+        "error should name both engines: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_fjall_backend_basic() {
+    use wardsondb::engine::storage::MemoryConfig;
+
+    let tmp = TempDir::new().unwrap();
+    let storage = Storage::open_with_config(tmp.path(), "fjall", MemoryConfig::default()).unwrap();
+    assert_eq!(storage.engine_name, "fjall");
+
+    // Round-trip a collection + document through the fjall backend.
+    storage.create_collection("fj").unwrap();
+    let doc = serde_json::json!({"hello": "fjall"});
+    let inserted = storage.insert_document("fj", doc).unwrap();
+    let id = inserted["_id"].as_str().unwrap().to_string();
+
+    let fetched = storage.get_document("fj", &id).unwrap();
+    assert_eq!(fetched["hello"], "fjall");
+
+    let docs = storage.scan_all_documents("fj").unwrap();
+    assert_eq!(docs.len(), 1);
+
+    storage.delete_document("fj", &id).unwrap();
+    assert_eq!(storage.scan_all_documents("fj").unwrap().len(), 0);
 }

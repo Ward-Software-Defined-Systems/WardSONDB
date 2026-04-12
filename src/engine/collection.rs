@@ -1,6 +1,6 @@
-use fjall::TxPartitionHandle;
 use serde::{Deserialize, Serialize};
 
+use crate::engine::backend::{PartitionId, StorageBackend};
 use crate::error::AppError;
 
 use super::storage::Storage;
@@ -22,7 +22,7 @@ impl Storage {
     pub fn create_collection(&self, name: &str) -> Result<CollectionInfo, AppError> {
         self.check_not_poisoned()?;
         let meta_key = format!("collection:{name}");
-        if self.meta.get(&meta_key)?.is_some() {
+        if self.engine.get(&self.meta, meta_key.as_bytes())?.is_some() {
             return Err(AppError::CollectionExists(name.to_string()));
         }
 
@@ -37,17 +37,14 @@ impl Storage {
         };
         let meta_bytes = serde_json::to_vec(&meta)?;
 
-        let mut tx = self.db.write_tx();
-        tx.insert(&self.meta, &meta_key, meta_bytes);
-        self.check_fjall_result(tx.commit())?;
+        let mut batch = self.write_batch();
+        batch.insert(&self.meta, meta_key.as_bytes(), &meta_bytes);
+        self.commit_batch(batch)?;
 
         self.persist()?;
 
-        // Initialize doc counter
         self.doc_counts.initialize(name, 0);
 
-        // Re-arm scan accelerator if bitmap columns are configured
-        // (columns survive clear() on drop — they're emptied, not removed)
         if self.scan_accelerator.has_columns() {
             self.scan_accelerator.set_ready(true);
         }
@@ -61,10 +58,9 @@ impl Storage {
 
     pub fn list_collections(&self) -> Result<Vec<CollectionInfo>, AppError> {
         let mut collections = Vec::new();
-        let read_tx = self.db.read_tx();
-        for kv in read_tx.prefix(&self.meta, "collection:") {
+        for kv in self.engine.prefix_iterator(&self.meta, b"collection:")? {
             let (key, _value) = kv?;
-            let key_str = std::str::from_utf8(key.as_ref())
+            let key_str = std::str::from_utf8(&key)
                 .map_err(|e| AppError::Internal(format!("Invalid key: {e}")))?;
             let col_name = key_str
                 .strip_prefix("collection:")
@@ -90,7 +86,7 @@ impl Storage {
 
     pub fn get_collection_info(&self, name: &str) -> Result<CollectionInfo, AppError> {
         let meta_key = format!("collection:{name}");
-        if self.meta.get(&meta_key)?.is_none() {
+        if self.engine.get(&self.meta, meta_key.as_bytes())?.is_none() {
             return Err(AppError::CollectionNotFound(name.to_string()));
         }
 
@@ -112,63 +108,54 @@ impl Storage {
     pub fn drop_collection(&self, name: &str) -> Result<(), AppError> {
         self.check_not_poisoned()?;
         let meta_key = format!("collection:{name}");
-        if self.meta.get(&meta_key)?.is_none() {
+        if self.engine.get(&self.meta, meta_key.as_bytes())?.is_none() {
             return Err(AppError::CollectionNotFound(name.to_string()));
         }
 
         let docs_partition = self.get_docs_partition(name)?;
 
-        // Collect all doc keys
-        let read_tx = self.db.read_tx();
-        let keys: Vec<Vec<u8>> = read_tx
-            .iter(&docs_partition)
-            .filter_map(|kv| kv.ok().map(|(k, _)| k.as_ref().to_vec()))
+        // Collect all doc keys (own them before starting the batch).
+        let keys: Vec<Vec<u8>> = self
+            .engine
+            .full_iterator(&docs_partition)?
+            .filter_map(|kv| kv.ok().map(|(k, _)| k))
             .collect();
-        drop(read_tx);
 
-        // Also drop all indexes for this collection
         let index_defs = self.index_manager.get_indexes_for_collection(name);
 
-        let mut tx = self.db.write_tx();
+        let mut batch = self.write_batch();
 
-        // Remove all documents
         for key in &keys {
-            tx.remove(&docs_partition, key.as_slice());
+            batch.remove(&docs_partition, key);
         }
 
-        // Remove all index entries and meta keys
         for idx_def in &index_defs {
             if let Some(idx_partition) = self.index_manager.get_index_partition(name, &idx_def.name)
             {
-                let rtx = self.db.read_tx();
-                let idx_keys: Vec<Vec<u8>> = rtx
-                    .iter(&idx_partition)
-                    .filter_map(|kv| kv.ok().map(|(k, _)| k.as_ref().to_vec()))
+                let idx_keys: Vec<Vec<u8>> = self
+                    .engine
+                    .full_iterator(&idx_partition)?
+                    .filter_map(|kv| kv.ok().map(|(k, _)| k))
                     .collect();
-                drop(rtx);
                 for key in &idx_keys {
-                    tx.remove(&idx_partition, key.as_slice());
+                    batch.remove(&idx_partition, key);
                 }
             }
             let idx_meta_key = format!("index:{}:{}", name, idx_def.name);
-            tx.remove(&self.meta, idx_meta_key.as_str());
+            batch.remove(&self.meta, idx_meta_key.as_bytes());
         }
 
-        tx.remove(&self.meta, meta_key.as_str());
-        self.check_fjall_result(tx.commit())?;
+        batch.remove(&self.meta, meta_key.as_bytes());
+        self.commit_batch(batch)?;
 
-        // Unregister indexes from cache
         for idx_def in &index_defs {
             self.index_manager.unregister(name, &idx_def.name);
         }
 
-        // Remove doc counter
         self.doc_counts.remove(name);
-
-        // Clear scan accelerator in-memory state
         self.scan_accelerator.clear();
 
-        // Delete persisted bitmap files (accelerator is global, persisted under "_all")
+        // Delete persisted bitmap files (accelerator is global, stored under "_all").
         let bitmap_dir = self.data_dir.join("bitmap").join("_all");
         if bitmap_dir.exists()
             && let Err(e) = std::fs::remove_dir_all(&bitmap_dir)
@@ -182,10 +169,10 @@ impl Storage {
 
     pub fn collection_exists(&self, name: &str) -> Result<bool, AppError> {
         let meta_key = format!("collection:{name}");
-        Ok(self.meta.get(&meta_key)?.is_some())
+        Ok(self.engine.get(&self.meta, meta_key.as_bytes())?.is_some())
     }
 
-    pub fn get_docs_partition(&self, collection: &str) -> Result<TxPartitionHandle, AppError> {
+    pub fn get_docs_partition(&self, collection: &str) -> Result<PartitionId, AppError> {
         let ks_name = format!("{collection}#docs");
         self.create_partition(&ks_name)
     }

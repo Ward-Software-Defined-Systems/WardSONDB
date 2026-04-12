@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
+use crate::engine::backend::StorageBackend;
 use crate::error::AppError;
 use crate::query::filter::parse_filter;
 
@@ -31,9 +32,9 @@ impl Storage {
 
         let meta_key = format!("ttl:{collection}");
         let bytes = serde_json::to_vec(&config)?;
-        let mut tx = self.db.write_tx();
-        tx.insert(&self.meta, &meta_key, bytes);
-        self.check_fjall_result(tx.commit())?;
+        let mut batch = self.write_batch();
+        batch.insert(&self.meta, meta_key.as_bytes(), &bytes);
+        self.commit_batch(batch)?;
 
         Ok(config)
     }
@@ -41,9 +42,9 @@ impl Storage {
     pub fn get_ttl(&self, collection: &str) -> Result<Option<TtlConfig>, AppError> {
         self.ensure_collection_exists(collection)?;
         let meta_key = format!("ttl:{collection}");
-        match self.meta.get(&meta_key)? {
+        match self.engine.get(&self.meta, meta_key.as_bytes())? {
             Some(bytes) => {
-                let config: TtlConfig = serde_json::from_slice(bytes.as_ref())?;
+                let config: TtlConfig = serde_json::from_slice(&bytes)?;
                 Ok(Some(config))
             }
             None => Ok(None),
@@ -54,28 +55,25 @@ impl Storage {
         self.check_not_poisoned()?;
         self.ensure_collection_exists(collection)?;
         let meta_key = format!("ttl:{collection}");
-        let mut tx = self.db.write_tx();
-        tx.remove(&self.meta, meta_key.as_str());
-        self.check_fjall_result(tx.commit())?;
+        let mut batch = self.write_batch();
+        batch.remove(&self.meta, meta_key.as_bytes());
+        self.commit_batch(batch)?;
         Ok(())
     }
 
-    /// Get all collections that have a TTL policy.
     pub fn get_all_ttl_configs(&self) -> Result<Vec<(String, TtlConfig)>, AppError> {
         let mut results = Vec::new();
-        let read_tx = self.db.read_tx();
-        for kv in read_tx.prefix(&self.meta, "ttl:") {
+        for kv in self.engine.prefix_iterator(&self.meta, b"ttl:")? {
             let (key_bytes, val_bytes) = kv?;
-            let key_str = std::str::from_utf8(key_bytes.as_ref())
+            let key_str = std::str::from_utf8(&key_bytes)
                 .map_err(|e| AppError::Internal(format!("Invalid key: {e}")))?;
             let collection = key_str.strip_prefix("ttl:").unwrap_or(key_str).to_string();
-            let config: TtlConfig = serde_json::from_slice(val_bytes.as_ref())?;
+            let config: TtlConfig = serde_json::from_slice(&val_bytes)?;
             results.push((collection, config));
         }
         Ok(results)
     }
 
-    /// Run TTL cleanup for a single collection. Returns the number of documents deleted.
     pub fn run_ttl_cleanup(&self, collection: &str, config: &TtlConfig) -> Result<u64, AppError> {
         if !config.enabled {
             return Ok(0);
@@ -84,7 +82,6 @@ impl Storage {
         let cutoff = chrono::Utc::now() - chrono::Duration::days(config.retention_days as i64);
         let cutoff_str = cutoff.to_rfc3339();
 
-        // Build a filter: {field: {"$lt": cutoff_str}}
         let filter_json = serde_json::json!({
             &config.field: {"$lt": cutoff_str}
         });

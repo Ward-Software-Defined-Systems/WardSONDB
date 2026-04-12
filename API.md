@@ -40,6 +40,7 @@ wardsondb [OPTIONS]
 |------|-------|---------|-------------|
 | `--port <PORT>` | `-p` | `8080` | Listen port |
 | `--data-dir <PATH>` | `-d` | `./data` | Data directory (created automatically) |
+| `--storage-engine <ENGINE>` | | `rocksdb` | Storage backend: `rocksdb` or `fjall`. Locked per data directory via a `.engine` marker file. |
 | `--log-level <LEVEL>` | `-l` | `info` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
 | `--log-file <PATH>` | | `wardsondb.log` | Log file path (per-request logs always go here) |
 | `--verbose` | `-v` | `false` | Show per-request logs in the terminal |

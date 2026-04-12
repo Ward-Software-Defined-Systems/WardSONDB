@@ -91,25 +91,6 @@ impl IntoResponse for AppError {
     }
 }
 
-impl From<fjall::Error> for AppError {
-    fn from(e: fjall::Error) -> Self {
-        // Check if this is a poisoned keyspace (fatal background flush/compaction failure)
-        let msg = e.to_string();
-        if msg.contains("oison") {
-            // Matches "Poisoned", "poisoned", etc.
-            tracing::error!(
-                error = %e,
-                "FATAL: Storage engine poisoned — a background flush or compaction worker failed. \
-                 All writes will be rejected. The server must be restarted. \
-                 Check disk space, IO errors, and system logs for the root cause."
-            );
-            return AppError::StoragePoisoned;
-        }
-        tracing::error!(error = %e, "Storage engine error");
-        AppError::Internal(format!("Storage error: {e}"))
-    }
-}
-
 impl From<serde_json::Error> for AppError {
     fn from(e: serde_json::Error) -> Self {
         AppError::InvalidDocument(format!("JSON error: {e}"))

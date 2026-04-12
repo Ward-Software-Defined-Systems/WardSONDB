@@ -52,6 +52,16 @@ All numbers measured against 3.45 million production SIEM events (firewall, thre
 cargo build --release
 ```
 
+RocksDB is the default storage backend and requires `cmake` and `libclang`
+(for `bindgen`) at build time:
+
+- **Ubuntu/Debian:** `sudo apt install cmake libclang-dev`
+- **macOS:** `xcode-select --install`
+
+Select a backend with `--storage-engine rocksdb|fjall` (default `rocksdb`). The
+engine is locked to the data directory on first open via a `.engine` marker
+file — switching engines on an existing data dir is a hard startup error.
+
 ### Run
 
 ```bash
@@ -68,23 +78,11 @@ ulimit -n 65536
   --bitmap-fields "event_type,severity,status"
 ```
 
-### Linux: use jemalloc to avoid RSS bloat
+### Linux allocator
 
-On Linux, glibc's default allocator (ptmalloc2) holds onto freed memory in per-thread arenas. With Tokio's multi-threaded runtime, RSS climbs continuously even though the application isn't leaking — the allocator is hoarding fragmented memory. This does not occur on macOS, where libmalloc returns freed memory aggressively.
+On Linux, WardSONDB links `tikv-jemallocator` automatically and installs it as the process-wide `#[global_allocator]` via a `cfg(target_os = "linux")` gate in `src/main.rs`. This avoids the RSS-climb behaviour you see under Tokio's multi-threaded runtime with glibc's ptmalloc2 (which retains freed memory in per-thread arenas). No user action needed — a standard `cargo build --release` on Linux pulls in jemalloc's `cc` build, which requires a working C toolchain (already present if you installed `cmake`/`libclang-dev` for RocksDB).
 
-If you are deploying on Linux, add jemalloc to `Cargo.toml`:
-
-```toml
-[dependencies]
-tikv-jemallocator = "0.6"
-```
-
-And in `main.rs`:
-
-```rust
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-```
+On macOS the dependency isn't downloaded and the system allocator is used — libmalloc already returns freed memory to the OS aggressively, so jemalloc wouldn't add much.
 
 ### Create a collection and insert data
 
@@ -329,6 +327,8 @@ The planner selects the best strategy in this order:
 
 ## Memory Tuning
 
+These flags tune the active storage backend. They map to RocksDB's `LruCache` + `WriteBufferManager` + per-column-family `write_buffer_size` under the default backend, and to the analogous fjall parameters (`cache_size` / `max_write_buffer_size` / `max_memtable_size`) when `--storage-engine fjall` is used.
+
 WardSONDB uses conservative defaults (64 MiB cache, 64 MiB write buffer, 2 flush/compaction workers) suitable for resource-constrained environments. For high-memory systems handling millions of documents, increase these values to avoid write buffer saturation and compaction bottlenecks.
 
 ```bash
@@ -381,7 +381,7 @@ WardSONDB is designed for trusted network environments. Below are security consi
 |---|---|---|
 | High RSS memory usage at scale | **Expected behavior** | At 2M+ documents, the OS-reported RSS can grow to consume 80-90% of system memory. This is standard behavior across all mmap-based storage engines (RocksDB, LMDB, LevelDB) where memory-mapped SST files are counted as RSS by the OS kernel. The actual heap usage is bounded by the configured limits (see Memory Tuning section). The inflated RSS number reflects OS page cache, not application memory consumption — macOS is particularly aggressive about reporting mmap regions as RSS. macOS may terminate the process under memory pressure (Jetsam). Workaround: ensure adequate system memory and avoid running memory-intensive applications alongside WardSONDB on the same host. |
 | Full-scan queries slow at 2M+ documents | **Mitigated** | Queries on unindexed fields require a full collection scan. At 2M+ documents, unindexed queries can take 5-15 seconds. **Mitigation:** enable the bitmap scan accelerator (`--bitmap-fields`) for categorical fields — reduces unindexed count queries from seconds to sub-millisecond. For remaining unindexed fields, create secondary indexes. |
-| Compaction storm during bulk ingest with many indexes | **Known limitation** | Creating multiple indexes before or during heavy bulk ingest can trigger a compaction storm — fjall's background compaction workers saturate all CPU cores, making the server unresponsive to queries and health checks. This occurs because each inserted document writes to every index, generating massive write amplification. The server remains alive but cannot serve requests until compaction completes. Mitigation: create indexes *after* initial bulk ingest completes, create them one at a time with pauses between each, and monitor the `write_pressure` field in `GET /_health` — defer queries while it reports `"high"`. |
+| Compaction storm during bulk ingest with many indexes | **Known limitation** | Creating multiple indexes before or during heavy bulk ingest can trigger a compaction storm — background compaction workers (RocksDB or fjall) saturate CPU cores, making the server unresponsive to queries and health checks. This occurs because each inserted document writes to every index, generating massive write amplification. The server remains alive but cannot serve requests until compaction completes. Mitigation: create indexes *after* initial bulk ingest completes, create them one at a time with pauses between each, and monitor the `write_pressure` field in `GET /_health` — defer queries while it reports `"high"`. |
 
 ## Roadmap
 
@@ -399,7 +399,7 @@ WardSONDB is designed for trusted network environments. Below are security consi
 - [x] Compound range scans — equality prefix + range suffix on compound indexes *(Alpha)*
 - [x] Bitmap planner priority — prefer bitmap over secondary index for count_only queries on bitmap-enabled fields
 - [x] Bitmap-accelerated aggregation — aggregate executor reads bitmap counts directly (zero doc reads)
-- [ ] RSS memory optimization — investigate fjall mmap behavior at scale
+- [ ] RSS memory optimization — investigate RocksDB/fjall mmap behaviour at scale
 - [ ] Streaming/cursors — large result sets beyond limit/offset
 - [ ] Query explain — show scan strategy and index usage
 - [ ] Schema validation — optional JSON Schema on collections
@@ -409,8 +409,10 @@ WardSONDB is designed for trusted network environments. Below are security consi
 
 - [Rust](https://www.rust-lang.org/) — systems programming language
 - [Axum](https://github.com/tokio-rs/axum) — async web framework
-- [fjall](https://github.com/fjall-rs/fjall) — LSM-tree storage engine
+- [RocksDB](https://github.com/facebook/rocksdb) via [rust-rocksdb](https://github.com/rust-rocksdb/rust-rocksdb) — default storage backend
+- [fjall](https://github.com/fjall-rs/fjall) — alternative storage backend
 - [tokio](https://tokio.rs/) — async runtime
+- [tikv-jemallocator](https://github.com/tikv/jemallocator) — Linux allocator (avoids glibc RSS bloat under Tokio's multi-threaded runtime)
 
 ## License
 

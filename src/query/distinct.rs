@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use serde_json::Value;
 
+use crate::engine::backend::StorageBackend;
 use crate::engine::storage::Storage;
 use crate::error::AppError;
 
@@ -83,15 +84,14 @@ fn try_index_only_distinct(
         return Ok(None);
     }
 
-    let read_tx = storage.db.read_tx();
     let mut unique_keys: HashSet<Vec<u8>> = HashSet::new();
     let mut values: Vec<Value> = Vec::new();
     let mut truncated = false;
 
-    for kv in read_tx.iter(&partition) {
+    for kv in storage.engine.full_iterator(&partition)? {
         let (key_bytes, _) = kv?;
         // Key format: {value_bytes}\x00{doc_id}
-        let key = key_bytes.as_ref();
+        let key = key_bytes.as_slice();
         if let Some(sep_pos) = key.iter().rposition(|&b| b == 0x00) {
             let value_part = &key[..sep_pos];
             if unique_keys.insert(value_part.to_vec()) {

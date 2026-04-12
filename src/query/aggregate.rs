@@ -6,6 +6,7 @@ use serde_json::Value;
 const COLLECT_CAP: usize = 1000;
 const MAX_PIPELINE_STAGES: usize = 100;
 
+use crate::engine::backend::StorageBackend;
 use crate::engine::storage::Storage;
 use crate::error::AppError;
 
@@ -513,14 +514,13 @@ fn try_index_only_aggregate(
     }
 
     // Execute index-only aggregation: iterate index keys, group by value bytes
-    let read_tx = storage.db.read_tx();
     let mut group_counts: Vec<(Vec<u8>, u64)> = Vec::new();
     let mut current_value: Option<Vec<u8>> = None;
     let mut current_count: u64 = 0;
 
-    for kv in read_tx.iter(&partition) {
+    for kv in storage.engine.full_iterator(&partition)? {
         let (key_bytes, _) = kv?;
-        let key = key_bytes.as_ref();
+        let key = key_bytes.as_slice();
 
         // Single-field index key: {value_bytes}\x00{doc_id}
         // doc_id is 36 bytes (UUIDv7), separator at len-37

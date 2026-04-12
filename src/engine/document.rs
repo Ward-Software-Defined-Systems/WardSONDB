@@ -4,6 +4,7 @@ use chrono::Utc;
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::engine::backend::StorageBackend;
 use crate::error::AppError;
 use crate::query::filter::FilterNode;
 
@@ -55,7 +56,11 @@ impl Storage {
             let custom_id = validate_custom_id(&raw_id)?;
             // Check for duplicate
             let docs_partition = self.get_docs_partition(collection)?;
-            if docs_partition.get(&custom_id)?.is_some() {
+            if self
+                .engine
+                .get(&docs_partition, custom_id.as_bytes())?
+                .is_some()
+            {
                 return Err(AppError::DocumentConflict(format!(
                     "Document already exists: {custom_id}"
                 )));
@@ -78,11 +83,11 @@ impl Storage {
         }
 
         let docs_partition = self.get_docs_partition(collection)?;
-        let mut tx = self.db.write_tx();
-        tx.insert(&docs_partition, id.as_str(), &bytes);
+        let mut batch = self.write_batch();
+        batch.insert(&docs_partition, id.as_bytes(), &bytes);
         self.index_manager
-            .add_index_entries_to_tx(&mut tx, collection, &id, &doc);
-        self.check_fjall_result(tx.commit())?;
+            .add_index_entries_to_batch(&mut batch, collection, &id, &doc);
+        self.commit_batch(batch)?;
 
         self.doc_counts.increment(collection, 1);
         self.scan_accelerator.on_insert(&id, &doc);
@@ -94,9 +99,9 @@ impl Storage {
         self.ensure_collection_exists(collection)?;
 
         let docs_partition = self.get_docs_partition(collection)?;
-        match docs_partition.get(id)? {
+        match self.engine.get(&docs_partition, id.as_bytes())? {
             Some(bytes) => {
-                let doc: Value = serde_json::from_slice(bytes.as_ref())?;
+                let doc: Value = serde_json::from_slice(&bytes)?;
                 Ok(doc)
             }
             None => Err(AppError::DocumentNotFound(id.to_string())),
@@ -113,10 +118,11 @@ impl Storage {
         self.ensure_collection_exists(collection)?;
 
         let docs_partition = self.get_docs_partition(collection)?;
-        let existing_bytes = docs_partition
-            .get(id)?
+        let existing_bytes = self
+            .engine
+            .get(&docs_partition, id.as_bytes())?
             .ok_or_else(|| AppError::DocumentNotFound(id.to_string()))?;
-        let existing_doc: Value = serde_json::from_slice(existing_bytes.as_ref())?;
+        let existing_doc: Value = serde_json::from_slice(&existing_bytes)?;
 
         let old_rev = existing_doc
             .get("_rev")
@@ -158,14 +164,17 @@ impl Storage {
             return Err(AppError::DocumentTooLarge);
         }
 
-        let mut tx = self.db.write_tx();
-        // Remove old index entries, write new ones
+        let mut batch = self.write_batch();
+        self.index_manager.remove_index_entries_from_batch(
+            &mut batch,
+            collection,
+            id,
+            &existing_doc,
+        );
+        batch.insert(&docs_partition, id.as_bytes(), &bytes);
         self.index_manager
-            .remove_index_entries_from_tx(&mut tx, collection, id, &existing_doc);
-        tx.insert(&docs_partition, id, &bytes);
-        self.index_manager
-            .add_index_entries_to_tx(&mut tx, collection, id, &doc);
-        self.check_fjall_result(tx.commit())?;
+            .add_index_entries_to_batch(&mut batch, collection, id, &doc);
+        self.commit_batch(batch)?;
 
         self.scan_accelerator.on_update(id, &existing_doc, &doc);
 
@@ -188,16 +197,21 @@ impl Storage {
         self.ensure_collection_exists(collection)?;
 
         let docs_partition = self.get_docs_partition(collection)?;
-        let existing_bytes = docs_partition
-            .get(id)?
+        let existing_bytes = self
+            .engine
+            .get(&docs_partition, id.as_bytes())?
             .ok_or_else(|| AppError::DocumentNotFound(id.to_string()))?;
-        let existing_doc: Value = serde_json::from_slice(existing_bytes.as_ref())?;
+        let existing_doc: Value = serde_json::from_slice(&existing_bytes)?;
 
-        let mut tx = self.db.write_tx();
-        self.index_manager
-            .remove_index_entries_from_tx(&mut tx, collection, id, &existing_doc);
-        tx.remove(&docs_partition, id);
-        self.check_fjall_result(tx.commit())?;
+        let mut batch = self.write_batch();
+        self.index_manager.remove_index_entries_from_batch(
+            &mut batch,
+            collection,
+            id,
+            &existing_doc,
+        );
+        batch.remove(&docs_partition, id.as_bytes());
+        self.commit_batch(batch)?;
 
         self.doc_counts.increment(collection, -1);
         self.scan_accelerator.on_delete(id, &existing_doc);
@@ -245,7 +259,7 @@ impl Storage {
                             continue;
                         }
                         // Check for existing document in collection
-                        match docs_partition.get(&custom_id) {
+                        match self.engine.get(&docs_partition, custom_id.as_bytes()) {
                             Ok(Some(_)) => {
                                 errors.push(format!(
                                     "Document {i}: document already exists: {custom_id}"
@@ -291,13 +305,13 @@ impl Storage {
         }
 
         if !to_write.is_empty() {
-            let mut tx = self.db.write_tx();
+            let mut batch = self.write_batch();
             for (id, bytes, doc) in &to_write {
-                tx.insert(&docs_partition, id.as_str(), bytes.as_slice());
+                batch.insert(&docs_partition, id.as_bytes(), bytes.as_slice());
                 self.index_manager
-                    .add_index_entries_to_tx(&mut tx, collection, id, doc);
+                    .add_index_entries_to_batch(&mut batch, collection, id, doc);
             }
-            self.check_fjall_result(tx.commit())?;
+            self.commit_batch(batch)?;
             self.doc_counts.increment(collection, inserted as i64);
 
             for (id, _bytes, doc) in &to_write {
@@ -312,11 +326,10 @@ impl Storage {
         self.ensure_collection_exists(collection)?;
 
         let docs_partition = self.get_docs_partition(collection)?;
-        let read_tx = self.db.read_tx();
         let mut docs = Vec::new();
-        for kv in read_tx.iter(&docs_partition) {
+        for kv in self.engine.full_iterator(&docs_partition)? {
             let (_, value) = kv?;
-            let doc: Value = serde_json::from_slice(value.as_ref())?;
+            let doc: Value = serde_json::from_slice(&value)?;
             docs.push(doc);
         }
         Ok(docs)
@@ -340,17 +353,17 @@ impl Storage {
         }
 
         let docs_partition = self.get_docs_partition(collection)?;
-        let mut tx = self.db.write_tx();
+        let mut batch = self.write_batch();
 
         for doc in &matching {
             if let Some(id) = doc.get("_id").and_then(|v| v.as_str()) {
                 self.index_manager
-                    .remove_index_entries_from_tx(&mut tx, collection, id, doc);
-                tx.remove(&docs_partition, id);
+                    .remove_index_entries_from_batch(&mut batch, collection, id, doc);
+                batch.remove(&docs_partition, id.as_bytes());
             }
         }
 
-        self.check_fjall_result(tx.commit())?;
+        self.commit_batch(batch)?;
         self.doc_counts.increment(collection, -(count as i64));
 
         for doc in &matching {
@@ -389,7 +402,7 @@ impl Storage {
 
         let docs_partition = self.get_docs_partition(collection)?;
         let now = Utc::now().to_rfc3339();
-        let mut tx = self.db.write_tx();
+        let mut batch = self.write_batch();
 
         // Track (id, old_doc, new_doc) for bitmap accelerator
         let mut update_pairs: Vec<(String, Value, Value)> = Vec::new();
@@ -404,11 +417,9 @@ impl Storage {
                 .to_string();
             let old_rev = new_doc.get("_rev").and_then(|v| v.as_u64()).unwrap_or(0);
 
-            // Remove old index entries
             self.index_manager
-                .remove_index_entries_from_tx(&mut tx, collection, &id, &old_doc);
+                .remove_index_entries_from_batch(&mut batch, collection, &id, &old_doc);
 
-            // Apply $set fields
             if let Some(obj) = new_doc.as_object_mut() {
                 for (path, value) in &set_fields {
                     set_nested_field(obj, path, value.clone());
@@ -418,16 +429,15 @@ impl Storage {
             }
 
             let bytes = serde_json::to_vec(&new_doc)?;
-            tx.insert(&docs_partition, id.as_str(), bytes.as_slice());
+            batch.insert(&docs_partition, id.as_bytes(), bytes.as_slice());
 
-            // Write new index entries
             self.index_manager
-                .add_index_entries_to_tx(&mut tx, collection, &id, &new_doc);
+                .add_index_entries_to_batch(&mut batch, collection, &id, &new_doc);
 
             update_pairs.push((id, old_doc, new_doc));
         }
 
-        self.check_fjall_result(tx.commit())?;
+        self.commit_batch(batch)?;
 
         for (id, old_doc, new_doc) in &update_pairs {
             self.scan_accelerator.on_update(id, old_doc, new_doc);
@@ -454,7 +464,7 @@ impl Storage {
 
         // Check for duplicate name
         let meta_key = format!("index:{collection}:{name}");
-        if self.meta.get(&meta_key)?.is_some() {
+        if self.engine.get(&self.meta, meta_key.as_bytes())?.is_some() {
             return Err(AppError::IndexExists(name.to_string()));
         }
 
@@ -484,16 +494,14 @@ impl Storage {
 
         // Backfill: scan all existing documents and index them
         let docs_partition = self.get_docs_partition(collection)?;
-        let read_tx = self.db.read_tx();
         let mut entries: Vec<Vec<u8>> = Vec::new();
         let is_compound = fields.len() > 1;
 
-        for kv in read_tx.iter(&docs_partition) {
+        for kv in self.engine.full_iterator(&docs_partition)? {
             let (_, value_bytes) = kv?;
-            let doc: Value = serde_json::from_slice(value_bytes.as_ref())?;
+            let doc: Value = serde_json::from_slice(&value_bytes)?;
             if let Some(doc_id) = doc.get("_id").and_then(|v| v.as_str()) {
                 if is_compound {
-                    // All fields must be present for compound index
                     let values: Vec<&Value> = fields
                         .iter()
                         .filter_map(|f| crate::query::filter::resolve_json_path(&doc, f))
@@ -510,16 +518,14 @@ impl Storage {
                 }
             }
         }
-        drop(read_tx);
 
-        // Write all index entries + meta in one transaction
         let meta_bytes = serde_json::to_vec(&def)?;
-        let mut tx = self.db.write_tx();
+        let mut batch = self.write_batch();
         for key in &entries {
-            tx.insert(&partition, key.as_slice(), b"");
+            batch.insert(&partition, key.as_slice(), b"");
         }
-        tx.insert(&self.meta, &meta_key, meta_bytes);
-        self.check_fjall_result(tx.commit())?;
+        batch.insert(&self.meta, meta_key.as_bytes(), &meta_bytes);
+        self.commit_batch(batch)?;
 
         // Register in cache
         self.index_manager.register(def.clone(), partition);
@@ -535,7 +541,7 @@ impl Storage {
         self.ensure_collection_exists(collection)?;
 
         let meta_key = format!("index:{collection}:{name}");
-        if self.meta.get(&meta_key)?.is_none() {
+        if self.engine.get(&self.meta, meta_key.as_bytes())?.is_none() {
             return Err(AppError::IndexNotFound(format!("{collection}/{name}")));
         }
 
@@ -544,20 +550,18 @@ impl Storage {
             .get_index_partition(collection, name)
             .ok_or_else(|| AppError::IndexNotFound(format!("{collection}/{name}")))?;
 
-        // Clear all entries from the partition
-        let read_tx = self.db.read_tx();
-        let keys: Vec<Vec<u8>> = read_tx
-            .iter(&partition)
-            .filter_map(|kv| kv.ok().map(|(k, _)| k.as_ref().to_vec()))
+        let keys: Vec<Vec<u8>> = self
+            .engine
+            .full_iterator(&partition)?
+            .filter_map(|kv| kv.ok().map(|(k, _)| k))
             .collect();
-        drop(read_tx);
 
-        let mut tx = self.db.write_tx();
+        let mut batch = self.write_batch();
         for key in &keys {
-            tx.remove(&partition, key.as_slice());
+            batch.remove(&partition, key.as_slice());
         }
-        tx.remove(&self.meta, meta_key.as_str());
-        self.check_fjall_result(tx.commit())?;
+        batch.remove(&self.meta, meta_key.as_bytes());
+        self.commit_batch(batch)?;
 
         self.index_manager.unregister(collection, name);
         self.persist()?;

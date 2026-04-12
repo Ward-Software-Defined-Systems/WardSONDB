@@ -1,5 +1,6 @@
 use serde_json::Value;
 
+use crate::engine::backend::StorageBackend;
 use crate::engine::storage::Storage;
 use crate::error::AppError;
 use crate::index::secondary::extract_doc_id_from_key;
@@ -123,7 +124,7 @@ fn execute_index_scan(
                 && let Some(count) =
                     storage
                         .index_manager
-                        .count_eq(&storage.db, collection, field, value)
+                        .count_eq(&storage.engine, collection, field, value)
             {
                 return Ok(QueryResult {
                     docs: vec![],
@@ -137,7 +138,7 @@ fn execute_index_scan(
 
             let ids = storage
                 .index_manager
-                .lookup_eq(&storage.db, collection, field, value)
+                .lookup_eq(&storage.engine, collection, field, value)
                 .unwrap_or_default();
             (index_name.clone(), ids)
         }
@@ -155,11 +156,12 @@ fn execute_index_scan(
                     .is_some();
                 if has_index {
                     for value in values {
-                        if let Some(count) =
-                            storage
-                                .index_manager
-                                .count_eq(&storage.db, collection, field, value)
-                        {
+                        if let Some(count) = storage.index_manager.count_eq(
+                            &storage.engine,
+                            collection,
+                            field,
+                            value,
+                        ) {
                             total += count;
                         }
                     }
@@ -176,7 +178,7 @@ fn execute_index_scan(
 
             let ids = storage
                 .index_manager
-                .lookup_in(&storage.db, collection, field, values)
+                .lookup_in(&storage.engine, collection, field, values)
                 .unwrap_or_default();
             (index_name.clone(), ids)
         }
@@ -191,7 +193,7 @@ fn execute_index_scan(
                 let lower_ref = lower.as_ref().map(|(v, i)| (v, *i));
                 let upper_ref = upper.as_ref().map(|(v, i)| (v, *i));
                 if let Some(count) = storage.index_manager.count_range(
-                    &storage.db,
+                    &storage.engine,
                     collection,
                     field,
                     lower_ref,
@@ -212,7 +214,7 @@ fn execute_index_scan(
             let upper_ref = upper.as_ref().map(|(v, i)| (v, *i));
             let ids = storage
                 .index_manager
-                .lookup_range(&storage.db, collection, field, lower_ref, upper_ref)
+                .lookup_range(&storage.engine, collection, field, lower_ref, upper_ref)
                 .unwrap_or_default();
             (index_name.clone(), ids)
         }
@@ -225,8 +227,11 @@ fn execute_index_scan(
                     .ok_or_else(|| {
                         AppError::Internal(format!("Index partition not found: {index_name}"))
                     })?;
-                let read_tx = storage.db.read_tx();
-                let count = read_tx.prefix(&partition, prefix).flatten().count() as u64;
+                let count = storage
+                    .engine
+                    .prefix_iterator(&partition, prefix)?
+                    .flatten()
+                    .count() as u64;
                 return Ok(QueryResult {
                     docs: vec![],
                     total_count: Some(count),
@@ -243,10 +248,13 @@ fn execute_index_scan(
                 .ok_or_else(|| {
                     AppError::Internal(format!("Index partition not found: {index_name}"))
                 })?;
-            let read_tx = storage.db.read_tx();
             let mut ids = Vec::new();
-            for (key, _) in read_tx.prefix(&partition, prefix).flatten() {
-                if let Some(id) = extract_doc_id_from_key(key.as_ref()) {
+            for (key, _) in storage
+                .engine
+                .prefix_iterator(&partition, prefix)?
+                .flatten()
+            {
+                if let Some(id) = extract_doc_id_from_key(&key) {
                     ids.push(id);
                 }
             }
@@ -264,8 +272,8 @@ fn execute_index_scan(
     let docs_partition = storage.get_docs_partition(collection)?;
     let mut loaded_docs = Vec::with_capacity(candidate_ids.len());
     for id in &candidate_ids {
-        if let Ok(Some(bytes)) = docs_partition.get(id.as_str())
-            && let Ok(doc) = serde_json::from_slice::<Value>(bytes.as_ref())
+        if let Ok(Some(bytes)) = storage.engine.get(&docs_partition, id.as_bytes())
+            && let Ok(doc) = serde_json::from_slice::<Value>(&bytes)
         {
             loaded_docs.push(doc);
         }
@@ -360,8 +368,8 @@ fn execute_index_sorted(
             None => return Ok(false),
         };
 
-        let doc = match docs_partition.get(doc_id.as_str()) {
-            Ok(Some(bytes)) => match serde_json::from_slice::<Value>(bytes.as_ref()) {
+        let doc = match storage.engine.get(&docs_partition, doc_id.as_bytes()) {
+            Ok(Some(bytes)) => match serde_json::from_slice::<Value>(&bytes) {
                 Ok(doc) => doc,
                 Err(_) => return Ok(false),
             },
@@ -398,20 +406,15 @@ fn execute_index_sorted(
     };
 
     // Scan in the requested direction
-    let read_tx = storage.db.read_tx();
-    if reverse {
-        for kv in read_tx.prefix(&partition, prefix).rev() {
-            let (key, _) = kv?;
-            if process_key(key.as_ref())? {
-                break;
-            }
-        }
+    let iter = if reverse {
+        storage.engine.prefix_iterator_rev(&partition, prefix)?
     } else {
-        for kv in read_tx.prefix(&partition, prefix) {
-            let (key, _) = kv?;
-            if process_key(key.as_ref())? {
-                break;
-            }
+        storage.engine.prefix_iterator(&partition, prefix)?
+    };
+    for kv in iter {
+        let (key, _) = kv?;
+        if process_key(&key)? {
+            break;
         }
     }
 
@@ -481,8 +484,6 @@ fn execute_compound_range(
         k
     };
 
-    let read_tx = storage.db.read_tx();
-
     // For non-inclusive lower bound, build the exact prefix to skip
     let lower_exact_prefix = if let Some((lower_bytes, false)) = lower {
         let mut p = eq_prefix.to_vec();
@@ -496,10 +497,14 @@ fn execute_compound_range(
     // count_only optimization: count index keys without loading docs
     if query.count_only && plan.post_filter.is_none() {
         let mut count = 0u64;
-        for kv in read_tx.range(&partition, start_key.as_slice()..end_key.as_slice()) {
+        for kv in
+            storage
+                .engine
+                .range_iterator(&partition, start_key.as_slice(), end_key.as_slice())?
+        {
             let (key, _) = kv?;
             if let Some(ref prefix) = lower_exact_prefix
-                && key.as_ref().starts_with(prefix)
+                && key.starts_with(prefix)
             {
                 continue;
             }
@@ -517,17 +522,19 @@ fn execute_compound_range(
 
     // Collect candidate doc IDs from the range scan
     let mut candidate_ids = Vec::new();
-    for kv in read_tx.range(&partition, start_key.as_slice()..end_key.as_slice()) {
+    for kv in storage
+        .engine
+        .range_iterator(&partition, start_key.as_slice(), end_key.as_slice())?
+    {
         let (key, _) = kv?;
-        let key_ref = key.as_ref();
 
         if let Some(ref prefix) = lower_exact_prefix
-            && key_ref.starts_with(prefix)
+            && key.starts_with(prefix)
         {
             continue;
         }
 
-        if let Some(id) = extract_doc_id_from_key(key_ref) {
+        if let Some(id) = extract_doc_id_from_key(&key) {
             candidate_ids.push(id);
         }
     }
@@ -538,8 +545,8 @@ fn execute_compound_range(
     let docs_partition = storage.get_docs_partition(collection)?;
     let mut loaded_docs = Vec::with_capacity(candidate_ids.len());
     for id in &candidate_ids {
-        if let Ok(Some(bytes)) = docs_partition.get(id.as_str())
-            && let Ok(doc) = serde_json::from_slice::<Value>(bytes.as_ref())
+        if let Ok(Some(bytes)) = storage.engine.get(&docs_partition, id.as_bytes())
+            && let Ok(doc) = serde_json::from_slice::<Value>(&bytes)
         {
             loaded_docs.push(doc);
         }
@@ -632,8 +639,8 @@ fn execute_bitmap_scan(
 
     for pos in bitmap.iter() {
         if let Some(doc_id) = storage.scan_accelerator.positions.get_doc_id(pos)
-            && let Ok(Some(bytes)) = docs_partition.get(&*doc_id)
-            && let Ok(doc) = serde_json::from_slice::<Value>(bytes.as_ref())
+            && let Ok(Some(bytes)) = storage.engine.get(&docs_partition, doc_id.as_bytes())
+            && let Ok(doc) = serde_json::from_slice::<Value>(&bytes)
         {
             docs_scanned += 1;
             loaded_docs.push(doc);
