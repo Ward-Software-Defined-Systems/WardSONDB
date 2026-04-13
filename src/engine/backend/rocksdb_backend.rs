@@ -49,6 +49,7 @@ impl RocksDbBackend {
             let mut table_opts = BlockBasedOptions::default();
             table_opts.set_block_cache(&cache);
             table_opts.set_cache_index_and_filter_blocks(true);
+            table_opts.set_bloom_filter(10.0, false);
             table_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
             cf_opts.set_block_based_table_factory(&table_opts);
 
@@ -73,6 +74,7 @@ impl RocksDbBackend {
         let mut table_opts = BlockBasedOptions::default();
         table_opts.set_block_cache(&cache);
         table_opts.set_cache_index_and_filter_blocks(true);
+        table_opts.set_bloom_filter(10.0, false);
         table_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
         db_opts.set_block_based_table_factory(&table_opts);
         db_opts.set_compression_per_level(&[
@@ -116,6 +118,7 @@ impl RocksDbBackend {
         let mut table_opts = BlockBasedOptions::default();
         table_opts.set_block_cache(&self.cache);
         table_opts.set_cache_index_and_filter_blocks(true);
+        table_opts.set_bloom_filter(10.0, false);
         table_opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
         cf_opts.set_block_based_table_factory(&table_opts);
 
