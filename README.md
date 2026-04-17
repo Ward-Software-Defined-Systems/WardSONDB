@@ -52,9 +52,10 @@ All numbers measured against 3.45 million production SIEM events (firewall, thre
 cargo build --release
 ```
 
-RocksDB is the default storage backend and needs a C/C++ toolchain plus
-`cmake`, `clang`, and `libclang` at build time (bindgen uses libclang to
-preprocess RocksDB / zstd headers):
+The RocksDB backend needs a C/C++ toolchain plus `cmake`, `clang`, and
+`libclang` at build time (bindgen uses libclang to preprocess RocksDB / zstd
+headers). These are still required to build even if you plan to launch with
+`--storage-engine fjall`, because both backends are compiled in:
 
 - **Ubuntu/Debian:** `sudo apt install build-essential clang cmake libclang-dev`
 - **macOS:** `xcode-select --install`
@@ -65,22 +66,23 @@ installs clang's builtin header directory (`/usr/lib/clang/<version>/include/`)
 that provides `stddef.h` and friends. Without the `clang` package you'll see
 `fatal error: 'stddef.h' file not found` when `zstd-sys` builds.
 
-Select a backend with `--storage-engine rocksdb|fjall` (default `rocksdb`). The
-engine is locked to the data directory on first open via a `.engine` marker
-file — switching engines on an existing data dir is a hard startup error.
+Select a backend with `--storage-engine rocksdb|fjall` — this flag is
+**required** on every launch; there is no implicit default. The engine is
+locked to the data directory on first open via a `.engine` marker file —
+switching engines on an existing data dir is a hard startup error.
 
 ### Run
 
 ```bash
-# Basic — HTTP on port 8080
-./target/release/wardsondb
+# Basic — HTTP on port 8080 (pick a backend: rocksdb or fjall)
+./target/release/wardsondb --storage-engine rocksdb
 
 # With TLS (auto-generated self-signed cert)
-./target/release/wardsondb --tls
+./target/release/wardsondb --storage-engine rocksdb --tls
 
 # Production — TLS, custom port, API key auth, bitmap acceleration
 ulimit -n 65536
-./target/release/wardsondb --tls --port 443 --data-dir /var/lib/wardsondb --api-key "your-secret-key" \
+./target/release/wardsondb --storage-engine rocksdb --tls --port 443 --data-dir /var/lib/wardsondb --api-key "your-secret-key" \
   --cache-size-mb 512 --write-buffer-mb 512 --flush-workers 4 --compaction-workers 4 \
   --bitmap-fields "event_type,severity,status"
 ```
@@ -202,6 +204,7 @@ curl -X PUT http://localhost:8080/events/ttl \
 |------|---------|-------------|
 | `--port` | `8080` | Listen port |
 | `--data-dir` | `./data` | Data directory |
+| `--storage-engine` | *required* | Storage backend: `rocksdb` or `fjall`. No default — must be passed on every launch. Locked per data directory via a `.engine` marker file. |
 | `--tls` | `false` | Enable TLS |
 | `--tls-cert` | | Custom TLS certificate path |
 | `--tls-key` | | Custom TLS key path |
@@ -271,7 +274,7 @@ The bitmap scan accelerator eliminates full-collection scans for queries on low-
 ### Enabling
 
 ```bash
-./target/release/wardsondb --tls \
+./target/release/wardsondb --storage-engine rocksdb --tls \
   --bitmap-fields "event_type,network.action,severity,network.protocol,source_format"
 ```
 
@@ -334,13 +337,13 @@ The planner selects the best strategy in this order:
 
 ## Memory Tuning
 
-These flags tune the active storage backend. They map to RocksDB's `LruCache` + `WriteBufferManager` + per-column-family `write_buffer_size` under the default backend, and to the analogous fjall parameters (`cache_size` / `max_write_buffer_size` / `max_memtable_size`) when `--storage-engine fjall` is used.
+These flags tune the active storage backend. Under `--storage-engine rocksdb` they map to RocksDB's `LruCache` + `WriteBufferManager` + per-column-family `write_buffer_size`; under `--storage-engine fjall` they map to the analogous fjall parameters (`cache_size` / `max_write_buffer_size` / `max_memtable_size`).
 
 WardSONDB uses conservative defaults (64 MiB cache, 64 MiB write buffer, 2 flush/compaction workers) suitable for resource-constrained environments. For high-memory systems handling millions of documents, increase these values to avoid write buffer saturation and compaction bottlenecks.
 
 ```bash
 # Recommended for systems with 32GB+ RAM and heavy write workloads
-./target/release/wardsondb --tls \
+./target/release/wardsondb --storage-engine rocksdb --tls \
   --cache-size-mb 512 \
   --write-buffer-mb 512 \
   --memtable-mb 32 \
@@ -416,8 +419,8 @@ WardSONDB is designed for trusted network environments. Below are security consi
 
 - [Rust](https://www.rust-lang.org/) — systems programming language
 - [Axum](https://github.com/tokio-rs/axum) — async web framework
-- [RocksDB](https://github.com/facebook/rocksdb) via [rust-rocksdb](https://github.com/rust-rocksdb/rust-rocksdb) — default storage backend
-- [fjall](https://github.com/fjall-rs/fjall) — alternative storage backend
+- [RocksDB](https://github.com/facebook/rocksdb) via [rust-rocksdb](https://github.com/rust-rocksdb/rust-rocksdb) — storage backend (select with `--storage-engine rocksdb`)
+- [fjall](https://github.com/fjall-rs/fjall) — storage backend (select with `--storage-engine fjall`)
 - [tokio](https://tokio.rs/) — async runtime
 - [tikv-jemallocator](https://github.com/tikv/jemallocator) — Linux allocator (avoids glibc RSS bloat under Tokio's multi-threaded runtime)
 

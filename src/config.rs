@@ -20,10 +20,10 @@ pub struct Config {
     #[arg(short, long, default_value = "./data")]
     pub data_dir: String,
 
-    /// Storage engine: `rocksdb` (default) or `fjall`.
+    /// Storage engine: `rocksdb` or `fjall` (required — no default).
     /// The data directory is locked to its first engine via a `.engine` marker
     /// file; switching engines on existing data is a startup error.
-    #[arg(long, default_value = "rocksdb", value_parser = ["rocksdb", "fjall"])]
+    #[arg(long, required = true, value_parser = ["rocksdb", "fjall"])]
     pub storage_engine: String,
 
     /// Log level: trace|debug|info|warn|error

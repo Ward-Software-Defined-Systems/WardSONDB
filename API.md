@@ -11,11 +11,11 @@
 **Recommended:** `ulimit -n 65536`
 
 ```bash
-# Raise the file descriptor limit before launching
-ulimit -n 65536 && wardsondb
+# Raise the file descriptor limit before launching (pick a backend)
+ulimit -n 65536 && wardsondb --storage-engine rocksdb
 
 # With TLS enabled
-ulimit -n 65536 && wardsondb --tls
+ulimit -n 65536 && wardsondb --storage-engine rocksdb --tls
 ```
 
 WardSONDB will attempt to auto-raise the file descriptor limit on startup if possible. If the limit remains below 4096, it logs a **WARNING** at startup.
@@ -40,7 +40,7 @@ wardsondb [OPTIONS]
 |------|-------|---------|-------------|
 | `--port <PORT>` | `-p` | `8080` | Listen port |
 | `--data-dir <PATH>` | `-d` | `./data` | Data directory (created automatically) |
-| `--storage-engine <ENGINE>` | | `rocksdb` | Storage backend: `rocksdb` or `fjall`. Locked per data directory via a `.engine` marker file. |
+| `--storage-engine <ENGINE>` | | *required* | Storage backend: `rocksdb` or `fjall`. Required on every launch (no default). Locked per data directory via a `.engine` marker file. |
 | `--log-level <LEVEL>` | `-l` | `info` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
 | `--log-file <PATH>` | | `wardsondb.log` | Log file path (per-request logs always go here) |
 | `--verbose` | `-v` | `false` | Show per-request logs in the terminal |
@@ -69,36 +69,39 @@ The `--help` output also displays a **FILE DESCRIPTORS** section at the bottom, 
 
 ### Examples
 
+Every invocation below passes `--storage-engine rocksdb`; swap in
+`--storage-engine fjall` to use the alternative backend.
+
 ```bash
-# Default — listen on port 8080, store data in ./data
-wardsondb
+# Minimal — listen on port 8080, store data in ./data
+wardsondb --storage-engine rocksdb
 
 # Custom port and data directory
-wardsondb --port 3000 --data-dir /var/lib/wardsondb
+wardsondb --storage-engine rocksdb --port 3000 --data-dir /var/lib/wardsondb
 
 # Debug logging with per-request logs in the terminal
-wardsondb --log-level debug --verbose
+wardsondb --storage-engine rocksdb --log-level debug --verbose
 
 # Production — info level, logs to a specific file
-wardsondb --data-dir /var/lib/wardsondb --log-file /var/log/wardsondb.log
+wardsondb --storage-engine rocksdb --data-dir /var/lib/wardsondb --log-file /var/log/wardsondb.log
 
 # TLS with auto-generated self-signed certificate
-wardsondb --tls
+wardsondb --storage-engine rocksdb --tls
 
 # TLS with custom certificate
-wardsondb --tls --tls-cert /etc/ssl/wardsondb.crt --tls-key /etc/ssl/wardsondb.key
+wardsondb --storage-engine rocksdb --tls --tls-cert /etc/ssl/wardsondb.crt --tls-key /etc/ssl/wardsondb.key
 
 # Bitmap scan accelerator with explicit fields
-wardsondb --bitmap-fields "event_type,severity,network.action"
+wardsondb --storage-engine rocksdb --bitmap-fields "event_type,severity,network.action"
 
 # Bitmap with custom cardinality cap
-wardsondb --bitmap-fields "event_type,severity" --bitmap-max-cardinality 500
+wardsondb --storage-engine rocksdb --bitmap-fields "event_type,severity" --bitmap-max-cardinality 500
 
 # Bitmap with explicit memory budget (2 GiB)
-wardsondb --bitmap-fields "event_type,severity" --bitmap-memory-mb 2048
+wardsondb --storage-engine rocksdb --bitmap-fields "event_type,severity" --bitmap-memory-mb 2048
 
 # Disable bitmap scan accelerator
-wardsondb --no-bitmap
+wardsondb --storage-engine rocksdb --no-bitmap
 ```
 
 ### Logging Behavior
@@ -113,7 +116,7 @@ Pass `--tls` to enable HTTPS. Two modes:
 
 **Auto-generated self-signed certificate:**
 ```bash
-wardsondb --tls
+wardsondb --storage-engine rocksdb --tls
 ```
 - Generates a self-signed certificate and key on first run
 - Stored in `<data-dir>/tls/cert.pem` and `<data-dir>/tls/key.pem`
@@ -124,7 +127,7 @@ wardsondb --tls
 
 **Custom certificate:**
 ```bash
-wardsondb --tls --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem
+wardsondb --storage-engine rocksdb --tls --tls-cert /path/to/cert.pem --tls-key /path/to/key.pem
 ```
 
 Without `--tls`, the server runs plain HTTP (default behavior).
@@ -1467,13 +1470,13 @@ API key authentication is opt-in. When API keys are configured, all endpoints ex
 
 ```bash
 # Single key
-wardsondb --api-key "my-secret-key"
+wardsondb --storage-engine rocksdb --api-key "my-secret-key"
 
 # Multiple keys
-wardsondb --api-key "key1" --api-key "key2"
+wardsondb --storage-engine rocksdb --api-key "key1" --api-key "key2"
 
 # Key file (one key per line, # for comments)
-wardsondb --api-key-file /etc/wardsondb/keys.txt
+wardsondb --storage-engine rocksdb --api-key-file /etc/wardsondb/keys.txt
 ```
 
 ### Usage
@@ -1682,7 +1685,7 @@ A complete workflow from starting the server to querying data:
 
 ```bash
 # 1. Start the server
-wardsondb --port 8080
+wardsondb --storage-engine rocksdb --port 8080
 
 # 2. Create a collection
 curl -X POST http://localhost:8080/_collections \
