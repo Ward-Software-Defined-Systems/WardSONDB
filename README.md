@@ -293,7 +293,7 @@ The bitmap scan accelerator eliminates full-collection scans for queries on low-
 - New inserts/updates automatically maintain the bitmaps after commit
 - The query planner uses bitmaps when all filter fields are bitmap-covered and the query is count-only or aggregation
 - Bitmap AND/OR/NOT operations run entirely in memory with zero document reads
-- Bitmaps are rebuilt from storage on restart — fjall is always the source of truth
+- Bitmaps are rebuilt from storage on restart — the storage engine (RocksDB or fjall) is always the source of truth
 - Dropping and recreating a collection re-arms the accelerator automatically — no restart needed
 - A **memory budget** (default: auto-sized to min(4GB, 10% system RAM)) prevents OOM — when exceeded, new inserts skip bitmap tracking and queries fall back to full scan for uncovered documents
 - **Automatic compaction**: when TTL deletes create >25% holes in the position map, a background rebuild reclaims memory

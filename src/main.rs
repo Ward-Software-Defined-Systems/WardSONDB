@@ -134,7 +134,12 @@ async fn main() {
     // Spawn periodic stats reporter (every 10 seconds)
     server::metrics::spawn_stats_reporter(metrics.clone(), 10);
 
-    // Spawn bitmap persistence + compaction task (every 60 seconds)
+    // Spawn bitmap persistence + compaction task (every 60 seconds).
+    //
+    // The persist call and `recompute_cached_memory` both do unbounded
+    // in-memory work plus blocking `fs::write`, so they run inside
+    // `spawn_blocking` to keep them off the async worker pool. The outer
+    // interval driver stays on the runtime so the 60s cadence is accurate.
     if !config.no_bitmap {
         let persist_state = state.clone();
         let data_dir_owned = config.data_dir.clone();
@@ -143,25 +148,39 @@ async fn main() {
             tick.tick().await; // Skip first immediate tick
             loop {
                 tick.tick().await;
-                if persist_state.storage.scan_accelerator.is_ready() {
-                    let dir = std::path::Path::new(&data_dir_owned);
-                    if let Err(e) = persist_state
+                if !persist_state.storage.scan_accelerator.is_ready() {
+                    continue;
+                }
+
+                let persist_task_state = persist_state.clone();
+                let dir = std::path::PathBuf::from(&data_dir_owned);
+                let persist_result = tokio::task::spawn_blocking(move || {
+                    let result = persist_task_state
                         .storage
                         .scan_accelerator
-                        .persist_to_disk(dir, "_all")
-                    {
-                        warn!(error = %e, "Failed to persist scan accelerator");
-                    }
+                        .persist_to_disk(&dir, "_all");
+                    persist_task_state
+                        .storage
+                        .scan_accelerator
+                        .recompute_cached_memory();
+                    result
+                })
+                .await;
 
-                    // Compact if >25% holes from TTL deletes
-                    if persist_state.storage.scan_accelerator.needs_compaction() {
-                        info!("Bitmap position map has >25% holes, triggering compaction rebuild");
-                        let compact_state = persist_state.clone();
-                        let _ = tokio::task::spawn_blocking(move || {
-                            rebuild_all_accelerators(&compact_state.storage);
-                        })
-                        .await;
-                    }
+                match persist_result {
+                    Ok(Err(e)) => warn!(error = %e, "Failed to persist scan accelerator"),
+                    Err(e) => warn!(error = %e, "Persist task panicked"),
+                    Ok(Ok(())) => {}
+                }
+
+                // Compact if >25% holes from TTL deletes
+                if persist_state.storage.scan_accelerator.needs_compaction() {
+                    info!("Bitmap position map has >25% holes, triggering compaction rebuild");
+                    let compact_state = persist_state.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        rebuild_all_accelerators(&compact_state.storage);
+                    })
+                    .await;
                 }
             }
         });
@@ -479,10 +498,10 @@ fn system_ram_bytes() -> Option<u64> {
             for line in contents.lines() {
                 if let Some(rest) = line.strip_prefix("MemTotal:") {
                     let rest = rest.trim();
-                    if let Some(kb_str) = rest.strip_suffix("kB") {
-                        if let Ok(kb) = kb_str.trim().parse::<u64>() {
-                            return Some(kb * 1024);
-                        }
+                    if let Some(kb_str) = rest.strip_suffix("kB")
+                        && let Ok(kb) = kb_str.trim().parse::<u64>()
+                    {
+                        return Some(kb * 1024);
                     }
                 }
             }

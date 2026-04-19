@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use parking_lot::RwLock;
 use roaring::RoaringBitmap;
@@ -164,6 +164,16 @@ impl BitmapColumn {
     }
 }
 
+/// Immutable per-column snapshot used by `persist_to_disk` so guards are
+/// never held across blocking I/O. Fields mirror `BitmapColumn` but everything
+/// is already cloned out from under the locks.
+struct ColumnSnapshot {
+    field_path: String,
+    cardinality: u32,
+    value_bitmaps: HashMap<String, RoaringBitmap>,
+    exists_bitmap: RoaringBitmap,
+}
+
 // ── ScanAccelerator ─────────────────────────────────────────────────────────
 
 /// Result of a bitmap scan: the matching positions + any residual filter.
@@ -206,6 +216,9 @@ pub struct ScanAccelerator {
     profiler: CardinalityProfiler,
     /// true when memory budget is exceeded; skips bitmap column tracking.
     over_budget: AtomicBool,
+    /// Cached total memory usage, refreshed by the background persist task.
+    /// Read on the `on_insert` hot path to avoid the 4-lock `total_memory_bytes()` chain.
+    cached_memory_bytes: AtomicU64,
 }
 
 impl ScanAccelerator {
@@ -226,6 +239,7 @@ impl ScanAccelerator {
             ready: AtomicBool::new(false),
             profiler: CardinalityProfiler::new(has_fields),
             over_budget: AtomicBool::new(false),
+            cached_memory_bytes: AtomicU64::new(0),
         }
     }
 
@@ -245,6 +259,14 @@ impl ScanAccelerator {
             total += column.memory_bytes();
         }
         total
+    }
+
+    /// Refresh `cached_memory_bytes`. Called from the background persist task
+    /// (inside `spawn_blocking`) so the `on_insert` hot path can read a cached
+    /// value via a single atomic load instead of acquiring four RwLock guards.
+    pub fn recompute_cached_memory(&self) {
+        let bytes = self.total_memory_bytes() as u64;
+        self.cached_memory_bytes.store(bytes, Ordering::Relaxed);
     }
 
     pub fn is_ready(&self) -> bool {
@@ -328,11 +350,16 @@ impl ScanAccelerator {
             }
         }
 
-        // Check memory budget every 1000 inserts
+        // Check memory budget every 1000 inserts.
+        // Reads `cached_memory_bytes` (a single atomic) instead of calling
+        // `total_memory_bytes()` — the latter takes four RwLock reader guards
+        // (config + columns + positions.id_to_pos + positions.pos_to_id) and
+        // contributed to a write-halt deadlock against `persist_to_disk`.
+        // The cache is refreshed by the background persist task every 60 s.
         if pos % 1000 == 0 {
             let budget = self.config.read().max_memory_bytes;
             if budget > 0 {
-                let used = self.total_memory_bytes();
+                let used = self.cached_memory_bytes.load(Ordering::Relaxed) as usize;
                 let was_over = self.over_budget.load(Ordering::Relaxed);
                 let is_over = used as u64 > budget;
                 if is_over != was_over {
@@ -797,50 +824,78 @@ impl ScanAccelerator {
         let bitmap_dir = data_dir.join("bitmap").join(collection);
         fs::create_dir_all(&bitmap_dir)?;
 
-        // Persist position map
-        let positions_vec = self.positions.pos_to_id.read();
-        let next_pos = self.positions.next_pos.load(Ordering::Relaxed);
+        // Snapshot everything we need under the shortest possible guard scopes,
+        // then drop all guards before any blocking I/O. Earlier revisions held
+        // reader guards on `pos_to_id` + `id_to_pos` + `columns` + per-column
+        // `value_bitmaps` + `exists_bitmap` across `fs::write` calls. Under
+        // parking_lot writer-fairness, a queued writer from `on_insert` /
+        // `on_update` would cause every subsequent reader in this function to
+        // block, producing a hard process-wide deadlock under sustained ingest.
+        //
+        // Peak transient allocation at 2M docs × ~11 fields: ~300-400 MB
+        // (dominated by the positions Vec + HashMap clones). Budget for this
+        // if pushing past 10M docs on small hosts.
+        let (pos_vec_snapshot, next_pos) = {
+            let guard = self.positions.pos_to_id.read();
+            (
+                guard.clone(),
+                self.positions.next_pos.load(Ordering::Relaxed),
+            )
+        };
 
-        // Write positions metadata
+        let id_map_snapshot: HashMap<Arc<str>, u32> = self.positions.id_to_pos.read().clone();
+
+        let columns_snapshot: Vec<ColumnSnapshot> = {
+            let cols = self.columns.read();
+            cols.iter()
+                .map(|(field, col)| ColumnSnapshot {
+                    field_path: field.clone(),
+                    cardinality: col.cardinality.load(Ordering::Relaxed),
+                    value_bitmaps: col.value_bitmaps.read().clone(),
+                    exists_bitmap: col.exists_bitmap.read().clone(),
+                })
+                .collect()
+        };
+
+        // From here on, no RwLock guards are held. All I/O runs lock-free.
+
         let meta = serde_json::json!({
             "next_pos": next_pos,
-            "count": positions_vec.len(),
+            "count": pos_vec_snapshot.len(),
         });
         fs::write(
             bitmap_dir.join("positions.meta.json"),
             serde_json::to_string_pretty(&meta).unwrap_or_default(),
         )?;
 
-        // Write position map as JSON (supports variable-length string IDs)
-        let pos_entries: Vec<Option<&str>> =
-            positions_vec.iter().map(|slot| slot.as_deref()).collect();
+        // Serde's `Arc<T>` Serialize impl is gated behind the `rc` feature,
+        // which we don't enable. Convert to borrowed `&str` references at
+        // serialize time — cheap, no allocations, and produces the same
+        // JSON bytes as the previous implementation.
+        let pos_entries: Vec<Option<&str>> = pos_vec_snapshot
+            .iter()
+            .map(|slot| slot.as_deref())
+            .collect();
         fs::write(
             bitmap_dir.join("positions.map.json"),
             serde_json::to_string(&pos_entries).unwrap_or_default(),
         )?;
 
-        // Persist id_to_pos as JSON
-        let id_map = self.positions.id_to_pos.read();
-        let id_entries: HashMap<&str, u32> = id_map.iter().map(|(k, v)| (&**k, *v)).collect();
+        let id_entries: HashMap<&str, u32> =
+            id_map_snapshot.iter().map(|(k, v)| (&**k, *v)).collect();
         fs::write(
             bitmap_dir.join("positions.ids.json"),
             serde_json::to_string(&id_entries).unwrap_or_default(),
         )?;
 
-        // Persist bitmap columns
-        let columns = self.columns.read();
         let mut columns_meta = Vec::new();
-
-        for (field_path, column) in columns.iter() {
-            let bitmaps = column.value_bitmaps.read();
-            let exists = column.exists_bitmap.read();
-
-            // Safe field name for filesystem
-            let safe_field = field_path.replace('.', "_DOT_");
+        for snapshot in &columns_snapshot {
+            let safe_field = snapshot.field_path.replace('.', "_DOT_");
 
             // Write exists bitmap
             let mut exists_bytes = Vec::new();
-            exists
+            snapshot
+                .exists_bitmap
                 .serialize_into(&mut exists_bytes)
                 .map_err(std::io::Error::other)?;
             fs::write(
@@ -850,7 +905,7 @@ impl ScanAccelerator {
 
             // Write each value bitmap
             let mut value_keys = Vec::new();
-            for (i, (value_key, bitmap)) in bitmaps.iter().enumerate() {
+            for (i, (value_key, bitmap)) in snapshot.value_bitmaps.iter().enumerate() {
                 let mut bitmap_bytes = Vec::new();
                 bitmap
                     .serialize_into(&mut bitmap_bytes)
@@ -861,9 +916,9 @@ impl ScanAccelerator {
             }
 
             columns_meta.push(serde_json::json!({
-                "field_path": field_path,
+                "field_path": &snapshot.field_path,
                 "safe_field": safe_field,
-                "cardinality": column.cardinality.load(Ordering::Relaxed),
+                "cardinality": snapshot.cardinality,
                 "values": value_keys.iter().map(|(k, f)| serde_json::json!({"key": k, "file": f})).collect::<Vec<_>>(),
             }));
         }
