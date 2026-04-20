@@ -3,7 +3,8 @@
 
 # Database data directory (runtime data, not source)
 /data
-
+/data-fjall
+/data-rocksdb
 # Log files
 *.log
 
@@ -38,3 +39,4 @@ COMPOUND-RANGE-INSTRUCTIONS.md
 DOCS-CLEANUP.md
 TASK-BITMAP-MEMORY-GOVERNANCE.md
 TASK-STORAGE-BACKEND-REWORK.md
+/WardSONDB-Performance-Optimization
