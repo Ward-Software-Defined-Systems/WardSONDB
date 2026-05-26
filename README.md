@@ -378,7 +378,7 @@ WardSONDB is designed for trusted network environments. Below are security consi
 |---|---|---|
 | Regex denial of service | **Critical** | **Mitigated** — uses the Rust `regex` crate which guarantees linear-time matching. Pattern length capped at 1024 characters. |
 | API key timing attacks | **Critical** | **Mitigated** — API key comparison uses constant-time equality (`subtle` crate) to prevent timing-based enumeration. |
-| Unbounded query results | **Medium** | **Mitigated** — query `limit` capped at 10,000. Bulk insert capped at 10,000 documents. Pipeline stages capped at 100. |
+| Unbounded query results | **Medium** | **Mitigated** — query `limit` capped at 100,000 (configurable via `--max-query-limit`). Bulk insert capped at 10,000 documents. Pipeline stages capped at 100. |
 | Query resource exhaustion | **Medium** | **Mitigated** — queries timeout after 30 seconds (configurable via `--query-timeout`). Filter nesting capped at depth 20, branches at 1000. |
 | No built-in authentication | **Medium** | **Configurable** — API key auth is opt-in via `--api-key` or `--api-key-file`. When not configured, all endpoints are open. Deploy behind a reverse proxy with auth if exposed beyond your LAN. |
 | TLS certificate trust | **Info** | Auto-generated self-signed certificates trigger browser warnings. For production, provide your own certs via `--tls-cert` and `--tls-key`. |

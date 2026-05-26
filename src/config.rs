@@ -66,6 +66,10 @@ pub struct Config {
     #[arg(long, default_value = "30")]
     pub query_timeout: u64,
 
+    /// Maximum allowed query `limit` (results clamped silently if exceeded)
+    #[arg(long, default_value = "100000")]
+    pub max_query_limit: u64,
+
     /// Make /_metrics endpoint publicly accessible (bypasses auth)
     #[arg(long, default_value_t = false)]
     pub metrics_public: bool,

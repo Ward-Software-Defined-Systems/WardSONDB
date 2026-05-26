@@ -25,6 +25,7 @@ fn test_config(tmp: &TempDir, port: u16) -> Config {
         api_keys: vec![],
         api_key_file: None,
         query_timeout: 30,
+        max_query_limit: 100_000,
         metrics_public: false,
         cache_size_mb: 64,
         write_buffer_mb: 64,
@@ -117,6 +118,38 @@ async fn start_test_server_with_keys(api_keys: Vec<String>) -> (String, TempDir)
     // Give the server a moment to start
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
+    (base_url, tmp)
+}
+
+async fn start_test_server_with_max_query_limit(max: u64) -> (String, TempDir) {
+    let tmp = TempDir::new().unwrap();
+    let storage = Storage::open(tmp.path()).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let mut config = test_config(&tmp, port);
+    config.max_query_limit = max;
+
+    let state = Arc::new(AppState {
+        storage,
+        config,
+        started_at: Instant::now(),
+        metrics: Arc::new(Metrics::new()),
+        api_keys: vec![],
+    });
+
+    let app = build_router(state);
+    let addr = format!("127.0.0.1:{port}");
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    let base_url = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     (base_url, tmp)
 }
 
@@ -2915,7 +2948,7 @@ async fn test_regex_dos_prevention() {
     );
 }
 
-/// Test 51: Query limit capped at 10,000
+/// Test 51: Query limit capped at the configured ceiling (default 100,000)
 #[tokio::test]
 async fn test_query_limit_cap() {
     let (base_url, _tmp) = start_test_server().await;
@@ -2947,8 +2980,42 @@ async fn test_query_limit_cap() {
         .unwrap();
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["ok"], true);
-    // All 5 docs returned (within 10,000 cap)
+    // All 5 docs returned (within 100,000 cap)
     assert_eq!(body["data"].as_array().unwrap().len(), 5);
+}
+
+/// Verifies `--max-query-limit` is wired through to the parser by setting
+/// a small custom ceiling and confirming the clamp applies at that value.
+#[tokio::test]
+async fn test_query_limit_cap_configurable() {
+    let (base_url, _tmp) = start_test_server_with_max_query_limit(3).await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "cfglimit"}))
+        .send()
+        .await
+        .unwrap();
+
+    for i in 0..10 {
+        client
+            .post(format!("{base_url}/cfglimit/docs"))
+            .json(&json!({"n": i}))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let resp = client
+        .post(format!("{base_url}/cfglimit/query"))
+        .json(&json!({"limit": 50}))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["data"].as_array().unwrap().len(), 3);
 }
 
 /// Test 52: Bulk insert rejects more than 10,000 documents

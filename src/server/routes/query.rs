@@ -41,7 +41,7 @@ pub async fn search(
     JsonBody(body): JsonBody<QueryRequest>,
 ) -> Result<Json<ApiResponse>, AppError> {
     let start = Instant::now();
-    let query = parse_query(body)?;
+    let query = parse_query(body, state.config.max_query_limit)?;
     let count_only = query.count_only;
     let timeout_secs = state.config.query_timeout;
 

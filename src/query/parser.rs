@@ -6,8 +6,6 @@ use crate::error::AppError;
 use super::filter::{FilterNode, parse_filter};
 use super::sort::{SortField, parse_sort};
 
-const MAX_QUERY_LIMIT: u64 = 10_000;
-
 #[derive(Debug, Deserialize)]
 pub struct QueryRequest {
     pub filter: Option<Value>,
@@ -28,7 +26,7 @@ pub struct ParsedQuery {
     pub count_only: bool,
 }
 
-pub fn parse_query(req: QueryRequest) -> Result<ParsedQuery, AppError> {
+pub fn parse_query(req: QueryRequest, max_limit: u64) -> Result<ParsedQuery, AppError> {
     let filter = match req.filter {
         Some(f) => Some(parse_filter(&f)?),
         None => None,
@@ -42,7 +40,7 @@ pub fn parse_query(req: QueryRequest) -> Result<ParsedQuery, AppError> {
     Ok(ParsedQuery {
         filter,
         sort,
-        limit: req.limit.unwrap_or(100).min(MAX_QUERY_LIMIT),
+        limit: req.limit.unwrap_or(100).min(max_limit),
         offset: req.offset.unwrap_or(0),
         fields: req.fields,
         count_only: req.count_only.unwrap_or(false),
