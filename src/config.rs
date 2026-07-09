@@ -70,6 +70,11 @@ pub struct Config {
     #[arg(long, default_value = "100000")]
     pub max_query_limit: u64,
 
+    /// Maximum HTTP request body size in MiB (bulk inserts must fit within it;
+    /// oversized requests get 413 DOCUMENT_TOO_LARGE)
+    #[arg(long, default_value = "64")]
+    pub max_body_mb: u64,
+
     /// Make /_metrics endpoint publicly accessible (bypasses auth)
     #[arg(long, default_value_t = false)]
     pub metrics_public: bool,

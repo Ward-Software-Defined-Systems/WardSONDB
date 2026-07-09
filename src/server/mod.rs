@@ -30,6 +30,9 @@ pub struct AppState {
 pub fn build_router(state: Arc<AppState>) -> Router {
     let metrics = state.metrics.clone();
     let auth_state = state.clone();
+    // Axum's default body cap is 2 MB — below the 16 MB single-document
+    // limit, and bulk inserts need headroom beyond that.
+    let max_body_bytes = (state.config.max_body_mb as usize).saturating_mul(1024 * 1024);
 
     Router::new()
         // System
@@ -93,6 +96,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/{collection}/storage",
             get(routes::collections::get_storage_info),
         )
+        .layer(axum::extract::DefaultBodyLimit::max(max_body_bytes))
         .layer(axum::middleware::from_fn(request_logger))
         .layer(axum::middleware::from_fn(request_id_middleware))
         .layer(axum::middleware::from_fn_with_state(

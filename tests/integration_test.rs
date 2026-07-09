@@ -26,6 +26,7 @@ fn test_config(tmp: &TempDir, port: u16) -> Config {
         api_key_file: None,
         query_timeout: 30,
         max_query_limit: 100_000,
+        max_body_mb: 64,
         metrics_public: false,
         cache_size_mb: 64,
         write_buffer_mb: 64,
@@ -6651,4 +6652,74 @@ async fn test_count_only_unfiltered_uses_doc_counter() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 404);
+}
+
+/// The request body limit is configurable (--max-body-mb, default 64 MiB) —
+/// axum's 2 MB default silently capped bulk inserts below the 16 MB
+/// single-document limit. Oversized bodies get 413 DOCUMENT_TOO_LARGE.
+#[tokio::test]
+async fn test_request_body_limit() {
+    // Default server: a ~3 MB bulk insert (over axum's old 2 MB default)
+    // must succeed.
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "big"}))
+        .send()
+        .await
+        .unwrap();
+
+    let filler = "x".repeat(30_000);
+    let docs: Vec<Value> = (0..100).map(|i| json!({"n": i, "pad": filler})).collect();
+    let resp = client
+        .post(format!("{base_url}/big/docs/_bulk"))
+        .json(&json!({"documents": docs}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201, "3MB bulk must pass the default limit");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["data"]["inserted"], 100);
+
+    // Low-limit server: a 2 MB body against a 1 MiB cap → 413.
+    let tmp = TempDir::new().unwrap();
+    let storage = Storage::open(tmp.path()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let mut config = test_config(&tmp, port);
+    config.max_body_mb = 1;
+    let state = Arc::new(AppState {
+        storage,
+        config,
+        started_at: Instant::now(),
+        metrics: Arc::new(Metrics::new()),
+        api_keys: vec![],
+    });
+    let app = build_router(state);
+    let addr = format!("127.0.0.1:{port}");
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let small_base = format!("http://{addr}");
+
+    client
+        .post(format!("{small_base}/_collections"))
+        .json(&json!({"name": "big"}))
+        .send()
+        .await
+        .unwrap();
+    let filler = "y".repeat(2_000_000);
+    let resp = client
+        .post(format!("{small_base}/big/docs"))
+        .json(&json!({"pad": filler}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 413);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "DOCUMENT_TOO_LARGE");
 }
