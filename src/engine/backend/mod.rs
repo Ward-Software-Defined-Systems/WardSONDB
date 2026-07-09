@@ -132,7 +132,9 @@ pub struct BackendIterator {
 enum BackendIteratorInner {
     /// fjall iterators borrow from a read transaction, so we collect up front.
     Fjall(std::vec::IntoIter<BackendResult<KvPair>>),
-    /// RocksDB iterators stream directly from a snapshot — zero materialization.
+    /// RocksDB iterators also buffer before returning: DBIterator borrows the
+    /// DB, but this type must be 'static. Callers that only need a page pass
+    /// `max_results` to the range methods to bound the buffering.
     RocksDb(Box<dyn Iterator<Item = BackendResult<KvPair>> + Send>),
 }
 
@@ -173,18 +175,26 @@ pub trait StorageBackend: Send + Sync {
         partition: &PartitionId,
         prefix: &[u8],
     ) -> BackendResult<BackendIterator>;
-    /// Iterate matching keys in reverse lexicographic order. Used for sorted
-    /// descending scans with early termination.
-    fn prefix_iterator_rev(
-        &self,
-        partition: &PartitionId,
-        prefix: &[u8],
-    ) -> BackendResult<BackendIterator>;
+    /// Iterate keys `k` with `start <= k < end` in ASCENDING byte order.
+    /// `max_results: Some(n)` reads and buffers at most n pairs (for
+    /// limit+1-style page probes); `None` is unbounded.
     fn range_iterator(
         &self,
         partition: &PartitionId,
         start: &[u8],
         end: &[u8],
+        max_results: Option<usize>,
+    ) -> BackendResult<BackendIterator>;
+    /// Iterate the same half-open key set `start <= k < end` in DESCENDING
+    /// byte order, i.e. starting from the largest key strictly below `end`.
+    /// Used for sorted descending scans with early termination and for
+    /// descending cursor seeks. `max_results` as on `range_iterator`.
+    fn range_iterator_rev(
+        &self,
+        partition: &PartitionId,
+        start: &[u8],
+        end: &[u8],
+        max_results: Option<usize>,
     ) -> BackendResult<BackendIterator>;
     fn full_iterator(&self, partition: &PartitionId) -> BackendResult<BackendIterator>;
     fn first_key(&self, partition: &PartitionId) -> BackendResult<Option<Vec<u8>>>;
@@ -238,25 +248,28 @@ impl StorageBackend for Engine {
             Engine::RocksDb(b) => b.prefix_iterator(partition, prefix),
         }
     }
-    fn prefix_iterator_rev(
-        &self,
-        partition: &PartitionId,
-        prefix: &[u8],
-    ) -> BackendResult<BackendIterator> {
-        match self {
-            Engine::Fjall(b) => b.prefix_iterator_rev(partition, prefix),
-            Engine::RocksDb(b) => b.prefix_iterator_rev(partition, prefix),
-        }
-    }
     fn range_iterator(
         &self,
         partition: &PartitionId,
         start: &[u8],
         end: &[u8],
+        max_results: Option<usize>,
     ) -> BackendResult<BackendIterator> {
         match self {
-            Engine::Fjall(b) => b.range_iterator(partition, start, end),
-            Engine::RocksDb(b) => b.range_iterator(partition, start, end),
+            Engine::Fjall(b) => b.range_iterator(partition, start, end, max_results),
+            Engine::RocksDb(b) => b.range_iterator(partition, start, end, max_results),
+        }
+    }
+    fn range_iterator_rev(
+        &self,
+        partition: &PartitionId,
+        start: &[u8],
+        end: &[u8],
+        max_results: Option<usize>,
+    ) -> BackendResult<BackendIterator> {
+        match self {
+            Engine::Fjall(b) => b.range_iterator_rev(partition, start, end, max_results),
+            Engine::RocksDb(b) => b.range_iterator_rev(partition, start, end, max_results),
         }
     }
     fn full_iterator(&self, partition: &PartitionId) -> BackendResult<BackendIterator> {

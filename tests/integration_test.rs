@@ -6090,3 +6090,394 @@ async fn test_cursor_with_projection_excluding_sort_field() {
     .await;
     assert_eq!(ids_of(&walked), reference);
 }
+
+// ─── Cursor fast paths (index seek, _id seek, exact probes) ──────────────────
+
+async fn start_test_server_with_engine(engine: &str) -> (String, TempDir) {
+    use wardsondb::engine::storage::MemoryConfig;
+
+    let tmp = TempDir::new().unwrap();
+    let storage = Storage::open_with_config(tmp.path(), engine, MemoryConfig::default()).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let mut config = test_config(&tmp, port);
+    config.storage_engine = engine.to_string();
+
+    let state = Arc::new(AppState {
+        storage,
+        config,
+        started_at: Instant::now(),
+        metrics: Arc::new(Metrics::new()),
+        api_keys: vec![],
+    });
+
+    let app = build_router(state);
+    let addr = format!("127.0.0.1:{port}");
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    let base_url = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (base_url, tmp)
+}
+
+/// Seed a collection with a compound index [event_type, received_at] and 15
+/// "fw" docs (with duplicated timestamps so ties span pages) + 5 "dns" docs.
+async fn seed_index_sorted_collection(client: &Client, base_url: &str) {
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "events"}))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base_url}/events/indexes"))
+        .json(&json!({"name": "idx_type_time", "fields": ["event_type", "received_at"]}))
+        .send()
+        .await
+        .unwrap();
+
+    let docs: Vec<Value> = (0..20)
+        .map(|i| {
+            json!({
+                "event_type": if i < 15 { "fw" } else { "dns" },
+                // i/3 → duplicate timestamps: tie runs of 3 cross page bounds
+                "received_at": format!("2026-04-{:02}", (i / 3) + 1),
+                "n": i
+            })
+        })
+        .collect();
+    client
+        .post(format!("{base_url}/events/docs/_bulk"))
+        .json(&json!({"documents": docs}))
+        .send()
+        .await
+        .unwrap();
+}
+
+/// B-3: cursor walks stay on the index_sorted fast path page after page, in
+/// both directions, with tie runs crossing page boundaries.
+#[tokio::test]
+async fn test_cursor_walk_index_sorted_both_directions() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+    seed_index_sorted_collection(&client, &base_url).await;
+
+    for dir in ["asc", "desc"] {
+        let body = json!({
+            "filter": {"event_type": "fw"},
+            "sort": [{"received_at": dir}],
+            "limit": 4
+        });
+
+        // Every page must be served by index_sorted, including cursor resumes.
+        let mut all = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut req = body.clone();
+            if let Some(c) = &cursor {
+                req["cursor"] = json!(c);
+            }
+            let resp = client
+                .post(format!("{base_url}/events/query"))
+                .json(&req)
+                .send()
+                .await
+                .unwrap();
+            let resp_body: Value = resp.json().await.unwrap();
+            assert_eq!(
+                resp_body["meta"]["scan_strategy"], "index_sorted",
+                "direction {dir}: cursor pages must stay on the seek path"
+            );
+            all.extend(resp_body["data"].as_array().unwrap().iter().cloned());
+            match resp_body["meta"]["next_cursor"].as_str() {
+                Some(c) => cursor = Some(c.to_string()),
+                None => break,
+            }
+        }
+
+        assert_eq!(all.len(), 15, "direction {dir}");
+        assert_eq!(
+            ids_of(&all),
+            reference_ids(&client, &base_url, "events", body).await,
+            "direction {dir}: pages must equal the one-shot result"
+        );
+    }
+}
+
+/// B-14: index_sorted has_more is exact — when matches == offset + limit the
+/// probe finds nothing and has_more/next_cursor are absent. (Previously it
+/// reported has_more: true the moment the limit filled.)
+#[tokio::test]
+async fn test_index_sorted_has_more_exact_boundary() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+    seed_index_sorted_collection(&client, &base_url).await;
+
+    // 15 fw docs exactly.
+    let resp = client
+        .post(format!("{base_url}/events/query"))
+        .json(&json!({
+            "filter": {"event_type": "fw"},
+            "sort": [{"received_at": "asc"}],
+            "limit": 15
+        }))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["meta"]["scan_strategy"], "index_sorted");
+    assert_eq!(body["data"].as_array().unwrap().len(), 15);
+    assert!(
+        body["meta"]["has_more"].is_null(),
+        "matches == limit must not report has_more"
+    );
+    assert!(body["meta"]["next_cursor"].is_null());
+
+    // offset + limit == matches → same.
+    let resp = client
+        .post(format!("{base_url}/events/query"))
+        .json(&json!({
+            "filter": {"event_type": "fw"},
+            "sort": [{"received_at": "asc"}],
+            "offset": 10,
+            "limit": 5
+        }))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["meta"]["scan_strategy"], "index_sorted");
+    assert!(body["meta"]["has_more"].is_null());
+
+    // One doc really is left → has_more present.
+    let resp = client
+        .post(format!("{base_url}/events/query"))
+        .json(&json!({
+            "filter": {"event_type": "fw"},
+            "sort": [{"received_at": "asc"}],
+            "limit": 14
+        }))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["meta"]["has_more"], true);
+    assert!(body["meta"]["next_cursor"].is_string());
+}
+
+/// An index with extra trailing fields can't resume safely: exact has_more
+/// but NO next_cursor; covering the tail with the sort re-enables cursors.
+#[tokio::test]
+async fn test_index_sorted_extras_no_cursor() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "events"}))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base_url}/events/indexes"))
+        .json(&json!({"name": "idx_type_time_sev", "fields": ["event_type", "received_at", "severity"]}))
+        .send()
+        .await
+        .unwrap();
+    let docs: Vec<Value> = (0..10)
+        .map(|i| {
+            json!({
+                "event_type": "fw",
+                "received_at": format!("2026-04-{:02}", i + 1),
+                "severity": if i % 2 == 0 { "high" } else { "low" }
+            })
+        })
+        .collect();
+    client
+        .post(format!("{base_url}/events/docs/_bulk"))
+        .json(&json!({"documents": docs}))
+        .send()
+        .await
+        .unwrap();
+
+    // Sort covers only [received_at]: index tail has extras → no cursor.
+    let resp = client
+        .post(format!("{base_url}/events/query"))
+        .json(&json!({
+            "filter": {"event_type": "fw"},
+            "sort": [{"received_at": "asc"}],
+            "limit": 4
+        }))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["meta"]["scan_strategy"], "index_sorted");
+    assert_eq!(body["meta"]["has_more"], true);
+    assert!(
+        body["meta"]["next_cursor"].is_null(),
+        "extras-tail plans must not emit cursors"
+    );
+
+    // Extending the sort to cover the tail re-enables cursor emission.
+    let body_full = json!({
+        "filter": {"event_type": "fw"},
+        "sort": [{"received_at": "asc"}, {"severity": "asc"}],
+        "limit": 4
+    });
+    let resp = client
+        .post(format!("{base_url}/events/query"))
+        .json(&body_full)
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["meta"]["scan_strategy"], "index_sorted");
+    assert!(body["meta"]["next_cursor"].is_string());
+
+    let walked = cursor_walk(&client, &base_url, "events", body_full.clone()).await;
+    assert_eq!(walked.len(), 10);
+    assert_eq!(
+        ids_of(&walked),
+        reference_ids(&client, &base_url, "events", body_full).await
+    );
+}
+
+/// B-7: a plain no-sort query bootstraps a cursor from the full scan's _id
+/// order and the seek path finishes the walk without re-materializing.
+#[tokio::test]
+async fn test_cursor_no_sort_id_walk() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "items"}))
+        .send()
+        .await
+        .unwrap();
+    let docs: Vec<Value> = (0..23)
+        .map(|i| json!({"n": i, "keep": i % 2 == 0}))
+        .collect();
+    client
+        .post(format!("{base_url}/items/docs/_bulk"))
+        .json(&json!({"documents": docs}))
+        .send()
+        .await
+        .unwrap();
+
+    // Unfiltered whole-collection walk, no sort at all.
+    let walked = cursor_walk(&client, &base_url, "items", json!({"limit": 5})).await;
+    assert_eq!(walked.len(), 23);
+    let ids = ids_of(&walked);
+    let mut sorted = ids.clone();
+    sorted.sort();
+    assert_eq!(ids, sorted, "no-sort walk must stream in _id order");
+
+    // Filtered no-sort walk exercises the seek path's residual filtering.
+    let walked = cursor_walk(
+        &client,
+        &base_url,
+        "items",
+        json!({"filter": {"keep": true}, "limit": 4}),
+    )
+    .await;
+    assert_eq!(walked.len(), 12);
+    for d in &walked {
+        assert_eq!(d["keep"], true);
+    }
+}
+
+/// B-15: the descending index seek on the fjall backend (range_iterator_rev)
+/// — full walk equivalence end-to-end over HTTP.
+#[tokio::test]
+async fn test_fjall_cursor_walk_index_sorted_desc() {
+    let (base_url, _tmp) = start_test_server_with_engine("fjall").await;
+    let client = Client::new();
+    seed_index_sorted_collection(&client, &base_url).await;
+
+    let body = json!({
+        "filter": {"event_type": "fw"},
+        "sort": [{"received_at": "desc"}],
+        "limit": 4
+    });
+
+    let probe = client
+        .post(format!("{base_url}/events/query"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let probe_body: Value = probe.json().await.unwrap();
+    assert_eq!(probe_body["meta"]["scan_strategy"], "index_sorted");
+
+    let walked = cursor_walk(&client, &base_url, "events", body.clone()).await;
+    assert_eq!(walked.len(), 15);
+    assert_eq!(
+        ids_of(&walked),
+        reference_ids(&client, &base_url, "events", body).await
+    );
+
+    // And the no-sort seek path on fjall too.
+    let walked = cursor_walk(&client, &base_url, "events", json!({"limit": 7})).await;
+    assert_eq!(walked.len(), 20);
+}
+
+/// B-16: --max-query-limit clamps each cursor page; the walk still completes.
+#[tokio::test]
+async fn test_cursor_limit_clamp_per_page() {
+    let (base_url, _tmp) = start_test_server_with_max_query_limit(3).await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "items"}))
+        .send()
+        .await
+        .unwrap();
+    let docs: Vec<Value> = (0..10).map(|i| json!({"score": i})).collect();
+    client
+        .post(format!("{base_url}/items/docs/_bulk"))
+        .json(&json!({"documents": docs}))
+        .send()
+        .await
+        .unwrap();
+
+    // Ask for 50 per page; the cap forces pages of 3.
+    let mut pages = 0;
+    let mut all = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let mut req = json!({"sort": [{"score": "asc"}], "limit": 50});
+        if let Some(c) = &cursor {
+            req["cursor"] = json!(c);
+        }
+        let resp = client
+            .post(format!("{base_url}/items/query"))
+            .json(&req)
+            .send()
+            .await
+            .unwrap();
+        let body: Value = resp.json().await.unwrap();
+        let docs = body["data"].as_array().unwrap();
+        assert!(docs.len() <= 3, "page must respect the configured cap");
+        all.extend(docs.iter().cloned());
+        pages += 1;
+        assert!(pages < 20, "walk must terminate");
+        match body["meta"]["next_cursor"].as_str() {
+            Some(c) => cursor = Some(c.to_string()),
+            None => break,
+        }
+    }
+    assert_eq!(all.len(), 10);
+    assert_eq!(pages, 4); // 3+3+3+1
+    let scores: Vec<i64> = all.iter().map(|d| d["score"].as_i64().unwrap()).collect();
+    assert_eq!(scores, (0..10).collect::<Vec<i64>>());
+}

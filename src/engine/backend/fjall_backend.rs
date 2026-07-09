@@ -95,27 +95,12 @@ impl StorageBackend for FjallBackend {
         Ok(BackendIterator::from_fjall(items))
     }
 
-    fn prefix_iterator_rev(
-        &self,
-        partition: &PartitionId,
-        prefix: &[u8],
-    ) -> BackendResult<BackendIterator> {
-        let PartitionId::Fjall(handle) = partition else {
-            return Err(BackendError::Internal(
-                "PartitionId/backend mismatch".into(),
-            ));
-        };
-        let rtx = self.db.read_tx();
-        let items: Vec<BackendResult<KvPair>> =
-            rtx.prefix(handle, prefix).rev().map(to_kv).collect();
-        Ok(BackendIterator::from_fjall(items))
-    }
-
     fn range_iterator(
         &self,
         partition: &PartitionId,
         start: &[u8],
         end: &[u8],
+        max_results: Option<usize>,
     ) -> BackendResult<BackendIterator> {
         let PartitionId::Fjall(handle) = partition else {
             return Err(BackendError::Internal(
@@ -125,8 +110,34 @@ impl StorageBackend for FjallBackend {
         let rtx = self.db.read_tx();
         let start_v = start.to_vec();
         let end_v = end.to_vec();
-        let items: Vec<BackendResult<KvPair>> =
-            rtx.range(handle, start_v..end_v).map(to_kv).collect();
+        let range = rtx.range(handle, start_v..end_v).map(to_kv);
+        let items: Vec<BackendResult<KvPair>> = match max_results {
+            Some(n) => range.take(n).collect(),
+            None => range.collect(),
+        };
+        Ok(BackendIterator::from_fjall(items))
+    }
+
+    fn range_iterator_rev(
+        &self,
+        partition: &PartitionId,
+        start: &[u8],
+        end: &[u8],
+        max_results: Option<usize>,
+    ) -> BackendResult<BackendIterator> {
+        let PartitionId::Fjall(handle) = partition else {
+            return Err(BackendError::Internal(
+                "PartitionId/backend mismatch".into(),
+            ));
+        };
+        let rtx = self.db.read_tx();
+        let start_v = start.to_vec();
+        let end_v = end.to_vec();
+        let range = rtx.range(handle, start_v..end_v).rev().map(to_kv);
+        let items: Vec<BackendResult<KvPair>> = match max_results {
+            Some(n) => range.take(n).collect(),
+            None => range.collect(),
+        };
         Ok(BackendIterator::from_fjall(items))
     }
 

@@ -823,8 +823,9 @@ Rules and semantics:
 - `cursor` is **mutually exclusive with `offset`**, and cannot be combined with `count_only` or `"limit": 0` (all `400 INVALID_QUERY`).
 - A cursor is bound to its **collection and sort specification** (fields + directions). Reusing it with a different sort or collection returns `400 INVALID_QUERY`. The **filter is deliberately not bound**: the cursor is purely positional, so you may narrow or widen the filter mid-walk and pagination stays well-defined.
 - Pages are **strictly-after**: each page contains the matching documents positioned after the last document of the previous page in the total order (sort fields, then an `_id` tiebreak in the direction of the last sort field). Documents deleted between pages are skipped without repeats or gaps among survivors; a document whose sort value is updated may move behind the cursor (not seen again) or ahead of it (seen on a later page) — inherent to keyset pagination.
-- `next_cursor` is emitted for sorted queries and cursor-resumed queries. To walk a collection without a sort, pass `"sort": [{"_id": "asc"}]` (or any deterministic sort) on the first request.
-- `meta.total_count` may be absent on cursor-paginated responses served by early-terminating index scans.
+- `next_cursor` is emitted for sorted queries, cursor-resumed queries, and no-sort full scans (which stream in `_id` order, so cursor walks of a whole collection work with no sort at all). Index- or bitmap-served queries **without** a sort don't emit one — pass an explicit sort (e.g. `[{"_id": "asc"}]`) to paginate those.
+- One exception on emission: an `index_sorted` plan whose index has extra fields *after* the sort fields returns exact `has_more` but no `next_cursor` (its within-tie order can't be resumed safely). Extend the sort to cover the index tail, or create an index that ends at the sort fields.
+- Cursor-resumed pages served by an index seek or `_id` seek omit `meta.total_count` (they never see the full match set); materializing strategies still include it.
 - `limit` is clamped to `--max-query-limit` per page, as usual.
 
 ### Count Only
@@ -875,7 +876,7 @@ When a query uses a compound index that covers both the filter and sort fields, 
 - `has_more: true` indicates more matching documents exist beyond the returned set
 - `scan_strategy` identifies the optimization used
 
-**When it activates:** Requires a compound index whose fields start with the equality filter field(s), followed by **all** sort fields in order with a uniform direction (all `asc` or all `desc`). For example, index `["event_type", "received_at"]` + query `event_type=firewall` sorted by `received_at desc`; or index `["event_type", "severity", "received_at"]` sorted by `[{"severity": "asc"}, {"received_at": "asc"}]`. Extra index fields *after* the sort fields are allowed (they only affect within-tie order). Mixed sort directions fall back to an in-memory sort.
+**When it activates:** Requires a compound index whose fields start with the equality filter field(s), followed by **all** sort fields in order with a uniform direction (all `asc` or all `desc`). For example, index `["event_type", "received_at"]` + query `event_type=firewall` sorted by `received_at desc`; or index `["event_type", "severity", "received_at"]` sorted by `[{"severity": "asc"}, {"received_at": "asc"}]`. Extra index fields *after* the sort fields are allowed (they only affect within-tie order; such plans don't emit `next_cursor` — see **Cursor Pagination**). Mixed sort directions fall back to an in-memory sort.
 
 ### Compound Range Scan
 

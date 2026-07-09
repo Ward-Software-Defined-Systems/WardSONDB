@@ -6,6 +6,7 @@ use crate::engine::bitmap::ScanAccelerator;
 use crate::index::IndexManager;
 use crate::index::secondary::value_to_sortable_bytes;
 
+use super::cursor::{Cursor, CursorValue};
 use super::filter::{FilterNode, FilterOp};
 use super::parser::ParsedQuery;
 use super::sort::SortField;
@@ -55,12 +56,18 @@ pub enum ScanPlan {
     },
 
     /// Sorted index scan with early termination.
-    /// A compound index covers both the filter field(s) and the sort field,
+    /// A compound index covers both the filter field(s) and all sort fields,
     /// allowing us to iterate in sort order and stop after offset+limit docs.
     IndexSorted {
         index_name: String,
         prefix: Vec<u8>,
         reverse: bool,
+        /// True when the eq prefix + sort fields span the ENTIRE index — the
+        /// scan's within-tie order is then exactly the comparator's
+        /// (`_id`-tiebreak) order, which is what makes cursors sound. With
+        /// extra trailing index fields, ties order by (extras, _id) instead,
+        /// so such plans neither emit nor accept cursors.
+        exact_tail: bool,
     },
 
     /// Bitmap scan — scan accelerator covers the filter (or part of it).
@@ -100,13 +107,16 @@ pub fn plan_query(
 
     // Try IndexSorted first (highest priority — enables early termination)
     // Only when: has sort, finite limit, not count_only.
-    // Cursored queries are excluded for now: they are served correctly by the
-    // materializing strategies' cursor layer; the index seek path lands next.
     if !sort.is_empty()
         && limit < u64::MAX
         && !count_only
-        && query.cursor.is_none()
-        && let Some(plan) = try_index_sorted(index_manager, collection, filter, sort)
+        && let Some(plan) = try_index_sorted(
+            index_manager,
+            collection,
+            filter,
+            sort,
+            query.cursor.as_ref(),
+        )
     {
         return plan;
     }
@@ -252,6 +262,7 @@ fn try_index_sorted(
     collection: &str,
     filter: &FilterNode,
     sort: &[SortField],
+    cursor: Option<&Cursor>,
 ) -> Option<QueryPlan> {
     if sort.is_empty() {
         return None;
@@ -279,6 +290,25 @@ fn try_index_sorted(
     let (idx_def, _, n_matched) =
         index_manager.find_compound_index(collection, &eq_field_names, &sort_field_names)?;
 
+    let exact_tail = n_matched + sort.len() == idx_def.fields.len();
+
+    if let Some(cur) = cursor {
+        // A cursor seek needs index order == comparator order, which extra
+        // trailing index fields break (ties order by extras, not _id).
+        if !exact_tail {
+            return None;
+        }
+        // Docs missing a sort field are not in the compound index at all, so
+        // a Missing position cannot be expressed as a seek key.
+        if cur
+            .sort_values
+            .iter()
+            .any(|v| matches!(v, CursorValue::Missing))
+        {
+            return None;
+        }
+    }
+
     // Build prefix from matched eq values in index field order
     let mut prefix = Vec::new();
     for i in 0..n_matched {
@@ -305,6 +335,7 @@ fn try_index_sorted(
             index_name: idx_def.name,
             prefix,
             reverse,
+            exact_tail,
         },
         post_filter: remaining,
         original_filter: Some(filter.clone()),

@@ -350,7 +350,7 @@ impl IndexManager {
         };
 
         let mut doc_ids = Vec::new();
-        let iter = engine.range_iterator(&partition, start, end).ok()?;
+        let iter = engine.range_iterator(&partition, start, end, None).ok()?;
         for item in iter.flatten() {
             let (key, _) = item;
 

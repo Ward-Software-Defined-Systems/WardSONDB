@@ -3,9 +3,9 @@ use serde_json::Value;
 use crate::engine::backend::StorageBackend;
 use crate::engine::storage::Storage;
 use crate::error::AppError;
-use crate::index::secondary::extract_doc_id_from_key;
+use crate::index::secondary::{extract_doc_id_from_key, value_to_sortable_bytes};
 
-use super::cursor::{compare_doc_to_cursor, encode_cursor};
+use super::cursor::{Cursor, CursorValue, compare_doc_to_cursor, encode_cursor};
 use super::filter::resolve_json_path;
 use super::parser::ParsedQuery;
 use super::planner::{QueryPlan, ScanPlan, plan_query};
@@ -102,6 +102,16 @@ fn execute_full_scan(
     query: &ParsedQuery,
     plan: &QueryPlan,
 ) -> Result<QueryResult, AppError> {
+    // Cursor + no sort: the total order is _id ascending, which is exactly
+    // the docs partition's key order — seek straight to the position instead
+    // of materializing everything before it.
+    if let Some(cursor) = &query.cursor
+        && query.sort.is_empty()
+        && !query.count_only
+    {
+        return execute_full_scan_id_seek(storage, collection, query, plan, cursor);
+    }
+
     let all_docs = storage.scan_all_documents(collection)?;
     let docs_scanned = all_docs.len() as u64;
 
@@ -129,11 +139,96 @@ fn execute_full_scan(
         });
     }
 
-    let (docs, has_more, next_cursor) = paginate_materialized(matching, query, collection);
+    let (docs, has_more, mut next_cursor) = paginate_materialized(matching, query, collection);
+
+    // Bootstrap cursor for no-sort walks: a full scan streams in _id order
+    // (the docs partition key), so the position is sound without a sort spec.
+    // Only _id is needed here, which projection always preserves. Index and
+    // bitmap scans must NOT do this — their no-sort order isn't _id.
+    if next_cursor.is_none() && has_more && query.sort.is_empty() {
+        next_cursor = docs
+            .last()
+            .and_then(|doc| encode_cursor(doc, &[], collection));
+    }
 
     Ok(QueryResult {
         docs,
         total_count: Some(total_count),
+        docs_scanned,
+        index_used: None,
+        scan_strategy: None,
+        has_more,
+        next_cursor,
+    })
+}
+
+/// Cursor-resumed full scan with an empty sort: seek the docs partition
+/// (key = `_id`) to just after the cursor's id and stream forward with a
+/// limit+1 probe.
+fn execute_full_scan_id_seek(
+    storage: &Storage,
+    collection: &str,
+    query: &ParsedQuery,
+    plan: &QueryPlan,
+    cursor: &Cursor,
+) -> Result<QueryResult, AppError> {
+    let docs_partition = storage.get_docs_partition(collection)?;
+    let limit = query.limit as usize;
+
+    // Strictly after last_id: ids are NUL-free, so last_id ++ 0x00 is the
+    // smallest key greater than last_id.
+    let mut lo = cursor.last_id.clone().into_bytes();
+    lo.push(0x00);
+    // _ids are UTF-8 strings and 0xFF never occurs in UTF-8, so a single
+    // 0xFF byte sorts above every doc key.
+    let hi = [0xFFu8];
+
+    let max_results = plan.original_filter.is_none().then_some(limit + 1);
+
+    let mut results: Vec<Value> = Vec::new();
+    let mut docs_scanned = 0u64;
+    for kv in storage
+        .engine
+        .range_iterator(&docs_partition, &lo, &hi, max_results)?
+    {
+        let (_, value_bytes) = kv?;
+        let Ok(doc) = serde_json::from_slice::<Value>(&value_bytes) else {
+            continue;
+        };
+        docs_scanned += 1;
+        if let Some(filter) = &plan.original_filter
+            && !filter.matches(&doc)
+        {
+            continue;
+        }
+        results.push(doc);
+        if results.len() > limit {
+            break;
+        }
+    }
+
+    let has_more = results.len() > limit;
+    results.truncate(limit);
+    let next_cursor = if has_more {
+        results
+            .last()
+            .and_then(|doc| encode_cursor(doc, &[], collection))
+    } else {
+        None
+    };
+
+    let docs = if let Some(ref fields) = query.fields {
+        results
+            .iter()
+            .map(|doc| project_fields(doc, fields))
+            .collect()
+    } else {
+        results
+    };
+
+    Ok(QueryResult {
+        docs,
+        total_count: None, // the seek never sees the full match set
         docs_scanned,
         index_used: None,
         scan_strategy: None,
@@ -356,6 +451,46 @@ fn execute_index_scan(
     })
 }
 
+/// Smallest byte string greater than every key that has `prefix` as a
+/// prefix — the exclusive upper bound of the prefix window. IndexSorted
+/// prefixes always end with the 0x01 field separator, so in practice this
+/// bumps that byte; the loop handles trailing 0xFF for generality. An
+/// all-0xFF prefix has no finite successor (unreachable here), so a maximal
+/// sentinel keeps the function total.
+fn prefix_successor(prefix: &[u8]) -> Vec<u8> {
+    let mut p = prefix.to_vec();
+    while let Some(&last) = p.last() {
+        if last == 0xFF {
+            p.pop();
+        } else {
+            *p.last_mut().unwrap() = last + 1;
+            return p;
+        }
+    }
+    vec![0xFF; prefix.len() + 1]
+}
+
+/// Rebuild the exact index key for a cursor position under this plan's
+/// prefix: `prefix ++ join(0x01, sortable(values)) ++ 0x00 ++ last_id` —
+/// byte-identical to `make_compound_index_key` for the eq+sort fields (the
+/// planner prefix already carries its trailing 0x01 separator).
+fn index_cursor_key(prefix: &[u8], cursor: &Cursor) -> Vec<u8> {
+    let mut key = prefix.to_vec();
+    for (i, cv) in cursor.sort_values.iter().enumerate() {
+        if i > 0 {
+            key.push(0x01);
+        }
+        // Missing is unreachable on this path (the planner rejects such
+        // cursors); encoding nothing keeps the function total.
+        if let CursorValue::Present(v) = cv {
+            key.extend_from_slice(&value_to_sortable_bytes(v));
+        }
+    }
+    key.push(0x00);
+    key.extend_from_slice(cursor.last_id.as_bytes());
+    key
+}
+
 /// Execute a sorted index scan with early termination.
 /// Uses a compound index that covers both filter and sort fields.
 fn execute_index_sorted(
@@ -364,12 +499,18 @@ fn execute_index_sorted(
     query: &ParsedQuery,
     plan: &QueryPlan,
 ) -> Result<QueryResult, AppError> {
-    let (index_name, prefix, reverse) = match &plan.scan {
+    let (index_name, prefix, reverse, exact_tail) = match &plan.scan {
         ScanPlan::IndexSorted {
             index_name,
             prefix,
             reverse,
-        } => (index_name.as_str(), prefix.as_slice(), *reverse),
+            exact_tail,
+        } => (
+            index_name.as_str(),
+            prefix.as_slice(),
+            *reverse,
+            *exact_tail,
+        ),
         _ => unreachable!(),
     };
 
@@ -383,76 +524,110 @@ fn execute_index_sorted(
     let offset = query.offset as usize;
     let limit = query.limit as usize;
 
-    let mut results = Vec::with_capacity(limit);
+    // Scan bounds: the whole prefix window, tightened to strictly after
+    // (forward) or strictly before (reverse) the cursor position. The planner
+    // only routes cursors here when exact_tail holds and no sort value is
+    // Missing, so the cursor maps onto an exact index key.
+    let prefix_end = prefix_successor(prefix);
+    let (lo, hi) = match &query.cursor {
+        Some(cursor) => {
+            let cursor_key = index_cursor_key(prefix, cursor);
+            if reverse {
+                (prefix.to_vec(), cursor_key) // end-exclusive = strictly below
+            } else {
+                // Doc ids are NUL-free, so no real key equals cursor_key ++
+                // 0x00 — appending it yields the smallest strictly-greater key.
+                let mut lo = cursor_key;
+                lo.push(0x00);
+                (lo, prefix_end)
+            }
+        }
+        None => (prefix.to_vec(), prefix_end),
+    };
+
+    // Bound the backend read to the page probe when nothing gets post-
+    // filtered away. An index entry whose doc vanished between iterator
+    // creation and the `get` consumes a slot and could understate has_more,
+    // but doc + index entries are deleted in one atomic batch, so the window
+    // is only the snapshot gap.
+    let max_results = plan.post_filter.is_none().then_some(offset + limit + 1);
+
+    let iter = if reverse {
+        storage
+            .engine
+            .range_iterator_rev(&partition, &lo, &hi, max_results)?
+    } else {
+        storage
+            .engine
+            .range_iterator(&partition, &lo, &hi, max_results)?
+    };
+
+    // Collect UNPROJECTED docs up to limit+1: the extra probe row makes
+    // has_more exact, and the cursor must see sort-field values that a
+    // projection might strip.
+    let mut results: Vec<Value> = Vec::new();
     let mut skipped = 0usize;
     let mut docs_scanned = 0u64;
-    let mut has_more = false;
 
-    // Helper closure to process a single index key
-    let mut process_key = |key_bytes: &[u8]| -> Result<bool, AppError> {
-        let doc_id = match extract_doc_id_from_key(key_bytes) {
-            Some(id) => id,
-            None => return Ok(false),
+    for kv in iter {
+        let (key, _) = kv?;
+        let Some(doc_id) = extract_doc_id_from_key(&key) else {
+            continue;
         };
-
         let doc = match storage.engine.get(&docs_partition, doc_id.as_bytes()) {
             Ok(Some(bytes)) => match serde_json::from_slice::<Value>(&bytes) {
                 Ok(doc) => doc,
-                Err(_) => return Ok(false),
+                Err(_) => continue,
             },
-            _ => return Ok(false),
+            _ => continue,
         };
         docs_scanned += 1;
 
-        // Apply post-filter
         if let Some(ref pf) = plan.post_filter
             && !pf.matches(&doc)
         {
-            return Ok(false);
+            continue;
         }
 
-        // Handle offset
         if skipped < offset {
             skipped += 1;
-            return Ok(false);
+            continue;
         }
-
-        // Apply projection
-        let doc = if let Some(ref fields) = query.fields {
-            project_fields(&doc, fields)
-        } else {
-            doc
-        };
 
         results.push(doc);
-        if results.len() >= limit {
-            has_more = true;
-            return Ok(true); // signal: stop
-        }
-        Ok(false)
-    };
-
-    // Scan in the requested direction
-    let iter = if reverse {
-        storage.engine.prefix_iterator_rev(&partition, prefix)?
-    } else {
-        storage.engine.prefix_iterator(&partition, prefix)?
-    };
-    for kv in iter {
-        let (key, _) = kv?;
-        if process_key(&key)? {
+        if results.len() > limit {
             break;
         }
     }
 
+    let has_more = results.len() > limit;
+    results.truncate(limit);
+
+    let next_cursor = if has_more && exact_tail {
+        results
+            .last()
+            .and_then(|doc| encode_cursor(doc, &query.sort, collection))
+    } else {
+        None
+    };
+
+    let docs = if let Some(ref fields) = query.fields {
+        results
+            .iter()
+            .map(|doc| project_fields(doc, fields))
+            .collect()
+    } else {
+        results
+    };
+
     Ok(QueryResult {
-        docs: results,
+        docs,
         total_count: None, // Unknown with early termination
         docs_scanned,
         index_used: Some(index_name.to_string()),
         scan_strategy: Some("index_sorted".to_string()),
         has_more,
-        next_cursor: None,
+        next_cursor,
     })
 }
 
@@ -525,11 +700,12 @@ fn execute_compound_range(
     // count_only optimization: count index keys without loading docs
     if query.count_only && plan.post_filter.is_none() {
         let mut count = 0u64;
-        for kv in
-            storage
-                .engine
-                .range_iterator(&partition, start_key.as_slice(), end_key.as_slice())?
-        {
+        for kv in storage.engine.range_iterator(
+            &partition,
+            start_key.as_slice(),
+            end_key.as_slice(),
+            None,
+        )? {
             let (key, _) = kv?;
             if let Some(ref prefix) = lower_exact_prefix
                 && key.starts_with(prefix)
@@ -551,9 +727,10 @@ fn execute_compound_range(
 
     // Collect candidate doc IDs from the range scan
     let mut candidate_ids = Vec::new();
-    for kv in storage
-        .engine
-        .range_iterator(&partition, start_key.as_slice(), end_key.as_slice())?
+    for kv in
+        storage
+            .engine
+            .range_iterator(&partition, start_key.as_slice(), end_key.as_slice(), None)?
     {
         let (key, _) = kv?;
 
