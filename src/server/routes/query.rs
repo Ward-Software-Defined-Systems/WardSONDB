@@ -15,8 +15,12 @@ use crate::server::AppState;
 use crate::server::middleware::error_handler::JsonBody;
 use crate::server::response::{ApiResponse, ResponseMeta};
 
-/// Run a blocking closure with an optional timeout.
-async fn with_query_timeout<F, R>(timeout_secs: u64, f: F) -> Result<R, AppError>
+/// Run a blocking closure off the async workers, with an optional timeout
+/// (`timeout_secs == 0` = no timeout). NOTE: a timed-out spawn_blocking task
+/// is NOT cancelled — it keeps running to completion. Reads use the
+/// configured query timeout; mutations must pass 0 so the client never sees
+/// a failure for work that then completes server-side.
+pub(crate) async fn with_query_timeout<F, R>(timeout_secs: u64, f: F) -> Result<R, AppError>
 where
     F: FnOnce() -> Result<R, AppError> + Send + 'static,
     R: Send + 'static,
@@ -134,7 +138,9 @@ pub async fn delete_by_query(
 ) -> Result<Json<ApiResponse>, AppError> {
     let start = Instant::now();
     let filter = parse_filter(&body.filter)?;
-    let deleted = state.storage.delete_by_query(&collection, &filter)?;
+    let st = state.clone();
+    let deleted =
+        with_query_timeout(0, move || st.storage.delete_by_query(&collection, &filter)).await?;
     state
         .metrics
         .lifetime_deletes
@@ -175,13 +181,15 @@ pub async fn distinct(
         None => None,
     };
 
-    let result = crate::query::distinct::execute_distinct(
-        &state.storage,
-        &collection,
-        &body.field,
-        filter.as_ref(),
-        body.limit,
-    )?;
+    let timeout_secs = state.config.query_timeout;
+    let st = state.clone();
+    let coll = collection.clone();
+    let field = body.field.clone();
+    let limit = body.limit;
+    let result = with_query_timeout(timeout_secs, move || {
+        crate::query::distinct::execute_distinct(&st.storage, &coll, &field, filter.as_ref(), limit)
+    })
+    .await?;
 
     state.metrics.record_query();
     let duration_ms = (start.elapsed().as_secs_f64() * 1_000_000.0).round() / 1000.0;
@@ -217,9 +225,12 @@ pub async fn update_by_query(
 ) -> Result<Json<ApiResponse>, AppError> {
     let start = Instant::now();
     let filter = parse_filter(&body.filter)?;
-    let updated = state
-        .storage
-        .update_by_query(&collection, &filter, &body.update)?;
+    let st = state.clone();
+    let update = body.update;
+    let updated = with_query_timeout(0, move || {
+        st.storage.update_by_query(&collection, &filter, &update)
+    })
+    .await?;
     let duration_ms = (start.elapsed().as_secs_f64() * 1_000_000.0).round() / 1000.0;
 
     let data = serde_json::json!({ "updated": updated });

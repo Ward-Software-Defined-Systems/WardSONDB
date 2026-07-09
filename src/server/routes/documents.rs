@@ -53,7 +53,13 @@ pub async fn get_by_id(
     State(state): State<Arc<AppState>>,
     Path((collection, id)): Path<(String, String)>,
 ) -> Result<Json<ApiResponse>, AppError> {
-    let doc = state.storage.get_document(&collection, &id)?;
+    // Point reads are KV work that can stall behind compactions/scans —
+    // keep them off the async workers like query/aggregate.
+    let timeout_secs = state.config.query_timeout;
+    let doc = super::query::with_query_timeout(timeout_secs, move || {
+        state.storage.get_document(&collection, &id)
+    })
+    .await?;
     Ok(Json(ApiResponse::success(doc)))
 }
 
