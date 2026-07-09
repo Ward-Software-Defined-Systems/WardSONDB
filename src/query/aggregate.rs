@@ -523,12 +523,17 @@ fn try_index_only_aggregate(
         let (key_bytes, _) = kv?;
         let key = key_bytes.as_slice();
 
-        // Single-field index key: {value_bytes}\x00{doc_id}
-        // doc_id is 36 bytes (UUIDv7), separator at len-37
-        if key.len() < 37 || key[key.len() - 37] != 0x00 {
-            continue;
-        }
-        let value_part = &key[..key.len() - 37];
+        // Single-field index key: {value_bytes}\x00{doc_id}. Doc ids are
+        // NUL-free (validate_custom_id) but NOT fixed-width — custom _ids can
+        // be 1..512 bytes — so the separator is the LAST 0x00, never a fixed
+        // offset. The value's own encoding may legitimately contain 0x00
+        // bytes (null's type prefix, number payloads, embedded NULs in
+        // strings), which is why we split on the last one, exactly like
+        // extract_doc_id_from_key.
+        let Some(sep) = key.iter().rposition(|&b| b == 0x00) else {
+            continue; // malformed key — no separator
+        };
+        let value_part = &key[..sep];
 
         match &current_value {
             Some(cv) if cv.as_slice() == value_part => {

@@ -6481,3 +6481,80 @@ async fn test_cursor_limit_clamp_per_page() {
     let scores: Vec<i64> = all.iter().map(|d| d["score"].as_i64().unwrap()).collect();
     assert_eq!(scores, (0..10).collect::<Vec<i64>>());
 }
+
+/// Regression: index-only aggregation assumed 36-byte (UUID) doc ids and
+/// silently skipped index entries for custom _ids of any other length,
+/// undercounting groups. The separator is the LAST 0x00 in the key — value
+/// encodings may themselves contain 0x00 bytes (e.g. embedded NULs).
+#[tokio::test]
+async fn test_index_only_aggregate_custom_ids() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "events"}))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base_url}/events/indexes"))
+        .json(&json!({"name": "idx_kind", "field": "kind"}))
+        .send()
+        .await
+        .unwrap();
+
+    // Mix of id lengths: 1 byte, 13 bytes, exactly 36 (UUID-length custom),
+    // 100 bytes, and auto-generated UUIDv7s. Plus one value containing an
+    // embedded NUL to pin the last-0x00 separator handling.
+    let long_id = "L".repeat(100);
+    let uuid_len_id = "x".repeat(36);
+    let docs = json!({
+        "documents": [
+            {"_id": "a", "kind": "alpha"},
+            {"_id": "medium-id-123", "kind": "alpha"},
+            {"kind": "alpha"},                       // auto UUID
+            {"_id": uuid_len_id, "kind": "beta"},
+            {"_id": long_id, "kind": "beta"},
+            {"kind": "beta"},                        // auto UUID
+            {"kind": "beta"},                        // auto UUID
+            {"_id": "z", "kind": "nul\u{0000}led"},
+        ]
+    });
+    let resp = client
+        .post(format!("{base_url}/events/docs/_bulk"))
+        .json(&docs)
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "bulk insert failed: {}",
+        resp.text().await.unwrap_or_default()
+    );
+
+    let resp = client
+        .post(format!("{base_url}/events/aggregate"))
+        .json(&json!({
+            "pipeline": [
+                {"$group": {"_id": "kind", "count": {"$count": {}}}},
+                {"$sort": {"count": "desc"}}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["meta"]["scan_strategy"], "index_only_aggregate");
+    assert_eq!(body["meta"]["docs_scanned"], 0);
+
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 3, "three distinct kinds: {data:?}");
+    assert_eq!(data[0]["_id"], "beta");
+    assert_eq!(data[0]["count"], 4);
+    assert_eq!(data[1]["_id"], "alpha");
+    assert_eq!(data[1]["count"], 3);
+    assert_eq!(data[2]["_id"], "nul\u{0000}led");
+    assert_eq!(data[2]["count"], 1);
+}
