@@ -6558,3 +6558,97 @@ async fn test_index_only_aggregate_custom_ids() {
     assert_eq!(data[2]["_id"], "nul\u{0000}led");
     assert_eq!(data[2]["count"], 1);
 }
+
+/// Unfiltered count_only must come from DocCounters (O(1)), not a full
+/// collection scan-and-parse, and must stay exact across every mutation path
+/// that changes doc counts.
+#[tokio::test]
+async fn test_count_only_unfiltered_uses_doc_counter() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "items"}))
+        .send()
+        .await
+        .unwrap();
+
+    let count_meta = |filter: Option<Value>| {
+        let client = client.clone();
+        let base_url = base_url.clone();
+        async move {
+            let mut req = json!({"count_only": true});
+            if let Some(f) = filter {
+                req["filter"] = f;
+            }
+            let resp = client
+                .post(format!("{base_url}/items/query"))
+                .json(&req)
+                .send()
+                .await
+                .unwrap();
+            resp.json::<Value>().await.unwrap()
+        }
+    };
+
+    // Empty collection.
+    let body = count_meta(None).await;
+    assert_eq!(body["data"]["count"], 0);
+    assert_eq!(body["meta"]["scan_strategy"], "doc_counter");
+    assert_eq!(body["meta"]["docs_scanned"], 0);
+
+    // Bulk insert 7 + single insert 1.
+    let docs: Vec<Value> = (0..7).map(|i| json!({"n": i, "kind": "bulk"})).collect();
+    client
+        .post(format!("{base_url}/items/docs/_bulk"))
+        .json(&json!({"documents": docs}))
+        .send()
+        .await
+        .unwrap();
+    let resp = client
+        .post(format!("{base_url}/items/docs"))
+        .json(&json!({"n": 100, "kind": "single"}))
+        .send()
+        .await
+        .unwrap();
+    let created: Value = resp.json().await.unwrap();
+    let single_id = created["data"]["_id"].as_str().unwrap().to_string();
+
+    let body = count_meta(None).await;
+    assert_eq!(body["data"]["count"], 8);
+    assert_eq!(body["meta"]["scan_strategy"], "doc_counter");
+
+    // Delete one by id.
+    client
+        .delete(format!("{base_url}/items/docs/{single_id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(count_meta(None).await["data"]["count"], 7);
+
+    // Delete two by query.
+    client
+        .post(format!("{base_url}/items/docs/_delete_by_query"))
+        .json(&json!({"filter": {"n": {"$gte": 5}}}))
+        .send()
+        .await
+        .unwrap();
+    let body = count_meta(None).await;
+    assert_eq!(body["data"]["count"], 5);
+    assert_eq!(body["meta"]["docs_scanned"], 0);
+
+    // Filtered counts still take the scan/index paths and stay exact.
+    let body = count_meta(Some(json!({"kind": "bulk"}))).await;
+    assert_eq!(body["data"]["count"], 5);
+    assert_ne!(body["meta"]["scan_strategy"], "doc_counter");
+
+    // Missing collection still 404s.
+    let resp = client
+        .post(format!("{base_url}/nope/query"))
+        .json(&json!({"count_only": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}

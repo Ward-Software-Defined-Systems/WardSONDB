@@ -27,6 +27,23 @@ pub fn execute_query(
     collection: &str,
     query: &ParsedQuery,
 ) -> Result<QueryResult, AppError> {
+    // Unfiltered count: DocCounters is authoritative (seeded by a full count
+    // at startup, maintained on every insert/delete path including bulk,
+    // delete_by_query, and TTL cleanup), so the O(n) scan-and-parse the full
+    // scan would do is pure waste — ~335 ms on a 100k-doc collection.
+    if query.count_only && query.filter.is_none() {
+        storage.ensure_collection_exists(collection)?;
+        return Ok(QueryResult {
+            docs: vec![],
+            total_count: Some(storage.doc_counts.get(collection).max(0) as u64),
+            docs_scanned: 0,
+            index_used: None,
+            scan_strategy: Some("doc_counter".to_string()),
+            has_more: false,
+            next_cursor: None,
+        });
+    }
+
     let plan = plan_query(
         query,
         &storage.index_manager,
