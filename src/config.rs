@@ -30,11 +30,13 @@ pub struct Config {
     #[arg(short, long, default_value = "info")]
     pub log_level: String,
 
-    /// Log file path (per-request logs always go here)
+    /// Log file path (written via a non-blocking appender; if the path can't
+    /// be opened the server warns and runs without file logging)
     #[arg(long, default_value = "wardsondb.log")]
     pub log_file: String,
 
-    /// Print per-request logs to the terminal (verbose mode)
+    /// Enable per-request logging (terminal AND file). Off by default:
+    /// always-on request logs grow without bound over long uptimes.
     #[arg(short, long, default_value_t = false)]
     pub verbose: bool,
 

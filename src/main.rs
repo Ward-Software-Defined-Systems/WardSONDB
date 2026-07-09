@@ -29,37 +29,52 @@ use server::{AppState, build_router};
 async fn main() {
     let config = Config::parse();
 
-    // Build logging layers:
-    //   - Terminal: shows everything EXCEPT per-request logs (unless --verbose)
-    //   - File: shows everything including per-request logs
+    // Build logging layers. Per-request lines (wardsondb::requests) are
+    // opt-in via --verbose on BOTH sinks: an always-on request log grew
+    // without bound on dev (multi-GiB wardsondb.log) and silently filled the
+    // 256 MB tmpfs in production. The file sink writes through a
+    // non-blocking appender so request handling never does synchronous file
+    // I/O on a worker thread.
     let base_filter = &config.log_level;
-
-    // Terminal filter: suppress wardsondb::requests unless verbose
-    let terminal_filter = if config.verbose {
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(base_filter))
-    } else {
-        EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new(format!("{base_filter},wardsondb::requests=off")))
+    let make_filter = |verbose: bool| {
+        if verbose {
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(base_filter))
+        } else {
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                EnvFilter::new(format!("{base_filter},wardsondb::requests=off"))
+            })
+        }
     };
 
     let terminal_layer = fmt::layer()
         .with_writer(std::io::stderr)
-        .with_filter(terminal_filter);
+        .with_filter(make_filter(config.verbose));
 
-    // File layer: always logs everything including per-request logs
-    let log_file = std::fs::OpenOptions::new()
+    // File layer: non-panicking open — an unwritable --log-file path must
+    // not take the server down; warn and run without file logging instead.
+    // The guard must stay alive for the life of the process: dropping it
+    // stops the background writer thread and flushes buffered lines.
+    let (file_layer, _file_log_guard) = match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&config.log_file)
-        .expect("Failed to open log file");
-
-    let file_filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(base_filter));
-
-    let file_layer = fmt::layer()
-        .with_writer(log_file)
-        .with_ansi(false)
-        .with_filter(file_filter);
+    {
+        Ok(file) => {
+            let (writer, guard) = tracing_appender::non_blocking(file);
+            let layer = fmt::layer()
+                .with_writer(writer)
+                .with_ansi(false)
+                .with_filter(make_filter(config.verbose));
+            (Some(layer), Some(guard))
+        }
+        Err(e) => {
+            eprintln!(
+                "WARNING: cannot open log file '{}': {e} — continuing without file logging",
+                config.log_file
+            );
+            (None, None)
+        }
+    };
 
     tracing_subscriber::registry()
         .with(terminal_layer)
@@ -200,9 +215,9 @@ async fn main() {
     let addr = format!("0.0.0.0:{}", config.port);
 
     if config.verbose {
-        info!("Verbose mode: per-request logs shown in terminal");
+        info!(log_file = %config.log_file, "Verbose mode: per-request logs shown in terminal and written to file");
     } else {
-        info!(log_file = %config.log_file, "Per-request logs written to file (use --verbose to show in terminal)");
+        info!("Per-request logging disabled (enable with --verbose)");
     }
 
     if config.tls {
