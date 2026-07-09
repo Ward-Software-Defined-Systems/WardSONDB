@@ -105,14 +105,17 @@ fn bench_query_10k(c: &mut Criterion) {
 
     c.bench_function("query_eq_filter_10k", |b| {
         b.iter(|| {
-            let query = parse_query(QueryRequest {
-                filter: Some(json!({"event_type": "firewall"})),
-                sort: None,
-                limit: Some(50),
-                offset: Some(0),
-                fields: None,
-                count_only: None,
-            })
+            let query = parse_query(
+                QueryRequest {
+                    filter: Some(json!({"event_type": "firewall"})),
+                    sort: None,
+                    limit: Some(50),
+                    offset: Some(0),
+                    fields: None,
+                    count_only: None,
+                },
+                100_000,
+            )
             .unwrap();
             execute_query(&storage, "events", &query).unwrap();
         });
@@ -120,14 +123,17 @@ fn bench_query_10k(c: &mut Criterion) {
 
     c.bench_function("query_nested_filter_10k", |b| {
         b.iter(|| {
-            let query = parse_query(QueryRequest {
-                filter: Some(json!({"network.dst_port": 443})),
-                sort: None,
-                limit: Some(50),
-                offset: Some(0),
-                fields: None,
-                count_only: None,
-            })
+            let query = parse_query(
+                QueryRequest {
+                    filter: Some(json!({"network.dst_port": 443})),
+                    sort: None,
+                    limit: Some(50),
+                    offset: Some(0),
+                    fields: None,
+                    count_only: None,
+                },
+                100_000,
+            )
             .unwrap();
             execute_query(&storage, "events", &query).unwrap();
         });
@@ -135,14 +141,17 @@ fn bench_query_10k(c: &mut Criterion) {
 
     c.bench_function("query_with_sort_10k", |b| {
         b.iter(|| {
-            let query = parse_query(QueryRequest {
-                filter: Some(json!({"event_type": "firewall"})),
-                sort: Some(vec![json!({"network.dst_port": "desc"})]),
-                limit: Some(50),
-                offset: Some(0),
-                fields: None,
-                count_only: None,
-            })
+            let query = parse_query(
+                QueryRequest {
+                    filter: Some(json!({"event_type": "firewall"})),
+                    sort: Some(json!([{"network.dst_port": "desc"}])),
+                    limit: Some(50),
+                    offset: Some(0),
+                    fields: None,
+                    count_only: None,
+                },
+                100_000,
+            )
             .unwrap();
             execute_query(&storage, "events", &query).unwrap();
         });
@@ -150,14 +159,17 @@ fn bench_query_10k(c: &mut Criterion) {
 
     c.bench_function("query_count_only_10k", |b| {
         b.iter(|| {
-            let query = parse_query(QueryRequest {
-                filter: Some(json!({"severity": "high"})),
-                sort: None,
-                limit: None,
-                offset: None,
-                fields: None,
-                count_only: Some(true),
-            })
+            let query = parse_query(
+                QueryRequest {
+                    filter: Some(json!({"severity": "high"})),
+                    sort: None,
+                    limit: None,
+                    offset: None,
+                    fields: None,
+                    count_only: Some(true),
+                },
+                100_000,
+            )
             .unwrap();
             execute_query(&storage, "events", &query).unwrap();
         });
@@ -172,14 +184,17 @@ fn bench_query_100k(c: &mut Criterion) {
 
     group.bench_function("eq_filter", |b| {
         b.iter(|| {
-            let query = parse_query(QueryRequest {
-                filter: Some(json!({"event_type": "firewall"})),
-                sort: None,
-                limit: Some(50),
-                offset: Some(0),
-                fields: None,
-                count_only: None,
-            })
+            let query = parse_query(
+                QueryRequest {
+                    filter: Some(json!({"event_type": "firewall"})),
+                    sort: None,
+                    limit: Some(50),
+                    offset: Some(0),
+                    fields: None,
+                    count_only: None,
+                },
+                100_000,
+            )
             .unwrap();
             execute_query(&storage, "events", &query).unwrap();
         });
@@ -187,14 +202,17 @@ fn bench_query_100k(c: &mut Criterion) {
 
     group.bench_function("nested_eq_filter", |b| {
         b.iter(|| {
-            let query = parse_query(QueryRequest {
-                filter: Some(json!({"network.dst_port": 443})),
-                sort: None,
-                limit: Some(50),
-                offset: Some(0),
-                fields: None,
-                count_only: None,
-            })
+            let query = parse_query(
+                QueryRequest {
+                    filter: Some(json!({"network.dst_port": 443})),
+                    sort: None,
+                    limit: Some(50),
+                    offset: Some(0),
+                    fields: None,
+                    count_only: None,
+                },
+                100_000,
+            )
             .unwrap();
             execute_query(&storage, "events", &query).unwrap();
         });
@@ -202,20 +220,23 @@ fn bench_query_100k(c: &mut Criterion) {
 
     group.bench_function("complex_filter_sort", |b| {
         b.iter(|| {
-            let query = parse_query(QueryRequest {
-                filter: Some(json!({
-                    "$and": [
-                        {"event_type": "firewall"},
-                        {"network.action": "block"},
-                        {"severity": {"$in": ["high", "critical"]}}
-                    ]
-                })),
-                sort: Some(vec![json!({"received_at": "desc"})]),
-                limit: Some(100),
-                offset: Some(0),
-                fields: None,
-                count_only: None,
-            })
+            let query = parse_query(
+                QueryRequest {
+                    filter: Some(json!({
+                        "$and": [
+                            {"event_type": "firewall"},
+                            {"network.action": "block"},
+                            {"severity": {"$in": ["high", "critical"]}}
+                        ]
+                    })),
+                    sort: Some(json!([{"received_at": "desc"}])),
+                    limit: Some(100),
+                    offset: Some(0),
+                    fields: None,
+                    count_only: None,
+                },
+                100_000,
+            )
             .unwrap();
             execute_query(&storage, "events", &query).unwrap();
         });
@@ -223,14 +244,17 @@ fn bench_query_100k(c: &mut Criterion) {
 
     group.bench_function("count_only", |b| {
         b.iter(|| {
-            let query = parse_query(QueryRequest {
-                filter: Some(json!({"severity": "high"})),
-                sort: None,
-                limit: None,
-                offset: None,
-                fields: None,
-                count_only: Some(true),
-            })
+            let query = parse_query(
+                QueryRequest {
+                    filter: Some(json!({"severity": "high"})),
+                    sort: None,
+                    limit: None,
+                    offset: None,
+                    fields: None,
+                    count_only: Some(true),
+                },
+                100_000,
+            )
             .unwrap();
             execute_query(&storage, "events", &query).unwrap();
         });
@@ -238,14 +262,17 @@ fn bench_query_100k(c: &mut Criterion) {
 
     group.bench_function("full_scan_no_filter", |b| {
         b.iter(|| {
-            let query = parse_query(QueryRequest {
-                filter: None,
-                sort: None,
-                limit: Some(50),
-                offset: Some(0),
-                fields: None,
-                count_only: None,
-            })
+            let query = parse_query(
+                QueryRequest {
+                    filter: None,
+                    sort: None,
+                    limit: Some(50),
+                    offset: Some(0),
+                    fields: None,
+                    count_only: None,
+                },
+                100_000,
+            )
             .unwrap();
             execute_query(&storage, "events", &query).unwrap();
         });
@@ -253,18 +280,21 @@ fn bench_query_100k(c: &mut Criterion) {
 
     group.bench_function("projection", |b| {
         b.iter(|| {
-            let query = parse_query(QueryRequest {
-                filter: Some(json!({"event_type": "firewall"})),
-                sort: None,
-                limit: Some(50),
-                offset: Some(0),
-                fields: Some(vec![
-                    "event_type".into(),
-                    "network.src_ip".into(),
-                    "severity".into(),
-                ]),
-                count_only: None,
-            })
+            let query = parse_query(
+                QueryRequest {
+                    filter: Some(json!({"event_type": "firewall"})),
+                    sort: None,
+                    limit: Some(50),
+                    offset: Some(0),
+                    fields: Some(vec![
+                        "event_type".into(),
+                        "network.src_ip".into(),
+                        "severity".into(),
+                    ]),
+                    count_only: None,
+                },
+                100_000,
+            )
             .unwrap();
             execute_query(&storage, "events", &query).unwrap();
         });

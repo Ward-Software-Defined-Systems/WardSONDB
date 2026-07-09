@@ -4,12 +4,14 @@ use serde_json::Value;
 use crate::error::AppError;
 
 use super::filter::{FilterNode, parse_filter};
-use super::sort::{SortField, parse_sort};
+use super::sort::{SortField, parse_sort_spec};
 
 #[derive(Debug, Deserialize)]
 pub struct QueryRequest {
     pub filter: Option<Value>,
-    pub sort: Option<Vec<Value>>,
+    /// Array of single-field objects, or a single-field object (shared shape
+    /// with the aggregate `$sort` stage — see `parse_sort_spec`).
+    pub sort: Option<Value>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
     pub fields: Option<Vec<String>>,
@@ -33,7 +35,7 @@ pub fn parse_query(req: QueryRequest, max_limit: u64) -> Result<ParsedQuery, App
     };
 
     let sort = match req.sort {
-        Some(s) => parse_sort(&s),
+        Some(s) => parse_sort_spec(&s).map_err(|e| AppError::InvalidQuery(format!("sort {e}")))?,
         None => vec![],
     };
 

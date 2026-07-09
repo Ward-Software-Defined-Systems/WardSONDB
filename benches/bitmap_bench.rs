@@ -95,14 +95,17 @@ fn bench_bitmap_vs_full_scan_10k(c: &mut Criterion) {
 
     group.bench_function("bitmap_eq", |b| {
         b.iter(|| {
-            let query = parse_query(QueryRequest {
-                filter: Some(json!({"event_type": "firewall"})),
-                sort: None,
-                limit: Some(50),
-                offset: Some(0),
-                fields: None,
-                count_only: None,
-            })
+            let query = parse_query(
+                QueryRequest {
+                    filter: Some(json!({"event_type": "firewall"})),
+                    sort: None,
+                    limit: Some(50),
+                    offset: Some(0),
+                    fields: None,
+                    count_only: None,
+                },
+                100_000,
+            )
             .unwrap();
             execute_query(&storage_bm, "events", &query).unwrap();
         });
@@ -110,14 +113,17 @@ fn bench_bitmap_vs_full_scan_10k(c: &mut Criterion) {
 
     group.bench_function("full_scan_eq", |b| {
         b.iter(|| {
-            let query = parse_query(QueryRequest {
-                filter: Some(json!({"event_type": "firewall"})),
-                sort: None,
-                limit: Some(50),
-                offset: Some(0),
-                fields: None,
-                count_only: None,
-            })
+            let query = parse_query(
+                QueryRequest {
+                    filter: Some(json!({"event_type": "firewall"})),
+                    sort: None,
+                    limit: Some(50),
+                    offset: Some(0),
+                    fields: None,
+                    count_only: None,
+                },
+                100_000,
+            )
             .unwrap();
             execute_query(&storage_fs, "events", &query).unwrap();
         });
@@ -140,14 +146,17 @@ fn bench_bitmap_vs_full_scan_100k(c: &mut Criterion) {
 
     group.bench_function("bitmap_eq", |b| {
         b.iter(|| {
-            let query = parse_query(QueryRequest {
-                filter: Some(json!({"event_type": "firewall"})),
-                sort: None,
-                limit: Some(50),
-                offset: Some(0),
-                fields: None,
-                count_only: None,
-            })
+            let query = parse_query(
+                QueryRequest {
+                    filter: Some(json!({"event_type": "firewall"})),
+                    sort: None,
+                    limit: Some(50),
+                    offset: Some(0),
+                    fields: None,
+                    count_only: None,
+                },
+                100_000,
+            )
             .unwrap();
             execute_query(&storage_bm, "events", &query).unwrap();
         });
@@ -155,14 +164,17 @@ fn bench_bitmap_vs_full_scan_100k(c: &mut Criterion) {
 
     group.bench_function("full_scan_eq", |b| {
         b.iter(|| {
-            let query = parse_query(QueryRequest {
-                filter: Some(json!({"event_type": "firewall"})),
-                sort: None,
-                limit: Some(50),
-                offset: Some(0),
-                fields: None,
-                count_only: None,
-            })
+            let query = parse_query(
+                QueryRequest {
+                    filter: Some(json!({"event_type": "firewall"})),
+                    sort: None,
+                    limit: Some(50),
+                    offset: Some(0),
+                    fields: None,
+                    count_only: None,
+                },
+                100_000,
+            )
             .unwrap();
             execute_query(&storage_fs, "events", &query).unwrap();
         });
@@ -185,19 +197,22 @@ fn bench_bitmap_and_two_fields(c: &mut Criterion) {
 
     group.bench_function("bitmap_and", |b| {
         b.iter(|| {
-            let query = parse_query(QueryRequest {
-                filter: Some(json!({
-                    "$and": [
-                        {"event_type": "firewall"},
-                        {"severity": "high"}
-                    ]
-                })),
-                sort: None,
-                limit: Some(50),
-                offset: Some(0),
-                fields: None,
-                count_only: None,
-            })
+            let query = parse_query(
+                QueryRequest {
+                    filter: Some(json!({
+                        "$and": [
+                            {"event_type": "firewall"},
+                            {"severity": "high"}
+                        ]
+                    })),
+                    sort: None,
+                    limit: Some(50),
+                    offset: Some(0),
+                    fields: None,
+                    count_only: None,
+                },
+                100_000,
+            )
             .unwrap();
             execute_query(&storage_bm, "events", &query).unwrap();
         });
@@ -205,19 +220,22 @@ fn bench_bitmap_and_two_fields(c: &mut Criterion) {
 
     group.bench_function("full_scan_and", |b| {
         b.iter(|| {
-            let query = parse_query(QueryRequest {
-                filter: Some(json!({
-                    "$and": [
-                        {"event_type": "firewall"},
-                        {"severity": "high"}
-                    ]
-                })),
-                sort: None,
-                limit: Some(50),
-                offset: Some(0),
-                fields: None,
-                count_only: None,
-            })
+            let query = parse_query(
+                QueryRequest {
+                    filter: Some(json!({
+                        "$and": [
+                            {"event_type": "firewall"},
+                            {"severity": "high"}
+                        ]
+                    })),
+                    sort: None,
+                    limit: Some(50),
+                    offset: Some(0),
+                    fields: None,
+                    count_only: None,
+                },
+                100_000,
+            )
             .unwrap();
             execute_query(&storage_fs, "events", &query).unwrap();
         });
@@ -240,14 +258,17 @@ fn bench_bitmap_count_only(c: &mut Criterion) {
 
     group.bench_function("bitmap_count", |b| {
         b.iter(|| {
-            let query = parse_query(QueryRequest {
-                filter: Some(json!({"event_type": "firewall"})),
-                sort: None,
-                limit: None,
-                offset: None,
-                fields: None,
-                count_only: Some(true),
-            })
+            let query = parse_query(
+                QueryRequest {
+                    filter: Some(json!({"event_type": "firewall"})),
+                    sort: None,
+                    limit: None,
+                    offset: None,
+                    fields: None,
+                    count_only: Some(true),
+                },
+                100_000,
+            )
             .unwrap();
             execute_query(&storage_bm, "events", &query).unwrap();
         });
@@ -255,14 +276,17 @@ fn bench_bitmap_count_only(c: &mut Criterion) {
 
     group.bench_function("full_scan_count", |b| {
         b.iter(|| {
-            let query = parse_query(QueryRequest {
-                filter: Some(json!({"event_type": "firewall"})),
-                sort: None,
-                limit: None,
-                offset: None,
-                fields: None,
-                count_only: Some(true),
-            })
+            let query = parse_query(
+                QueryRequest {
+                    filter: Some(json!({"event_type": "firewall"})),
+                    sort: None,
+                    limit: None,
+                    offset: None,
+                    fields: None,
+                    count_only: Some(true),
+                },
+                100_000,
+            )
             .unwrap();
             execute_query(&storage_fs, "events", &query).unwrap();
         });

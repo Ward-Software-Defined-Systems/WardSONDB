@@ -8,20 +8,78 @@ pub struct SortField {
     pub ascending: bool,
 }
 
-pub fn parse_sort(sort_spec: &[Value]) -> Vec<SortField> {
-    let mut fields = Vec::new();
-    for item in sort_spec {
-        if let Value::Object(obj) = item {
-            for (field, direction) in obj {
-                let ascending = !matches!(direction.as_str(), Some("desc"));
+/// Parse a sort specification. Shared by the `/query` endpoint's `sort` field
+/// and the aggregate `$sort` stage so both accept identical shapes:
+///
+/// - array form: `[{"field": dir}, ...]` — one field per element, priority in
+///   array order (`[]` is a no-op)
+/// - flat object form: `{"field": dir}` — exactly one field; multiple fields
+///   are rejected because JSON object key order is not preserved after parsing
+///
+/// Directions: `"asc"`, `"desc"`, `1`, `-1` (also `1.0` / `-1.0`). Anything
+/// else is an error naming the offending field.
+///
+/// Error messages are phrased to read naturally after the callers' prefixes
+/// ("sort ..." / "Stage {i}: $sort ...").
+pub fn parse_sort_spec(spec: &Value) -> Result<Vec<SortField>, String> {
+    match spec {
+        Value::Array(items) => {
+            let mut fields = Vec::with_capacity(items.len());
+            for (i, item) in items.iter().enumerate() {
+                let Value::Object(obj) = item else {
+                    return Err(format!(
+                        "element {i} must be an object with exactly one field"
+                    ));
+                };
+                if obj.len() != 1 {
+                    return Err(format!(
+                        "element {i} must have exactly one field (got {}); use one object per field: [{{\"a\": \"asc\"}}, {{\"b\": \"desc\"}}]",
+                        obj.len()
+                    ));
+                }
+                let (field, direction) = obj.iter().next().unwrap();
                 fields.push(SortField {
                     field: field.clone(),
-                    ascending,
+                    ascending: parse_direction(field, direction)?,
                 });
             }
+            Ok(fields)
         }
+        Value::Object(obj) => match obj.len() {
+            1 => {
+                let (field, direction) = obj.iter().next().unwrap();
+                Ok(vec![SortField {
+                    field: field.clone(),
+                    ascending: parse_direction(field, direction)?,
+                }])
+            }
+            0 => Err("must not be an empty object".to_string()),
+            n => Err(format!(
+                "object with {n} fields is ambiguous (JSON object key order is not preserved); use the array form: [{{\"a\": \"asc\"}}, {{\"b\": \"desc\"}}]"
+            )),
+        },
+        _ => Err("must be an array of single-field objects or a single-field object".to_string()),
     }
-    fields
+}
+
+fn parse_direction(field: &str, direction: &Value) -> Result<bool, String> {
+    let invalid = || {
+        format!(
+            "direction for field '{field}' must be \"asc\", \"desc\", 1, or -1 (got {})",
+            serde_json::to_string(direction).unwrap_or_else(|_| "?".to_string())
+        )
+    };
+    match direction {
+        Value::String(s) if s == "asc" => Ok(true),
+        Value::String(s) if s == "desc" => Ok(false),
+        // as_f64 covers integer and float encodings; 1.0 and -1.0 are exact.
+        Value::Number(n) => match n.as_f64() {
+            Some(1.0) => Ok(true),
+            Some(-1.0) => Ok(false),
+            _ => Err(invalid()),
+        },
+        _ => Err(invalid()),
+    }
 }
 
 pub fn sort_documents(docs: &mut [Value], sort_fields: &[SortField]) {

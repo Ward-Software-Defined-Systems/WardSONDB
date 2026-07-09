@@ -684,8 +684,8 @@ curl -X POST http://localhost:8080/events/query \
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `filter` | object | `null` | Filter DSL (see below). Omit or `null` to match all documents. |
-| `sort` | array | `[]` | Array of `{"field": "asc"\|"desc"}` objects. |
-| `limit` | integer | `100` | Maximum documents to return (capped at 10,000). |
+| `sort` | array or object | `[]` | Array of single-field `{"field": direction}` objects (priority in array order), or a single single-field object. Directions: `"asc"`, `"desc"`, `1`, `-1`. |
+| `limit` | integer | `100` | Maximum documents to return (capped at `--max-query-limit`, default 100,000). |
 | `offset` | integer | `0` | Number of documents to skip (for pagination). |
 | `fields` | array | `null` | Projection — list of field names to include. `_id` is always included. |
 | `count_only` | boolean | `false` | If `true`, return only the count, not the documents. |
@@ -766,13 +766,15 @@ Access nested object fields using dot notation:
 
 ### Sorting
 
-Sort by one or more fields. Each sort entry is an object with a single key (field name) and value `"asc"` or `"desc"`.
+Sort by one or more fields. Each sort entry is an object with a single key (field name) and a direction: `"asc"`, `"desc"`, `1`, or `-1`. Field priority follows array order. A single-field sort may also be written as a bare object (`{"sort": {"price": "desc"}}`) — the same two shapes the aggregate `$sort` stage accepts.
 
 Dot notation is supported for sorting on nested fields:
 
 ```json
 {"sort": [{"network.dst_port": "desc"}, {"_created_at": "asc"}]}
 ```
+
+Validation is strict: an unrecognized direction value, a sort entry with more than one field, or an empty-object sort is rejected with `400 INVALID_QUERY`. Multi-field specs must use the array form — a flat object with several fields is rejected because JSON object key order is not preserved after parsing.
 
 Documents missing a sort field sort to the **beginning** in ascending order, **end** in descending order.
 
@@ -1043,12 +1045,14 @@ Stages execute sequentially — the output of one stage feeds the input of the n
 
 ### $sort Stage (in aggregation)
 
-Sort results by one or more fields. Supports `"asc"`/`"desc"` or `1`/`-1`:
+Sort results by one or more fields. Accepts the same shapes as the `/query` endpoint's `sort` field — a single-field object, or an array of single-field objects for multi-field sorts (priority in array order). Directions: `"asc"`/`"desc"` or `1`/`-1`:
 
 ```json
 {"$sort": {"count": "desc"}}
-{"$sort": {"count": -1, "name": 1}}
+{"$sort": [{"count": -1}, {"name": 1}]}
 ```
+
+A flat object with several fields (`{"count": -1, "name": 1}`) is rejected with `400 INVALID_PIPELINE`: JSON object key order is not preserved after parsing, so field priority would be undefined — use the array form.
 
 ### Aggregation Examples
 

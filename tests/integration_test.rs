@@ -4897,3 +4897,293 @@ async fn test_fjall_backend_basic() {
     storage.delete_document("fj", &id).unwrap();
     assert_eq!(storage.scan_all_documents("fj").unwrap().len(), 0);
 }
+
+// ─── Sort-spec unification (shared parser for /query sort and $sort) ─────────
+
+/// A-1: aggregate $sort array form must respect written field order, not
+/// alphabetical key order (field names chosen anti-alphabetically on purpose).
+#[tokio::test]
+async fn test_aggregate_sort_array_form_respects_written_order() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "orders"}))
+        .send()
+        .await
+        .unwrap();
+
+    // zeta ties force alpha to decide; alphabetical priority (alpha first)
+    // would produce a different order than written priority (zeta first).
+    let docs = json!({
+        "documents": [
+            {"tag": "a", "zeta": 1, "alpha": 9},
+            {"tag": "b", "zeta": 2, "alpha": 1},
+            {"tag": "c", "zeta": 1, "alpha": 5},
+            {"tag": "d", "zeta": 2, "alpha": 7},
+        ]
+    });
+    client
+        .post(format!("{base_url}/orders/docs/_bulk"))
+        .json(&docs)
+        .send()
+        .await
+        .unwrap();
+
+    let resp = client
+        .post(format!("{base_url}/orders/aggregate"))
+        .json(&json!({
+            "pipeline": [
+                {"$sort": [{"zeta": "desc"}, {"alpha": "asc"}]}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let tags: Vec<&str> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["tag"].as_str().unwrap())
+        .collect();
+    // zeta desc first (2s before 1s), then alpha asc within ties.
+    assert_eq!(tags, vec!["b", "d", "c", "a"]);
+}
+
+/// A-2: multi-key flat $sort object is ambiguous (JSON key order lost) → 400.
+#[tokio::test]
+async fn test_aggregate_sort_multi_key_object_rejected() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "orders"}))
+        .send()
+        .await
+        .unwrap();
+
+    let resp = client
+        .post(format!("{base_url}/orders/aggregate"))
+        .json(&json!({
+            "pipeline": [
+                {"$sort": {"name": 1, "count": -1}}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "INVALID_PIPELINE");
+    let msg = body["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("array form"),
+        "message should point at the array form: {msg}"
+    );
+}
+
+/// A-3: numeric 1/-1 directions now work on /query (previously -1 silently
+/// sorted ascending). Floats 1.0/-1.0 are accepted too.
+#[tokio::test]
+async fn test_query_sort_numeric_directions() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "products"}))
+        .send()
+        .await
+        .unwrap();
+
+    let docs = json!({
+        "documents": [
+            {"name": "cheap", "price": 1},
+            {"name": "mid", "price": 5},
+            {"name": "dear", "price": 9},
+        ]
+    });
+    client
+        .post(format!("{base_url}/products/docs/_bulk"))
+        .json(&docs)
+        .send()
+        .await
+        .unwrap();
+
+    let names_for = |sort: Value| {
+        let client = client.clone();
+        let base_url = base_url.clone();
+        async move {
+            let resp = client
+                .post(format!("{base_url}/products/query"))
+                .json(&json!({"sort": sort}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            let body: Value = resp.json().await.unwrap();
+            body["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d["name"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        }
+    };
+
+    assert_eq!(
+        names_for(json!([{"price": -1}])).await,
+        vec!["dear", "mid", "cheap"]
+    );
+    assert_eq!(
+        names_for(json!([{"price": 1}])).await,
+        vec!["cheap", "mid", "dear"]
+    );
+    assert_eq!(
+        names_for(json!([{"price": -1.0}])).await,
+        vec!["dear", "mid", "cheap"]
+    );
+}
+
+/// A-4: invalid direction values are rejected with 400 on both endpoints,
+/// naming the offending field (previously they silently sorted ascending).
+#[tokio::test]
+async fn test_sort_invalid_direction_rejected_both_endpoints() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "products"}))
+        .send()
+        .await
+        .unwrap();
+
+    // /query endpoint: typo'd string direction
+    let resp = client
+        .post(format!("{base_url}/products/query"))
+        .json(&json!({"sort": [{"price": "descending"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "INVALID_QUERY");
+    let msg = body["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("'price'"),
+        "message should name the field: {msg}"
+    );
+
+    // aggregate $sort: direction 0 is not a valid direction
+    let resp = client
+        .post(format!("{base_url}/products/aggregate"))
+        .json(&json!({"pipeline": [{"$sort": {"price": 0}}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "INVALID_PIPELINE");
+    let msg = body["error"]["message"].as_str().unwrap();
+    assert!(
+        msg.contains("'price'"),
+        "message should name the field: {msg}"
+    );
+}
+
+/// A-8: a single-field flat object is accepted as the sort spec on /query
+/// (symmetric with the aggregate $sort stage).
+#[tokio::test]
+async fn test_query_sort_flat_object_form() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "products"}))
+        .send()
+        .await
+        .unwrap();
+
+    let docs = json!({
+        "documents": [
+            {"name": "cheap", "price": 1},
+            {"name": "dear", "price": 9},
+        ]
+    });
+    client
+        .post(format!("{base_url}/products/docs/_bulk"))
+        .json(&docs)
+        .send()
+        .await
+        .unwrap();
+
+    let resp = client
+        .post(format!("{base_url}/products/query"))
+        .json(&json!({"sort": {"price": "desc"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let docs = body["data"].as_array().unwrap();
+    assert_eq!(docs[0]["name"], "dear");
+    assert_eq!(docs[1]["name"], "cheap");
+}
+
+/// A-9: `{}` sort is rejected on both endpoints (an empty object cannot
+/// express intent); `[]` remains a no-op on /query.
+#[tokio::test]
+async fn test_sort_empty_object_rejected() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "products"}))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base_url}/products/docs"))
+        .json(&json!({"name": "one"}))
+        .send()
+        .await
+        .unwrap();
+
+    let resp = client
+        .post(format!("{base_url}/products/query"))
+        .json(&json!({"sort": {}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "INVALID_QUERY");
+
+    let resp = client
+        .post(format!("{base_url}/products/aggregate"))
+        .json(&json!({"pipeline": [{"$sort": {}}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "INVALID_PIPELINE");
+
+    // [] is still a no-op sort on /query
+    let resp = client
+        .post(format!("{base_url}/products/query"))
+        .json(&json!({"sort": []}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["data"].as_array().unwrap().len(), 1);
+}

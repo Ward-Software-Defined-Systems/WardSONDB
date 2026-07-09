@@ -800,25 +800,6 @@ fn parse_sort_stage(
     spec: &Value,
     stage_idx: usize,
 ) -> Result<Vec<super::sort::SortField>, AppError> {
-    let obj = spec.as_object().ok_or_else(|| {
-        AppError::InvalidPipeline(format!("Stage {stage_idx}: $sort must be an object"))
-    })?;
-
-    let mut fields = Vec::new();
-    for (field, direction) in obj {
-        let ascending = match direction.as_str() {
-            Some("desc") => false,
-            Some("asc") => true,
-            _ => {
-                // Also support numeric: 1 = asc, -1 = desc
-                !matches!(direction.as_i64(), Some(-1))
-            }
-        };
-        fields.push(super::sort::SortField {
-            field: field.clone(),
-            ascending,
-        });
-    }
-
-    Ok(fields)
+    super::sort::parse_sort_spec(spec)
+        .map_err(|e| AppError::InvalidPipeline(format!("Stage {stage_idx}: $sort {e}")))
 }
