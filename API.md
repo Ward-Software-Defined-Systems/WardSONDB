@@ -42,8 +42,8 @@ wardsondb [OPTIONS]
 | `--data-dir <PATH>` | `-d` | `./data` | Data directory (created automatically) |
 | `--storage-engine <ENGINE>` | | *required* | Storage backend: `rocksdb` or `fjall`. Required on every launch (no default). Locked per data directory via a `.engine` marker file. |
 | `--log-level <LEVEL>` | `-l` | `info` | Log level: `trace`, `debug`, `info`, `warn`, `error` |
-| `--log-file <PATH>` | | `wardsondb.log` | Log file path (per-request logs always go here) |
-| `--verbose` | `-v` | `false` | Show per-request logs in the terminal |
+| `--log-file <PATH>` | | `wardsondb.log` | Log file path. Written via a non-blocking appender; if the path can't be opened the server warns and runs without file logging |
+| `--verbose` | `-v` | `false` | Enable per-request logging on both sinks (terminal and file). Off by default — always-on request logs grow without bound over long uptimes |
 | `--tls` | | `false` | Enable TLS (HTTPS) |
 | `--tls-cert <PATH>` | | | Path to PEM certificate file |
 | `--tls-key <PATH>` | | | Path to PEM private key file |
@@ -51,7 +51,9 @@ wardsondb [OPTIONS]
 | `--api-key <KEY>` | | | API key for authentication (repeatable) |
 | `--api-key-file <PATH>` | | | File with API keys (one per line, # comments) |
 | `--metrics-public` | | `false` | Make `/_metrics` publicly accessible (bypasses auth) |
-| `--query-timeout <SECS>` | | `30` | Query/aggregation timeout in seconds (0 = no timeout) |
+| `--query-timeout <SECS>` | | `30` | Read timeout in seconds for query, aggregate, distinct, and get-by-id (0 = no timeout) |
+| `--max-query-limit <N>` | | `100000` | Maximum query `limit`; larger requests are clamped silently |
+| `--max-body-mb <N>` | | `64` | Maximum HTTP request body size in MiB; oversized requests get 413 `DOCUMENT_TOO_LARGE` |
 | `--cache-size-mb <N>` | | `64` | Block cache size in MiB (read cache for all partitions) |
 | `--write-buffer-mb <N>` | | `64` | Total write buffer budget in MiB across all partitions |
 | `--memtable-mb <N>` | | `8` | Max memtable size per partition in MiB before flush |
@@ -852,6 +854,8 @@ Get just the count of matching documents without returning them:
 }
 ```
 
+**Unfiltered counts are O(1):** with no `filter`, the count is served from the collection's document counter (maintained on every insert/delete path, seeded by a full count at startup) instead of scanning — `scan_strategy: "doc_counter"`, `docs_scanned: 0`, regardless of collection size. Filtered counts use the index fast paths where possible (see below) or a scan.
+
 ### Early Termination (Sorted Index Scan)
 
 When a query uses a compound index that covers both the filter and sort fields, WardSONDB can return results without loading the entire match set. This is indicated by `scan_strategy: "index_sorted"` in the response meta.
@@ -1638,7 +1642,8 @@ By default follows auth policy. Use `--metrics-public` to allow unauthenticated 
 | 409 | `COLLECTION_EXISTS` | Collection with that name already exists |
 | 409 | `INDEX_EXISTS` | Index with that name already exists |
 | 409 | `DOCUMENT_CONFLICT` | Revision mismatch on update |
-| 413 | `DOCUMENT_TOO_LARGE` | Document exceeds size limit |
+| 408 | `QUERY_TIMEOUT` | Read exceeded `--query-timeout` |
+| 413 | `DOCUMENT_TOO_LARGE` | Document exceeds the 16 MB per-document limit, or the request body exceeds `--max-body-mb` |
 | 500 | `INTERNAL_ERROR` | Unexpected server error |
 | 503 | `STORAGE_POISONED` | Storage engine suffered a fatal flush/compaction failure. Writes rejected, reads may continue. Restart required. |
 
@@ -1698,7 +1703,8 @@ These values are reported in the `GET /_stats` response under `memory_config`. I
 
 | Resource | Limit | Notes |
 |----------|-------|-------|
-| Query `limit` | 10,000 | Silently clamped; default 100 |
+| Query `limit` | 100,000 | Silently clamped; default 100; configurable via `--max-query-limit` |
+| Request body | 64 MiB | Configurable via `--max-body-mb`; oversized requests get 413 `DOCUMENT_TOO_LARGE` |
 | Bulk insert | 10,000 documents | Returns 400 if exceeded |
 | Pipeline stages | 100 | Returns 400 if exceeded |
 | Filter nesting depth | 20 | `$and`/`$or`/`$not` nesting |
@@ -1706,7 +1712,7 @@ These values are reported in the `GET /_stats` response under `memory_config`. I
 | Dot-notation depth | 20 | Max segments in `a.b.c...` paths |
 | Regex pattern length | 1,024 chars | Regex uses Rust `regex` crate (linear-time, no backtracking) |
 | Document size | 16 MB | Per document |
-| Query timeout | 30 seconds | Configurable via `--query-timeout` (0 = no timeout) |
+| Query timeout | 30 seconds | Applies to query, aggregate, distinct, and get-by-id; configurable via `--query-timeout` (0 = no timeout) |
 | `$collect` accumulator | 1,000 unique values | Returns `{"values": [...], "_truncated": true}` if cap is reached |
 | API key comparison | Constant-time | Uses `subtle` crate to prevent timing attacks |
 

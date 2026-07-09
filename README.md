@@ -4,6 +4,9 @@
 
 # WardSONDB
 
+> [!WARNING]
+> **This branch (`code-review`) is under active RAD iteration and is currently untested beyond its own CI suite.** Changes here have not been validated against production workloads and may land in rapid succession without release notes. Do not deploy from this branch — use `main` until this work is merged.
+
 A lightweight, high-performance JSON document database built in Rust. Designed for SIEM and security event workloads — fast ingest, indexed queries, aggregation pipelines, and automatic data retention in a single binary.
 
 ## Key Features
@@ -214,10 +217,13 @@ curl -X PUT http://localhost:8080/events/ttl \
 | `--ttl-interval` | `60` | TTL cleanup interval in seconds |
 | `--metrics-public` | `false` | Allow unauthenticated access to `/_metrics` |
 | `--log-level` | `info` | Log level (trace/debug/info/warn/error) |
-| `--log-file` | `wardsondb.log` | Log file path |
+| `--log-file` | `wardsondb.log` | Log file path (non-blocking writer; unwritable path = warn and continue without file logging) |
 | `--bitmap-fields` | | Comma-separated fields for bitmap scan acceleration *(Alpha)* |
 | `--bitmap-memory-mb` | `0` | Bitmap memory budget in MiB (0 = auto: min(4096, 10% system RAM)) |
-| `--verbose` | `false` | Show per-request logs in terminal |
+| `--verbose` | `false` | Enable per-request logging (terminal **and** file; off by default — request logs grow without bound over long uptimes) |
+| `--query-timeout` | `30` | Read timeout in seconds for query/aggregate/distinct/get-by-id (0 = no timeout) |
+| `--max-query-limit` | `100000` | Maximum query `limit`; larger requests are clamped silently |
+| `--max-body-mb` | `64` | Maximum HTTP request body size in MiB (413 `DOCUMENT_TOO_LARGE` on overrun) |
 | `--cache-size-mb` | `64` | Block + blob cache size in MiB (shared across all partitions) |
 | `--write-buffer-mb` | `64` | Max write buffer size in MiB (total across all partitions) |
 | `--memtable-mb` | `8` | Max memtable size in MiB per partition (triggers flush when exceeded) |
