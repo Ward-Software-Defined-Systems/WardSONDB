@@ -83,24 +83,50 @@ fn parse_direction(field: &str, direction: &Value) -> Result<bool, String> {
 }
 
 pub fn sort_documents(docs: &mut [Value], sort_fields: &[SortField]) {
-    docs.sort_by(|a, b| {
-        for sf in sort_fields {
-            let va = resolve_json_path(a, &sf.field);
-            let vb = resolve_json_path(b, &sf.field);
+    if sort_fields.is_empty() {
+        return;
+    }
+    docs.sort_by(|a, b| compare_docs(a, b, sort_fields));
+}
 
-            let ordering = compare_json_values(va, vb);
-            let ordering = if sf.ascending {
-                ordering
-            } else {
-                ordering.reverse()
-            };
+/// Direction of the implicit `_id` tiebreak for a sort spec: the last sort
+/// field's direction (ascending when the spec is empty). This matches index
+/// key order — within a full sort-value tie, a forward (all-asc) index scan
+/// yields doc ids ascending and a reverse (all-desc) scan yields them
+/// descending — so in-memory and index-order results agree byte for byte.
+pub fn tiebreak_ascending(sort_fields: &[SortField]) -> bool {
+    sort_fields.last().map(|s| s.ascending).unwrap_or(true)
+}
 
-            if ordering != std::cmp::Ordering::Equal {
-                return ordering;
-            }
+/// Total-order comparator: user sort fields, then `_id` tiebreak (see
+/// `tiebreak_ascending`). With an empty spec this orders by `_id` ascending.
+pub fn compare_docs(a: &Value, b: &Value, sort_fields: &[SortField]) -> std::cmp::Ordering {
+    for sf in sort_fields {
+        let va = resolve_json_path(a, &sf.field);
+        let vb = resolve_json_path(b, &sf.field);
+
+        let ordering = compare_json_values(va, vb);
+        let ordering = if sf.ascending {
+            ordering
+        } else {
+            ordering.reverse()
+        };
+
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
         }
-        std::cmp::Ordering::Equal
-    });
+    }
+
+    // _id tiebreak. Group results from $group compare here too, but their
+    // _ids are unique group keys, so this never reorders them.
+    let ia = a.get("_id").and_then(Value::as_str);
+    let ib = b.get("_id").and_then(Value::as_str);
+    let ordering = ia.cmp(&ib);
+    if tiebreak_ascending(sort_fields) {
+        ordering
+    } else {
+        ordering.reverse()
+    }
 }
 
 fn compare_json_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {

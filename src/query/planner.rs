@@ -251,7 +251,13 @@ fn try_index_sorted(
     if sort.is_empty() {
         return None;
     }
-    let sort_field = &sort[0].field;
+
+    // A single index scan direction can only serve uniform sort directions
+    // (the scan is forward for all-asc, reverse for all-desc). Mixed
+    // directions fall through to a materializing strategy + in-memory sort.
+    if !sort.iter().all(|s| s.ascending == sort[0].ascending) {
+        return None;
+    }
 
     // Extract equality conditions from the filter
     let eq_pairs = extract_eq_pairs(filter);
@@ -260,9 +266,13 @@ fn try_index_sorted(
     }
 
     let eq_field_names: Vec<&str> = eq_pairs.iter().map(|(f, _)| f.as_str()).collect();
+    let sort_field_names: Vec<&str> = sort.iter().map(|s| s.field.as_str()).collect();
 
+    // The compound index must cover ALL sort fields, in order, right after
+    // the eq prefix — otherwise secondary sort fields would be silently
+    // ignored (the scan never re-sorts).
     let (idx_def, _, n_matched) =
-        index_manager.find_compound_index(collection, &eq_field_names, Some(sort_field))?;
+        index_manager.find_compound_index(collection, &eq_field_names, &sort_field_names)?;
 
     // Build prefix from matched eq values in index field order
     let mut prefix = Vec::new();
@@ -325,7 +335,7 @@ fn try_compound_eq(
 
     let eq_field_names: Vec<&str> = eq_pairs.iter().map(|(f, _)| f.as_str()).collect();
     let (idx_def, _, n_matched) =
-        index_manager.find_compound_index(collection, &eq_field_names, None)?;
+        index_manager.find_compound_index(collection, &eq_field_names, &[])?;
 
     // Build compound prefix
     let all_matched = n_matched == idx_def.fields.len();

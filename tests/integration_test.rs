@@ -5187,3 +5187,263 @@ async fn test_sort_empty_object_rejected() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["data"].as_array().unwrap().len(), 1);
 }
+
+// ─── Multi-field sort: IndexSorted gating + _id tiebreak ─────────────────────
+
+/// A-5: a compound index covering eq-prefix + ALL sort fields in order serves
+/// a multi-field sort via index_sorted, with correct secondary-field ordering.
+/// (Previously the planner matched on the first sort field only and the scan
+/// never re-sorted, silently ignoring secondary fields.)
+#[tokio::test]
+async fn test_multi_field_sort_served_by_compound_index() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "events"}))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base_url}/events/indexes"))
+        .json(&json!({"name": "idx_type_sev_time", "fields": ["event_type", "severity", "received_at"]}))
+        .send()
+        .await
+        .unwrap();
+
+    // severity ties force received_at to decide within each severity group.
+    let docs = json!({
+        "documents": [
+            {"tag": "a", "event_type": "fw", "severity": "high", "received_at": "2026-03-03"},
+            {"tag": "b", "event_type": "fw", "severity": "low",  "received_at": "2026-03-01"},
+            {"tag": "c", "event_type": "fw", "severity": "high", "received_at": "2026-03-01"},
+            {"tag": "d", "event_type": "fw", "severity": "low",  "received_at": "2026-03-04"},
+            {"tag": "e", "event_type": "dns", "severity": "high", "received_at": "2026-03-02"},
+        ]
+    });
+    client
+        .post(format!("{base_url}/events/docs/_bulk"))
+        .json(&docs)
+        .send()
+        .await
+        .unwrap();
+
+    let resp = client
+        .post(format!("{base_url}/events/query"))
+        .json(&json!({
+            "filter": {"event_type": "fw"},
+            "sort": [{"severity": "asc"}, {"received_at": "asc"}],
+            "limit": 10
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["meta"]["scan_strategy"], "index_sorted");
+    assert_eq!(body["meta"]["index_used"], "idx_type_sev_time");
+
+    let tags: Vec<&str> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["tag"].as_str().unwrap())
+        .collect();
+    // severity asc ("high" < "low"), then received_at asc within severity.
+    assert_eq!(tags, vec!["c", "a", "b", "d"]);
+}
+
+/// A-6: mixed sort directions can't be served by one index scan direction —
+/// the planner must fall back, and the in-memory sort must produce the
+/// correct order.
+#[tokio::test]
+async fn test_multi_field_sort_mixed_direction_falls_back() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "events"}))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base_url}/events/indexes"))
+        .json(&json!({"name": "idx_type_sev_time", "fields": ["event_type", "severity", "received_at"]}))
+        .send()
+        .await
+        .unwrap();
+
+    let docs = json!({
+        "documents": [
+            {"tag": "a", "event_type": "fw", "severity": "high", "received_at": "2026-03-03"},
+            {"tag": "b", "event_type": "fw", "severity": "low",  "received_at": "2026-03-01"},
+            {"tag": "c", "event_type": "fw", "severity": "high", "received_at": "2026-03-01"},
+            {"tag": "d", "event_type": "fw", "severity": "low",  "received_at": "2026-03-04"},
+        ]
+    });
+    client
+        .post(format!("{base_url}/events/docs/_bulk"))
+        .json(&docs)
+        .send()
+        .await
+        .unwrap();
+
+    let resp = client
+        .post(format!("{base_url}/events/query"))
+        .json(&json!({
+            "filter": {"event_type": "fw"},
+            "sort": [{"severity": "asc"}, {"received_at": "desc"}],
+            "limit": 10
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_ne!(
+        body["meta"]["scan_strategy"], "index_sorted",
+        "mixed directions must not use index_sorted"
+    );
+
+    let tags: Vec<&str> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["tag"].as_str().unwrap())
+        .collect();
+    // severity asc, received_at desc within severity.
+    assert_eq!(tags, vec!["a", "c", "d", "b"]);
+}
+
+/// A-7: equal sort values order deterministically by _id — ascending for an
+/// asc sort, descending for a desc sort (the tiebreak follows the last sort
+/// field's direction) — and repeated queries return identical order.
+#[tokio::test]
+async fn test_sort_tiebreak_deterministic() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "items"}))
+        .send()
+        .await
+        .unwrap();
+
+    let docs: Vec<Value> = (0..6).map(|i| json!({"n": i, "price": 5})).collect();
+    client
+        .post(format!("{base_url}/items/docs/_bulk"))
+        .json(&json!({"documents": docs}))
+        .send()
+        .await
+        .unwrap();
+
+    let ids_for = |dir: &'static str| {
+        let client = client.clone();
+        let base_url = base_url.clone();
+        async move {
+            let resp = client
+                .post(format!("{base_url}/items/query"))
+                .json(&json!({"sort": [{"price": dir}]}))
+                .send()
+                .await
+                .unwrap();
+            let body: Value = resp.json().await.unwrap();
+            body["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d["_id"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        }
+    };
+
+    let asc_ids = ids_for("asc").await;
+    let mut expected = asc_ids.clone();
+    expected.sort();
+    assert_eq!(
+        asc_ids, expected,
+        "asc-sort ties must order by _id ascending"
+    );
+
+    let desc_ids = ids_for("desc").await;
+    let mut expected_desc = asc_ids.clone();
+    expected_desc.reverse();
+    assert_eq!(
+        desc_ids, expected_desc,
+        "desc-sort ties must order by _id descending"
+    );
+
+    // Repeatability
+    assert_eq!(asc_ids, ids_for("asc").await);
+}
+
+/// A-10: an index with extra fields AFTER the sort fields still serves the
+/// sort via index_sorted (extras only affect within-tie order).
+#[tokio::test]
+async fn test_index_sorted_extra_trailing_fields_still_used() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "events"}))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base_url}/events/indexes"))
+        .json(&json!({"name": "idx_type_time_sev", "fields": ["event_type", "received_at", "severity"]}))
+        .send()
+        .await
+        .unwrap();
+
+    let docs: Vec<Value> = (0..10)
+        .map(|i| {
+            json!({
+                "event_type": "fw",
+                "received_at": format!("2026-03-{:02}", i + 1),
+                "severity": if i % 2 == 0 { "high" } else { "low" }
+            })
+        })
+        .collect();
+    client
+        .post(format!("{base_url}/events/docs/_bulk"))
+        .json(&json!({"documents": docs}))
+        .send()
+        .await
+        .unwrap();
+
+    let resp = client
+        .post(format!("{base_url}/events/query"))
+        .json(&json!({
+            "filter": {"event_type": "fw"},
+            "sort": [{"received_at": "asc"}],
+            "limit": 5
+        }))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["meta"]["scan_strategy"], "index_sorted");
+    assert_eq!(body["meta"]["index_used"], "idx_type_time_sev");
+
+    let times: Vec<&str> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["received_at"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        times,
+        vec![
+            "2026-03-01",
+            "2026-03-02",
+            "2026-03-03",
+            "2026-03-04",
+            "2026-03-05"
+        ]
+    );
+}

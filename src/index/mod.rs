@@ -127,7 +127,7 @@ impl IndexManager {
         &self,
         collection: &str,
         eq_field_names: &[&str],
-        sort_field: Option<&str>,
+        sort_fields: &[&str],
     ) -> Option<(IndexDef, PartitionId, usize)> {
         let indexes = self.indexes.read();
         let eq_set: std::collections::HashSet<&str> = eq_field_names.iter().copied().collect();
@@ -154,9 +154,16 @@ impl IndexManager {
                 continue;
             }
 
-            if let Some(sf) = sort_field {
-                if matched < idx_fields.len()
-                    && idx_fields[matched] == sf
+            if !sort_fields.is_empty() {
+                // The index fields right after the matched eq prefix must be
+                // exactly the sort fields, in order (extra trailing index
+                // fields are allowed — they only affect within-tie order).
+                let need = matched + sort_fields.len();
+                if need <= idx_fields.len()
+                    && idx_fields[matched..need]
+                        .iter()
+                        .map(String::as_str)
+                        .eq(sort_fields.iter().copied())
                     && best.as_ref().is_none_or(|(_, _, bm)| matched > *bm)
                 {
                     best = Some((entry.def.clone(), entry.partition.clone(), matched));
