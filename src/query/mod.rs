@@ -1,4 +1,5 @@
 pub mod aggregate;
+pub mod cursor;
 pub mod distinct;
 pub mod executor;
 pub mod filter;

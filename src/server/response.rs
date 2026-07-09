@@ -32,6 +32,8 @@ pub struct ResponseMeta {
     pub scan_strategy: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub has_more: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
 }
 
 impl ApiResponse {

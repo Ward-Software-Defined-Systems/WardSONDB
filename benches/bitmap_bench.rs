@@ -103,8 +103,10 @@ fn bench_bitmap_vs_full_scan_10k(c: &mut Criterion) {
                     offset: Some(0),
                     fields: None,
                     count_only: None,
+                    cursor: None,
                 },
                 100_000,
+                "events",
             )
             .unwrap();
             execute_query(&storage_bm, "events", &query).unwrap();
@@ -121,8 +123,10 @@ fn bench_bitmap_vs_full_scan_10k(c: &mut Criterion) {
                     offset: Some(0),
                     fields: None,
                     count_only: None,
+                    cursor: None,
                 },
                 100_000,
+                "events",
             )
             .unwrap();
             execute_query(&storage_fs, "events", &query).unwrap();
@@ -154,8 +158,10 @@ fn bench_bitmap_vs_full_scan_100k(c: &mut Criterion) {
                     offset: Some(0),
                     fields: None,
                     count_only: None,
+                    cursor: None,
                 },
                 100_000,
+                "events",
             )
             .unwrap();
             execute_query(&storage_bm, "events", &query).unwrap();
@@ -172,8 +178,10 @@ fn bench_bitmap_vs_full_scan_100k(c: &mut Criterion) {
                     offset: Some(0),
                     fields: None,
                     count_only: None,
+                    cursor: None,
                 },
                 100_000,
+                "events",
             )
             .unwrap();
             execute_query(&storage_fs, "events", &query).unwrap();
@@ -210,8 +218,10 @@ fn bench_bitmap_and_two_fields(c: &mut Criterion) {
                     offset: Some(0),
                     fields: None,
                     count_only: None,
+                    cursor: None,
                 },
                 100_000,
+                "events",
             )
             .unwrap();
             execute_query(&storage_bm, "events", &query).unwrap();
@@ -233,8 +243,10 @@ fn bench_bitmap_and_two_fields(c: &mut Criterion) {
                     offset: Some(0),
                     fields: None,
                     count_only: None,
+                    cursor: None,
                 },
                 100_000,
+                "events",
             )
             .unwrap();
             execute_query(&storage_fs, "events", &query).unwrap();
@@ -266,8 +278,10 @@ fn bench_bitmap_count_only(c: &mut Criterion) {
                     offset: None,
                     fields: None,
                     count_only: Some(true),
+                    cursor: None,
                 },
                 100_000,
+                "events",
             )
             .unwrap();
             execute_query(&storage_bm, "events", &query).unwrap();
@@ -284,8 +298,10 @@ fn bench_bitmap_count_only(c: &mut Criterion) {
                     offset: None,
                     fields: None,
                     count_only: Some(true),
+                    cursor: None,
                 },
                 100_000,
+                "events",
             )
             .unwrap();
             execute_query(&storage_fs, "events", &query).unwrap();

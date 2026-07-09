@@ -113,8 +113,10 @@ fn bench_query_10k(c: &mut Criterion) {
                     offset: Some(0),
                     fields: None,
                     count_only: None,
+                    cursor: None,
                 },
                 100_000,
+                "events",
             )
             .unwrap();
             execute_query(&storage, "events", &query).unwrap();
@@ -131,8 +133,10 @@ fn bench_query_10k(c: &mut Criterion) {
                     offset: Some(0),
                     fields: None,
                     count_only: None,
+                    cursor: None,
                 },
                 100_000,
+                "events",
             )
             .unwrap();
             execute_query(&storage, "events", &query).unwrap();
@@ -149,8 +153,10 @@ fn bench_query_10k(c: &mut Criterion) {
                     offset: Some(0),
                     fields: None,
                     count_only: None,
+                    cursor: None,
                 },
                 100_000,
+                "events",
             )
             .unwrap();
             execute_query(&storage, "events", &query).unwrap();
@@ -167,8 +173,10 @@ fn bench_query_10k(c: &mut Criterion) {
                     offset: None,
                     fields: None,
                     count_only: Some(true),
+                    cursor: None,
                 },
                 100_000,
+                "events",
             )
             .unwrap();
             execute_query(&storage, "events", &query).unwrap();
@@ -192,8 +200,10 @@ fn bench_query_100k(c: &mut Criterion) {
                     offset: Some(0),
                     fields: None,
                     count_only: None,
+                    cursor: None,
                 },
                 100_000,
+                "events",
             )
             .unwrap();
             execute_query(&storage, "events", &query).unwrap();
@@ -210,8 +220,10 @@ fn bench_query_100k(c: &mut Criterion) {
                     offset: Some(0),
                     fields: None,
                     count_only: None,
+                    cursor: None,
                 },
                 100_000,
+                "events",
             )
             .unwrap();
             execute_query(&storage, "events", &query).unwrap();
@@ -234,8 +246,10 @@ fn bench_query_100k(c: &mut Criterion) {
                     offset: Some(0),
                     fields: None,
                     count_only: None,
+                    cursor: None,
                 },
                 100_000,
+                "events",
             )
             .unwrap();
             execute_query(&storage, "events", &query).unwrap();
@@ -252,8 +266,10 @@ fn bench_query_100k(c: &mut Criterion) {
                     offset: None,
                     fields: None,
                     count_only: Some(true),
+                    cursor: None,
                 },
                 100_000,
+                "events",
             )
             .unwrap();
             execute_query(&storage, "events", &query).unwrap();
@@ -270,8 +286,10 @@ fn bench_query_100k(c: &mut Criterion) {
                     offset: Some(0),
                     fields: None,
                     count_only: None,
+                    cursor: None,
                 },
                 100_000,
+                "events",
             )
             .unwrap();
             execute_query(&storage, "events", &query).unwrap();
@@ -292,8 +310,10 @@ fn bench_query_100k(c: &mut Criterion) {
                         "severity".into(),
                     ]),
                     count_only: None,
+                    cursor: None,
                 },
                 100_000,
+                "events",
             )
             .unwrap();
             execute_query(&storage, "events", &query).unwrap();

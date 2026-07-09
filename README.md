@@ -14,6 +14,7 @@ A lightweight, high-performance JSON document database built in Rust. Designed f
 - **Bitmap Scan Accelerator** *(Alpha)* — sub-millisecond aggregation and filtered counts on categorical fields without touching documents
 - **Compound Range Scans** *(Alpha)* — equality prefix + range suffix on compound indexes for fast time-windowed queries
 - **Aggregation pipelines** — `$match`, `$group`, `$sort`, `$limit`, `$skip` with index-accelerated execution
+- **Cursor pagination** — opaque `next_cursor` tokens for gap-free keyset walks over large result sets (strict sort validation; directions `asc`/`desc`/`1`/`-1` on both `/query` and `$sort`)
 - **Index-only query paths** — count, distinct, and aggregation operations that never touch documents
 - **TTL / auto-expiry** — per-collection retention policies with background cleanup
 - **TLS support** — auto-generated self-signed certs or bring your own

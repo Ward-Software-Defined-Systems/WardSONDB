@@ -129,7 +129,7 @@ pub fn compare_docs(a: &Value, b: &Value, sort_fields: &[SortField]) -> std::cmp
     }
 }
 
-fn compare_json_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
+pub(crate) fn compare_json_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
     match (a, b) {
         (None, None) => std::cmp::Ordering::Equal,
         (None, Some(_)) => std::cmp::Ordering::Less,

@@ -689,6 +689,7 @@ curl -X POST http://localhost:8080/events/query \
 | `offset` | integer | `0` | Number of documents to skip (for pagination). |
 | `fields` | array | `null` | Projection — list of field names to include. `_id` is always included. |
 | `count_only` | boolean | `false` | If `true`, return only the count, not the documents. |
+| `cursor` | string | `null` | Opaque pagination token from a previous response's `meta.next_cursor`. Mutually exclusive with `offset`. See **Cursor Pagination**. |
 
 ### Filter Operators
 
@@ -789,6 +790,43 @@ Return only specific fields (always includes `_id`):
 }
 ```
 
+### Cursor Pagination
+
+For walking large result sets, prefer cursors over `offset` — offset pagination re-scans and discards all skipped documents on every page, while a cursor resumes from the previous position.
+
+When a query has more matching documents than `limit`, the response includes an opaque token in `meta.next_cursor` (alongside `meta.has_more: true`). Echo it back in the `cursor` field of the next request, keeping the same collection, filter, and sort:
+
+```json
+{
+  "filter": {"event_type": "firewall"},
+  "sort": [{"received_at": "desc"}],
+  "limit": 500,
+  "cursor": "eyJ2IjoxLCJmIjo..."
+}
+```
+
+**Response (last page has no `next_cursor`):**
+```json
+{
+  "ok": true,
+  "data": [ ... ],
+  "meta": {
+    "returned_count": 500,
+    "has_more": true,
+    "next_cursor": "eyJ2IjoxLCJmIjo..."
+  }
+}
+```
+
+Rules and semantics:
+
+- `cursor` is **mutually exclusive with `offset`**, and cannot be combined with `count_only` or `"limit": 0` (all `400 INVALID_QUERY`).
+- A cursor is bound to its **collection and sort specification** (fields + directions). Reusing it with a different sort or collection returns `400 INVALID_QUERY`. The **filter is deliberately not bound**: the cursor is purely positional, so you may narrow or widen the filter mid-walk and pagination stays well-defined.
+- Pages are **strictly-after**: each page contains the matching documents positioned after the last document of the previous page in the total order (sort fields, then an `_id` tiebreak in the direction of the last sort field). Documents deleted between pages are skipped without repeats or gaps among survivors; a document whose sort value is updated may move behind the cursor (not seen again) or ahead of it (seen on a later page) — inherent to keyset pagination.
+- `next_cursor` is emitted for sorted queries and cursor-resumed queries. To walk a collection without a sort, pass `"sort": [{"_id": "asc"}]` (or any deterministic sort) on the first request.
+- `meta.total_count` may be absent on cursor-paginated responses served by early-terminating index scans.
+- `limit` is clamped to `--max-query-limit` per page, as usual.
+
 ### Count Only
 
 Get just the count of matching documents without returning them:
@@ -837,7 +875,7 @@ When a query uses a compound index that covers both the filter and sort fields, 
 - `has_more: true` indicates more matching documents exist beyond the returned set
 - `scan_strategy` identifies the optimization used
 
-**When it activates:** Requires a compound index whose fields start with the equality filter field(s) and end with the sort field. For example, index `["event_type", "received_at"]` + query `event_type=firewall` sorted by `received_at desc`.
+**When it activates:** Requires a compound index whose fields start with the equality filter field(s), followed by **all** sort fields in order with a uniform direction (all `asc` or all `desc`). For example, index `["event_type", "received_at"]` + query `event_type=firewall` sorted by `received_at desc`; or index `["event_type", "severity", "received_at"]` sorted by `[{"severity": "asc"}, {"received_at": "asc"}]`. Extra index fields *after* the sort fields are allowed (they only affect within-tie order). Mixed sort directions fall back to an in-memory sort.
 
 ### Compound Range Scan
 

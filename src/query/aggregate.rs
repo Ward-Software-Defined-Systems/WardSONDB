@@ -69,6 +69,7 @@ pub fn execute_aggregate(
                 offset: 0,
                 fields: None,
                 count_only: false,
+                cursor: None,
             };
             let result = execute_query(storage, collection, &parsed)?;
             (result.docs, result.docs_scanned, result.index_used, true)

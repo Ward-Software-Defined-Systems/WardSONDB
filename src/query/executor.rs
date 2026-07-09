@@ -5,10 +5,11 @@ use crate::engine::storage::Storage;
 use crate::error::AppError;
 use crate::index::secondary::extract_doc_id_from_key;
 
+use super::cursor::{compare_doc_to_cursor, encode_cursor};
 use super::filter::resolve_json_path;
 use super::parser::ParsedQuery;
 use super::planner::{QueryPlan, ScanPlan, plan_query};
-use super::sort::sort_documents;
+use super::sort::compare_docs;
 
 #[derive(Debug)]
 pub struct QueryResult {
@@ -18,6 +19,7 @@ pub struct QueryResult {
     pub index_used: Option<String>,
     pub scan_strategy: Option<String>,
     pub has_more: bool,
+    pub next_cursor: Option<String>,
 }
 
 pub fn execute_query(
@@ -26,12 +28,9 @@ pub fn execute_query(
     query: &ParsedQuery,
 ) -> Result<QueryResult, AppError> {
     let plan = plan_query(
-        &query.filter,
+        query,
         &storage.index_manager,
         collection,
-        &query.sort,
-        query.limit,
-        query.count_only,
         &storage.scan_accelerator,
     );
 
@@ -47,6 +46,56 @@ pub fn execute_query(
     }
 }
 
+/// Final ordering, pagination, and projection for strategies that materialize
+/// the full match set. Sorts with the `_id`-tiebreak comparator whenever a
+/// sort or a cursor is present (a cursor with no sort needs the deterministic
+/// `_id` order — this is also what makes bitmap scans, whose natural order is
+/// insertion position, cursor-safe). Resolves the page window from the cursor
+/// position or the offset, computes an exact `has_more`, and builds
+/// `next_cursor` from the last page document BEFORE projection strips fields.
+fn paginate_materialized(
+    mut matching: Vec<Value>,
+    query: &ParsedQuery,
+    collection: &str,
+) -> (Vec<Value>, bool, Option<String>) {
+    use std::cmp::Ordering;
+
+    if query.cursor.is_some() || !query.sort.is_empty() {
+        matching.sort_by(|a, b| compare_docs(a, b, &query.sort));
+    }
+
+    let start = match &query.cursor {
+        // Sorted by the same total order the cursor encodes, so the page
+        // starts exactly where docs stop comparing at-or-before the cursor.
+        Some(cursor) => matching.partition_point(|doc| {
+            compare_doc_to_cursor(doc, cursor, &query.sort) != Ordering::Greater
+        }),
+        None => (query.offset as usize).min(matching.len()),
+    };
+    let end = start
+        .saturating_add(query.limit as usize)
+        .min(matching.len());
+    let has_more = matching.len() > end;
+
+    let next_cursor =
+        if has_more && end > start && (query.cursor.is_some() || !query.sort.is_empty()) {
+            encode_cursor(&matching[end - 1], &query.sort, collection)
+        } else {
+            None
+        };
+
+    matching.truncate(end);
+    let page = matching.split_off(start);
+
+    let docs = if let Some(ref fields) = query.fields {
+        page.iter().map(|doc| project_fields(doc, fields)).collect()
+    } else {
+        page
+    };
+
+    (docs, has_more, next_cursor)
+}
+
 fn execute_full_scan(
     storage: &Storage,
     collection: &str,
@@ -57,7 +106,7 @@ fn execute_full_scan(
     let docs_scanned = all_docs.len() as u64;
 
     let filter = plan.original_filter.as_ref();
-    let mut matching: Vec<Value> = if let Some(filter) = filter {
+    let matching: Vec<Value> = if let Some(filter) = filter {
         all_docs
             .into_iter()
             .filter(|doc| filter.matches(doc))
@@ -76,25 +125,11 @@ fn execute_full_scan(
             index_used: None,
             scan_strategy: None,
             has_more: false,
+            next_cursor: None,
         });
     }
 
-    if !query.sort.is_empty() {
-        sort_documents(&mut matching, &query.sort);
-    }
-
-    let offset = query.offset as usize;
-    let limit = query.limit as usize;
-    let paginated: Vec<Value> = matching.into_iter().skip(offset).take(limit).collect();
-
-    let docs = if let Some(ref fields) = query.fields {
-        paginated
-            .into_iter()
-            .map(|doc| project_fields(&doc, fields))
-            .collect()
-    } else {
-        paginated
-    };
+    let (docs, has_more, next_cursor) = paginate_materialized(matching, query, collection);
 
     Ok(QueryResult {
         docs,
@@ -102,7 +137,8 @@ fn execute_full_scan(
         docs_scanned,
         index_used: None,
         scan_strategy: None,
-        has_more: false,
+        has_more,
+        next_cursor,
     })
 }
 
@@ -133,6 +169,7 @@ fn execute_index_scan(
                     index_used: Some(index_name.clone()),
                     scan_strategy: None,
                     has_more: false,
+                    next_cursor: None,
                 });
             }
 
@@ -172,6 +209,7 @@ fn execute_index_scan(
                         index_used: Some(index_name.clone()),
                         scan_strategy: None,
                         has_more: false,
+                        next_cursor: None,
                     });
                 }
             }
@@ -206,6 +244,7 @@ fn execute_index_scan(
                         index_used: Some(index_name.clone()),
                         scan_strategy: None,
                         has_more: false,
+                        next_cursor: None,
                     });
                 }
             }
@@ -239,6 +278,7 @@ fn execute_index_scan(
                     index_used: Some(index_name.clone()),
                     scan_strategy: Some("compound_eq".to_string()),
                     has_more: false,
+                    next_cursor: None,
                 });
             }
 
@@ -280,7 +320,7 @@ fn execute_index_scan(
     }
 
     // Apply post-filter (residual conditions not covered by the index)
-    let mut matching = if let Some(ref post_filter) = plan.post_filter {
+    let matching: Vec<Value> = if let Some(ref post_filter) = plan.post_filter {
         loaded_docs
             .into_iter()
             .filter(|doc| post_filter.matches(doc))
@@ -299,25 +339,11 @@ fn execute_index_scan(
             index_used: Some(index_name),
             scan_strategy: None,
             has_more: false,
+            next_cursor: None,
         });
     }
 
-    if !query.sort.is_empty() {
-        sort_documents(&mut matching, &query.sort);
-    }
-
-    let offset = query.offset as usize;
-    let limit = query.limit as usize;
-    let paginated: Vec<Value> = matching.into_iter().skip(offset).take(limit).collect();
-
-    let docs = if let Some(ref fields) = query.fields {
-        paginated
-            .into_iter()
-            .map(|doc| project_fields(&doc, fields))
-            .collect()
-    } else {
-        paginated
-    };
+    let (docs, has_more, next_cursor) = paginate_materialized(matching, query, collection);
 
     Ok(QueryResult {
         docs,
@@ -325,7 +351,8 @@ fn execute_index_scan(
         docs_scanned,
         index_used: Some(index_name),
         scan_strategy: None,
-        has_more: false,
+        has_more,
+        next_cursor,
     })
 }
 
@@ -425,6 +452,7 @@ fn execute_index_sorted(
         index_used: Some(index_name.to_string()),
         scan_strategy: Some("index_sorted".to_string()),
         has_more,
+        next_cursor: None,
     })
 }
 
@@ -517,6 +545,7 @@ fn execute_compound_range(
             index_used: Some(index_name.to_string()),
             scan_strategy: Some("compound_range".to_string()),
             has_more: false,
+            next_cursor: None,
         });
     }
 
@@ -553,7 +582,7 @@ fn execute_compound_range(
     }
 
     // Apply post-filter
-    let mut matching = if let Some(ref post_filter) = plan.post_filter {
+    let matching: Vec<Value> = if let Some(ref post_filter) = plan.post_filter {
         loaded_docs
             .into_iter()
             .filter(|doc| post_filter.matches(doc))
@@ -572,25 +601,11 @@ fn execute_compound_range(
             index_used: Some(index_name.to_string()),
             scan_strategy: Some("compound_range".to_string()),
             has_more: false,
+            next_cursor: None,
         });
     }
 
-    if !query.sort.is_empty() {
-        sort_documents(&mut matching, &query.sort);
-    }
-
-    let offset = query.offset as usize;
-    let limit = query.limit as usize;
-    let paginated: Vec<Value> = matching.into_iter().skip(offset).take(limit).collect();
-
-    let docs = if let Some(ref fields) = query.fields {
-        paginated
-            .into_iter()
-            .map(|doc| project_fields(&doc, fields))
-            .collect()
-    } else {
-        paginated
-    };
+    let (docs, has_more, next_cursor) = paginate_materialized(matching, query, collection);
 
     Ok(QueryResult {
         docs,
@@ -598,7 +613,8 @@ fn execute_compound_range(
         docs_scanned,
         index_used: Some(index_name.to_string()),
         scan_strategy: Some("compound_range".to_string()),
-        has_more: false,
+        has_more,
+        next_cursor,
     })
 }
 
@@ -629,6 +645,7 @@ fn execute_bitmap_scan(
             index_used: None,
             scan_strategy: Some("bitmap".to_string()),
             has_more: false,
+            next_cursor: None,
         });
     }
 
@@ -648,7 +665,7 @@ fn execute_bitmap_scan(
     }
 
     // Apply residual post-filter if any
-    let mut matching = if let Some(ref residual) = bitmap_result.residual_filter {
+    let matching: Vec<Value> = if let Some(ref residual) = bitmap_result.residual_filter {
         loaded_docs
             .into_iter()
             .filter(|doc| residual.matches(doc))
@@ -667,25 +684,11 @@ fn execute_bitmap_scan(
             index_used: None,
             scan_strategy: Some("bitmap".to_string()),
             has_more: false,
+            next_cursor: None,
         });
     }
 
-    if !query.sort.is_empty() {
-        sort_documents(&mut matching, &query.sort);
-    }
-
-    let offset = query.offset as usize;
-    let limit = query.limit as usize;
-    let paginated: Vec<Value> = matching.into_iter().skip(offset).take(limit).collect();
-
-    let docs = if let Some(ref fields) = query.fields {
-        paginated
-            .into_iter()
-            .map(|doc| project_fields(&doc, fields))
-            .collect()
-    } else {
-        paginated
-    };
+    let (docs, has_more, next_cursor) = paginate_materialized(matching, query, collection);
 
     Ok(QueryResult {
         docs,
@@ -693,7 +696,8 @@ fn execute_bitmap_scan(
         docs_scanned,
         index_used: None,
         scan_strategy: Some("bitmap".to_string()),
-        has_more: false,
+        has_more,
+        next_cursor,
     })
 }
 

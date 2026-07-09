@@ -7,6 +7,7 @@ use crate::index::IndexManager;
 use crate::index::secondary::value_to_sortable_bytes;
 
 use super::filter::{FilterNode, FilterOp};
+use super::parser::ParsedQuery;
 use super::sort::SortField;
 
 /// What scan strategy to use for a query.
@@ -80,15 +81,16 @@ pub struct QueryPlan {
 
 /// Plan the best scan strategy for a filter, given available indexes.
 pub fn plan_query(
-    filter: &Option<FilterNode>,
+    query: &ParsedQuery,
     index_manager: &IndexManager,
     collection: &str,
-    sort: &[SortField],
-    limit: u64,
-    count_only: bool,
     scan_accelerator: &ScanAccelerator,
 ) -> QueryPlan {
-    let Some(filter) = filter else {
+    let sort = &query.sort;
+    let limit = query.limit;
+    let count_only = query.count_only;
+
+    let Some(filter) = &query.filter else {
         return QueryPlan {
             scan: ScanPlan::FullScan,
             post_filter: None,
@@ -97,10 +99,13 @@ pub fn plan_query(
     };
 
     // Try IndexSorted first (highest priority — enables early termination)
-    // Only when: has sort, finite limit, not count_only
+    // Only when: has sort, finite limit, not count_only.
+    // Cursored queries are excluded for now: they are served correctly by the
+    // materializing strategies' cursor layer; the index seek path lands next.
     if !sort.is_empty()
         && limit < u64::MAX
         && !count_only
+        && query.cursor.is_none()
         && let Some(plan) = try_index_sorted(index_manager, collection, filter, sort)
     {
         return plan;
