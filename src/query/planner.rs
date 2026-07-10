@@ -80,6 +80,26 @@ pub enum ScanPlan {
     BitmapScan { bitmap: roaring::RoaringBitmap },
 }
 
+impl ScanPlan {
+    /// The `scan_strategy` label for this plan. Exhaustive on purpose — a
+    /// new variant must pick its wire label here at compile time (scattered
+    /// literals plus wildcard matches are how labels silently went stale
+    /// before, T8/S3-9). Call sites still decide Some vs None: doc-returning
+    /// full scans and plain index scans deliberately report no strategy.
+    pub fn name(&self) -> &'static str {
+        match self {
+            ScanPlan::FullScan => "full_scan",
+            ScanPlan::IndexEq { .. } => "index_eq",
+            ScanPlan::IndexIn { .. } => "index_in",
+            ScanPlan::IndexRange { .. } => "index_range",
+            ScanPlan::CompoundEq { .. } => "compound_eq",
+            ScanPlan::CompoundRange { .. } => "compound_range",
+            ScanPlan::IndexSorted { .. } => "index_sorted",
+            ScanPlan::BitmapScan { .. } => "bitmap",
+        }
+    }
+}
+
 /// The result of planning: a scan strategy + optional residual filter.
 pub struct QueryPlan {
     pub scan: ScanPlan,

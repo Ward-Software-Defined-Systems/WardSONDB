@@ -153,7 +153,7 @@ fn execute_full_scan(
             total_count: Some(total_count),
             docs_scanned,
             index_used: None,
-            scan_strategy: Some("full_scan".to_string()),
+            scan_strategy: Some(plan.scan.name().to_string()),
             has_more: false,
             next_cursor: None,
         });
@@ -326,7 +326,7 @@ fn execute_index_scan(
                     total_count: Some(count),
                     docs_scanned: 0,
                     index_used: Some(index_name.clone()),
-                    scan_strategy: Some("index_eq".to_string()),
+                    scan_strategy: Some(plan.scan.name().to_string()),
                     has_more: false,
                     next_cursor: None,
                 });
@@ -373,7 +373,7 @@ fn execute_index_scan(
                         total_count: Some(total),
                         docs_scanned: 0,
                         index_used: Some(index_name.clone()),
-                        scan_strategy: Some("index_in".to_string()),
+                        scan_strategy: Some(plan.scan.name().to_string()),
                         has_more: false,
                         next_cursor: None,
                     });
@@ -408,7 +408,7 @@ fn execute_index_scan(
                         total_count: Some(count),
                         docs_scanned: 0,
                         index_used: Some(index_name.clone()),
-                        scan_strategy: Some("index_range".to_string()),
+                        scan_strategy: Some(plan.scan.name().to_string()),
                         has_more: false,
                         next_cursor: None,
                     });
@@ -440,7 +440,7 @@ fn execute_index_scan(
                     total_count: Some(count),
                     docs_scanned: 0,
                     index_used: Some(index_name.clone()),
-                    scan_strategy: Some("compound_eq".to_string()),
+                    scan_strategy: Some(plan.scan.name().to_string()),
                     has_more: false,
                     next_cursor: None,
                 });
@@ -516,19 +516,12 @@ fn execute_index_scan(
     if query.count_only {
         // The materialized count (post-filter present, or a fast path that
         // didn't apply) — label it with the strategy that produced it.
-        let strategy = match &plan.scan {
-            ScanPlan::IndexEq { .. } => "index_eq",
-            ScanPlan::IndexIn { .. } => "index_in",
-            ScanPlan::IndexRange { .. } => "index_range",
-            ScanPlan::CompoundEq { .. } => "compound_eq",
-            _ => unreachable!(),
-        };
         return Ok(QueryResult {
             docs: vec![],
             total_count: Some(total_count),
             docs_scanned,
             index_used: Some(index_name),
-            scan_strategy: Some(strategy.to_string()),
+            scan_strategy: Some(plan.scan.name().to_string()),
             has_more: false,
             next_cursor: None,
         });
@@ -712,7 +705,7 @@ fn execute_index_sorted(
         total_count: None, // Unknown with early termination
         docs_scanned,
         index_used: Some(index_name.to_string()),
-        scan_strategy: Some("index_sorted".to_string()),
+        scan_strategy: Some(plan.scan.name().to_string()),
         has_more,
         next_cursor,
     })
@@ -761,7 +754,7 @@ fn execute_compound_range(
                 total_count: Some(0),
                 docs_scanned: 0,
                 index_used: Some(index_name.to_string()),
-                scan_strategy: Some("compound_range".to_string()),
+                scan_strategy: Some(plan.scan.name().to_string()),
                 has_more: false,
                 next_cursor: None,
             });
@@ -779,7 +772,7 @@ fn execute_compound_range(
             total_count: Some(count),
             docs_scanned: 0,
             index_used: Some(index_name.to_string()),
-            scan_strategy: Some("compound_range".to_string()),
+            scan_strategy: Some(plan.scan.name().to_string()),
             has_more: false,
             next_cursor: None,
         });
@@ -809,7 +802,7 @@ fn execute_compound_range(
             total_count: Some(total),
             docs_scanned,
             index_used: Some(index_name.to_string()),
-            scan_strategy: Some("compound_range".to_string()),
+            scan_strategy: Some(plan.scan.name().to_string()),
             has_more,
             next_cursor: None,
         });
@@ -846,7 +839,7 @@ fn execute_compound_range(
             total_count: Some(total_count),
             docs_scanned,
             index_used: Some(index_name.to_string()),
-            scan_strategy: Some("compound_range".to_string()),
+            scan_strategy: Some(plan.scan.name().to_string()),
             has_more: false,
             next_cursor: None,
         });
@@ -859,7 +852,7 @@ fn execute_compound_range(
         total_count: Some(total_count),
         docs_scanned,
         index_used: Some(index_name.to_string()),
-        scan_strategy: Some("compound_range".to_string()),
+        scan_strategy: Some(plan.scan.name().to_string()),
         has_more,
         next_cursor,
     })
@@ -888,7 +881,7 @@ fn execute_bitmap_scan(
             total_count: Some(bitmap.len()),
             docs_scanned: 0,
             index_used: None,
-            scan_strategy: Some("bitmap".to_string()),
+            scan_strategy: Some(plan.scan.name().to_string()),
             has_more: false,
             next_cursor: None,
         });
@@ -931,7 +924,7 @@ fn execute_bitmap_scan(
             total_count: Some(total),
             docs_scanned,
             index_used: None,
-            scan_strategy: Some("bitmap".to_string()),
+            scan_strategy: Some(plan.scan.name().to_string()),
             has_more,
             next_cursor: None,
         });
@@ -978,7 +971,7 @@ fn execute_bitmap_scan(
             total_count: Some(total_count),
             docs_scanned,
             index_used: None,
-            scan_strategy: Some("bitmap".to_string()),
+            scan_strategy: Some(plan.scan.name().to_string()),
             has_more: false,
             next_cursor: None,
         });
@@ -991,7 +984,7 @@ fn execute_bitmap_scan(
         total_count: Some(total_count),
         docs_scanned,
         index_used: None,
-        scan_strategy: Some("bitmap".to_string()),
+        scan_strategy: Some(plan.scan.name().to_string()),
         has_more,
         next_cursor,
     })
