@@ -5028,6 +5028,64 @@ async fn test_aggregate_sort_array_form_respects_written_order() {
     assert_eq!(tags, vec!["b", "d", "c", "a"]);
 }
 
+/// DT-11: `$sort: []` (array form) is an accepted no-op stage — 200, and the
+/// document order is identical to the same pipeline without the stage.
+#[tokio::test]
+async fn test_aggregate_sort_empty_array_noop() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "orders"}))
+        .send()
+        .await
+        .unwrap();
+
+    let docs = json!({
+        "documents": [
+            {"tag": "a", "n": 3},
+            {"tag": "b", "n": 1},
+            {"tag": "c", "n": 2},
+        ]
+    });
+    client
+        .post(format!("{base_url}/orders/docs/_bulk"))
+        .json(&docs)
+        .send()
+        .await
+        .unwrap();
+
+    let tags_for = |pipeline: Value| {
+        let client = client.clone();
+        let url = format!("{base_url}/orders/aggregate");
+        async move {
+            let resp = client
+                .post(url)
+                .json(&json!({"pipeline": pipeline}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            let body: Value = resp.json().await.unwrap();
+            body["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d["tag"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        }
+    };
+
+    // Empty pipelines are rejected outright, so anchor both runs on a
+    // match-all stage; the only difference is the no-op $sort.
+    let baseline = tags_for(json!([{"$match": {}}])).await;
+    let with_noop_sort = tags_for(json!([{"$match": {}}, {"$sort": []}])).await;
+
+    assert_eq!(baseline.len(), 3);
+    assert_eq!(with_noop_sort, baseline);
+}
+
 /// A-2: multi-key flat $sort object is ambiguous (JSON key order lost) → 400.
 #[tokio::test]
 async fn test_aggregate_sort_multi_key_object_rejected() {
