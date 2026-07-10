@@ -233,7 +233,7 @@ impl IndexManager {
         collection: &str,
         doc_id: &str,
         doc: &Value,
-    ) {
+    ) -> Result<(), AppError> {
         let indexes = self.indexes.read();
         for ((col, _), entry) in indexes.iter() {
             if col != collection {
@@ -248,13 +248,14 @@ impl IndexManager {
                     .collect();
                 if values.len() == entry.def.fields.len() {
                     let key = make_compound_index_key(&values, doc_id);
-                    batch.insert(&entry.partition, &key, b"");
+                    batch.insert(&entry.partition, &key, b"")?;
                 }
             } else if let Some(field_val) = resolve_json_path(doc, &entry.def.fields[0]) {
                 let key = make_index_key(field_val, doc_id);
-                batch.insert(&entry.partition, &key, b"");
+                batch.insert(&entry.partition, &key, b"")?;
             }
         }
+        Ok(())
     }
 
     /// Stage index removes for a document being deleted/updated into the given batch.
@@ -264,7 +265,7 @@ impl IndexManager {
         collection: &str,
         doc_id: &str,
         doc: &Value,
-    ) {
+    ) -> Result<(), AppError> {
         let indexes = self.indexes.read();
         for ((col, _), entry) in indexes.iter() {
             if col != collection {
@@ -279,13 +280,14 @@ impl IndexManager {
                     .collect();
                 if values.len() == entry.def.fields.len() {
                     let key = make_compound_index_key(&values, doc_id);
-                    batch.remove(&entry.partition, &key);
+                    batch.remove(&entry.partition, &key)?;
                 }
             } else if let Some(field_val) = resolve_json_path(doc, &entry.def.fields[0]) {
                 let key = make_index_key(field_val, doc_id);
-                batch.remove(&entry.partition, &key);
+                batch.remove(&entry.partition, &key)?;
             }
         }
+        Ok(())
     }
 
     /// Equality lookup: get all doc IDs where field == value.

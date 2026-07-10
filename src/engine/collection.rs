@@ -38,7 +38,7 @@ impl Storage {
         let meta_bytes = serde_json::to_vec(&meta)?;
 
         let mut batch = self.write_batch();
-        batch.insert(&self.meta, meta_key.as_bytes(), &meta_bytes);
+        batch.insert(&self.meta, meta_key.as_bytes(), &meta_bytes)?;
         // Seed before the collection becomes visible: initialize() overwrites,
         // so seeding after commit could stomp a counter a racing insert already
         // upserted. Pre-commit nothing can observe the collection, and a stale
@@ -130,7 +130,7 @@ impl Storage {
         let mut batch = self.write_batch();
 
         for key in &keys {
-            batch.remove(&docs_partition, key);
+            batch.remove(&docs_partition, key)?;
         }
 
         for idx_def in &index_defs {
@@ -142,14 +142,14 @@ impl Storage {
                     .filter_map(|kv| kv.ok().map(|(k, _)| k))
                     .collect();
                 for key in &idx_keys {
-                    batch.remove(&idx_partition, key);
+                    batch.remove(&idx_partition, key)?;
                 }
             }
             let idx_meta_key = format!("index:{}:{}", name, idx_def.name);
-            batch.remove(&self.meta, idx_meta_key.as_bytes());
+            batch.remove(&self.meta, idx_meta_key.as_bytes())?;
         }
 
-        batch.remove(&self.meta, meta_key.as_bytes());
+        batch.remove(&self.meta, meta_key.as_bytes())?;
         self.commit_batch(batch)?;
 
         for idx_def in &index_defs {

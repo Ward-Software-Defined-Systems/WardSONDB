@@ -95,29 +95,53 @@ pub enum WriteBatchWrapper {
 }
 
 impl WriteBatchWrapper {
-    pub fn insert(&mut self, partition: &PartitionId, key: &[u8], value: &[u8]) {
+    // Both failure arms are unreachable today (nothing drops a CF, one engine
+    // per process) — surfaced as BackendError rather than a mid-batch abort so
+    // an eventual violation fails the request, not the process.
+    pub fn insert(
+        &mut self,
+        partition: &PartitionId,
+        key: &[u8],
+        value: &[u8],
+    ) -> BackendResult<()> {
         match (self, partition) {
             (WriteBatchWrapper::Fjall(batch), PartitionId::Fjall(handle)) => {
                 batch.insert(handle.inner(), key, value);
+                Ok(())
             }
             (WriteBatchWrapper::RocksDb { batch, db }, PartitionId::RocksDb { cf_name, .. }) => {
-                let cf = db.cf_handle(cf_name).expect("CF must exist at insert time");
+                let cf = db.cf_handle(cf_name).ok_or_else(|| {
+                    BackendError::Internal(format!(
+                        "column family '{cf_name}' missing at batch insert"
+                    ))
+                })?;
                 batch.put_cf(&cf, key, value);
+                Ok(())
             }
-            _ => panic!("WriteBatchWrapper / PartitionId backend mismatch"),
+            _ => Err(BackendError::Internal(
+                "WriteBatchWrapper / PartitionId backend mismatch".to_string(),
+            )),
         }
     }
 
-    pub fn remove(&mut self, partition: &PartitionId, key: &[u8]) {
+    pub fn remove(&mut self, partition: &PartitionId, key: &[u8]) -> BackendResult<()> {
         match (self, partition) {
             (WriteBatchWrapper::Fjall(batch), PartitionId::Fjall(handle)) => {
                 batch.remove(handle.inner(), key);
+                Ok(())
             }
             (WriteBatchWrapper::RocksDb { batch, db }, PartitionId::RocksDb { cf_name, .. }) => {
-                let cf = db.cf_handle(cf_name).expect("CF must exist at remove time");
+                let cf = db.cf_handle(cf_name).ok_or_else(|| {
+                    BackendError::Internal(format!(
+                        "column family '{cf_name}' missing at batch remove"
+                    ))
+                })?;
                 batch.delete_cf(&cf, key);
+                Ok(())
             }
-            _ => panic!("WriteBatchWrapper / PartitionId backend mismatch"),
+            _ => Err(BackendError::Internal(
+                "WriteBatchWrapper / PartitionId backend mismatch".to_string(),
+            )),
         }
     }
 }

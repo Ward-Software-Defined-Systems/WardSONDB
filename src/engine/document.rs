@@ -86,9 +86,9 @@ impl Storage {
         }
 
         let mut batch = self.write_batch();
-        batch.insert(&docs_partition, id.as_bytes(), &bytes);
+        batch.insert(&docs_partition, id.as_bytes(), &bytes)?;
         self.index_manager
-            .add_index_entries_to_batch(&mut batch, collection, &id, &doc);
+            .add_index_entries_to_batch(&mut batch, collection, &id, &doc)?;
         self.commit_batch(batch)?;
 
         self.doc_counts.increment(collection, 1);
@@ -172,10 +172,10 @@ impl Storage {
             collection,
             id,
             &existing_doc,
-        );
-        batch.insert(&docs_partition, id.as_bytes(), &bytes);
+        )?;
+        batch.insert(&docs_partition, id.as_bytes(), &bytes)?;
         self.index_manager
-            .add_index_entries_to_batch(&mut batch, collection, id, &doc);
+            .add_index_entries_to_batch(&mut batch, collection, id, &doc)?;
         self.commit_batch(batch)?;
 
         self.scan_accelerator.on_update(id, &existing_doc, &doc);
@@ -211,8 +211,8 @@ impl Storage {
             collection,
             id,
             &existing_doc,
-        );
-        batch.remove(&docs_partition, id.as_bytes());
+        )?;
+        batch.remove(&docs_partition, id.as_bytes())?;
         self.commit_batch(batch)?;
 
         self.doc_counts.increment(collection, -1);
@@ -309,9 +309,9 @@ impl Storage {
         if !to_write.is_empty() {
             let mut batch = self.write_batch();
             for (id, bytes, doc) in &to_write {
-                batch.insert(&docs_partition, id.as_bytes(), bytes.as_slice());
+                batch.insert(&docs_partition, id.as_bytes(), bytes.as_slice())?;
                 self.index_manager
-                    .add_index_entries_to_batch(&mut batch, collection, id, doc);
+                    .add_index_entries_to_batch(&mut batch, collection, id, doc)?;
             }
             self.commit_batch(batch)?;
             self.doc_counts.increment(collection, inserted as i64);
@@ -360,8 +360,8 @@ impl Storage {
         for doc in &matching {
             if let Some(id) = doc.get("_id").and_then(|v| v.as_str()) {
                 self.index_manager
-                    .remove_index_entries_from_batch(&mut batch, collection, id, doc);
-                batch.remove(&docs_partition, id.as_bytes());
+                    .remove_index_entries_from_batch(&mut batch, collection, id, doc)?;
+                batch.remove(&docs_partition, id.as_bytes())?;
             }
         }
 
@@ -420,7 +420,7 @@ impl Storage {
             let old_rev = new_doc.get("_rev").and_then(|v| v.as_u64()).unwrap_or(0);
 
             self.index_manager
-                .remove_index_entries_from_batch(&mut batch, collection, &id, &old_doc);
+                .remove_index_entries_from_batch(&mut batch, collection, &id, &old_doc)?;
 
             if let Some(obj) = new_doc.as_object_mut() {
                 for (path, value) in &set_fields {
@@ -431,10 +431,10 @@ impl Storage {
             }
 
             let bytes = serde_json::to_vec(&new_doc)?;
-            batch.insert(&docs_partition, id.as_bytes(), bytes.as_slice());
+            batch.insert(&docs_partition, id.as_bytes(), bytes.as_slice())?;
 
             self.index_manager
-                .add_index_entries_to_batch(&mut batch, collection, &id, &new_doc);
+                .add_index_entries_to_batch(&mut batch, collection, &id, &new_doc)?;
 
             update_pairs.push((id, old_doc, new_doc));
         }
@@ -524,9 +524,9 @@ impl Storage {
         let meta_bytes = serde_json::to_vec(&def)?;
         let mut batch = self.write_batch();
         for key in &entries {
-            batch.insert(&partition, key.as_slice(), b"");
+            batch.insert(&partition, key.as_slice(), b"")?;
         }
-        batch.insert(&self.meta, meta_key.as_bytes(), &meta_bytes);
+        batch.insert(&self.meta, meta_key.as_bytes(), &meta_bytes)?;
         self.commit_batch(batch)?;
 
         // Register in cache
@@ -560,9 +560,9 @@ impl Storage {
 
         let mut batch = self.write_batch();
         for key in &keys {
-            batch.remove(&partition, key.as_slice());
+            batch.remove(&partition, key.as_slice())?;
         }
-        batch.remove(&self.meta, meta_key.as_bytes());
+        batch.remove(&self.meta, meta_key.as_bytes())?;
         self.commit_batch(batch)?;
 
         self.index_manager.unregister(collection, name);

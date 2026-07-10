@@ -33,7 +33,7 @@ impl Storage {
         let meta_key = format!("ttl:{collection}");
         let bytes = serde_json::to_vec(&config)?;
         let mut batch = self.write_batch();
-        batch.insert(&self.meta, meta_key.as_bytes(), &bytes);
+        batch.insert(&self.meta, meta_key.as_bytes(), &bytes)?;
         self.commit_batch(batch)?;
 
         Ok(config)
@@ -56,7 +56,7 @@ impl Storage {
         self.ensure_collection_exists(collection)?;
         let meta_key = format!("ttl:{collection}");
         let mut batch = self.write_batch();
-        batch.remove(&self.meta, meta_key.as_bytes());
+        batch.remove(&self.meta, meta_key.as_bytes())?;
         self.commit_batch(batch)?;
         Ok(())
     }
