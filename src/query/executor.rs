@@ -59,7 +59,7 @@ pub fn execute_query(
         | ScanPlan::CompoundEq { .. } => execute_index_scan(storage, collection, query, &plan),
         ScanPlan::IndexSorted { .. } => execute_index_sorted(storage, collection, query, &plan),
         ScanPlan::CompoundRange { .. } => execute_compound_range(storage, collection, query, &plan),
-        ScanPlan::BitmapScan => execute_bitmap_scan(storage, collection, query, &plan),
+        ScanPlan::BitmapScan { .. } => execute_bitmap_scan(storage, collection, query, &plan),
     }
 }
 
@@ -464,7 +464,7 @@ fn execute_index_scan(
         ScanPlan::FullScan
         | ScanPlan::IndexSorted { .. }
         | ScanPlan::CompoundRange { .. }
-        | ScanPlan::BitmapScan => unreachable!(),
+        | ScanPlan::BitmapScan { .. } => unreachable!(),
     };
 
     // Bare page: the page is exactly candidate_ids[offset..offset+limit] in
@@ -894,19 +894,17 @@ fn execute_bitmap_scan(
     query: &ParsedQuery,
     plan: &QueryPlan,
 ) -> Result<QueryResult, AppError> {
-    let filter = plan.original_filter.as_ref().unwrap();
-    let bitmap_result = match storage.scan_accelerator.bitmap_scan(filter) {
-        Some(r) => r,
-        None => {
-            // Fallback to full scan if bitmap scan fails at execution time
-            return execute_full_scan(storage, collection, query, plan);
-        }
+    // The plan carries the bitmap computed during planning (Roaring AND/OR
+    // over per-value bitmaps is not free — recomputing it here doubled that
+    // work) and its residual lives in plan.post_filter. Position resolution
+    // below tolerates staleness relative to concurrent writes the same way
+    // the old plan-then-recompute window did.
+    let ScanPlan::BitmapScan { bitmap } = &plan.scan else {
+        unreachable!()
     };
 
-    let bitmap = bitmap_result.bitmap;
-
     // count_only optimization — zero doc reads when no residual filter
-    if query.count_only && bitmap_result.residual_filter.is_none() {
+    if query.count_only && plan.post_filter.is_none() {
         return Ok(QueryResult {
             docs: vec![],
             total_count: Some(bitmap.len()),
@@ -923,12 +921,12 @@ fn execute_bitmap_scan(
     // +1 probe id so has_more stays exact even across transient holes.
     // total_count is the bitmap cardinality, matching the count fast path
     // above (same snapshot-gap semantic as the index windows).
-    if bare_page(query, &bitmap_result.residual_filter) {
+    if bare_page(query, &plan.post_filter) {
         let total = bitmap.len();
         let offset = query.offset as usize;
         let limit = query.limit as usize;
         let mut ids = storage.scan_accelerator.positions.resolve_window(
-            &bitmap,
+            bitmap,
             offset,
             limit.saturating_add(1),
         );
@@ -968,7 +966,7 @@ fn execute_bitmap_scan(
     let ids = storage
         .scan_accelerator
         .positions
-        .resolve_window(&bitmap, 0, usize::MAX);
+        .resolve_window(bitmap, 0, usize::MAX);
 
     // Load documents by id
     let docs_partition = storage.get_docs_partition(collection)?;
@@ -985,7 +983,7 @@ fn execute_bitmap_scan(
     }
 
     // Apply residual post-filter if any
-    let matching: Vec<Value> = if let Some(ref residual) = bitmap_result.residual_filter {
+    let matching: Vec<Value> = if let Some(ref residual) = plan.post_filter {
         loaded_docs
             .into_iter()
             .filter(|doc| residual.matches(doc))

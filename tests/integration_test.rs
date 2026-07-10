@@ -6891,6 +6891,28 @@ async fn test_count_only_scan_strategy_labels() {
     assert_eq!(n, 50);
     assert_eq!(strategy, "index_in");
 
+    // The doc-returning $in path must also yield no duplicates for
+    // duplicate values (ids dedup at the value level).
+    let resp = client
+        .post(format!("{base_url}/events/query"))
+        .json(&json!({
+            "filter": {"event_type": {"$in": ["firewall", "firewall", "dns"]}},
+            "limit": 100
+        }))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    let ids: Vec<&str> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 50);
+    let unique: std::collections::HashSet<&str> = ids.iter().copied().collect();
+    assert_eq!(unique.len(), 50, "duplicate docs in $in page");
+
     let (n, strategy) = count(json!({"seq": {"$gte": 50, "$lt": 75}})).await;
     assert_eq!(n, 25);
     assert_eq!(strategy, "index_range");

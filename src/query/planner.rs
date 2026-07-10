@@ -71,10 +71,13 @@ pub enum ScanPlan {
     },
 
     /// Bitmap scan — scan accelerator covers the filter (or part of it).
-    /// BitmapScan does NOT help with sort order — after getting bitmap results,
-    /// matching docs are loaded and sorted in memory. For queries with sort + limit
-    /// where a compound index exists, IndexSorted (higher priority) will be chosen instead.
-    BitmapScan,
+    /// Carries the matching-positions bitmap computed at plan time so the
+    /// executor doesn't recompute the same Roaring AND/OR set. BitmapScan
+    /// does NOT help with sort order — after getting bitmap results,
+    /// matching docs are loaded and sorted in memory. For queries with sort +
+    /// limit where a compound index exists, IndexSorted (higher priority)
+    /// will be chosen instead.
+    BitmapScan { bitmap: roaring::RoaringBitmap },
 }
 
 /// The result of planning: a scan strategy + optional residual filter.
@@ -644,7 +647,9 @@ fn try_bitmap_scan(scan_accelerator: &ScanAccelerator, filter: &FilterNode) -> O
     // Only use bitmap scan if the bitmap has a reasonable size (not empty)
     // or if it's a count_only query (where empty is a valid fast result)
     Some(QueryPlan {
-        scan: ScanPlan::BitmapScan,
+        scan: ScanPlan::BitmapScan {
+            bitmap: result.bitmap,
+        },
         post_filter: result.residual_filter,
         original_filter: Some(filter.clone()),
     })

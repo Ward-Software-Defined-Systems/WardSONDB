@@ -432,7 +432,12 @@ impl IndexManager {
         engine.count_range(&partition, &start, end).ok()
     }
 
-    /// $in: union of equality lookups.
+    /// $in: union of equality lookups over ONE resolved index handle (the
+    /// per-value lookup_eq re-took the index lock and re-cloned the handle).
+    /// Values dedup by encoded prefix — a doc contributes exactly one entry
+    /// per index, so duplicate ids can only come from duplicate
+    /// (equal-encoding) values; skipping those preserves the first-occurrence
+    /// output order without cloning every id into a seen-set.
     pub fn lookup_in(
         &self,
         engine: &Engine,
@@ -440,16 +445,28 @@ impl IndexManager {
         field: &str,
         values: &[Value],
     ) -> Option<Vec<String>> {
-        self.get_index_for_field(collection, field)?;
+        let (def, partition) = self.get_index_for_field(collection, field)?;
+        let separator = if def.is_compound() { 0x01 } else { 0x00 };
 
         let mut all_ids = Vec::new();
+        let mut seen_prefixes = std::collections::HashSet::new();
         for value in values {
-            if let Some(ids) = self.lookup_eq(engine, collection, field, value) {
-                all_ids.extend(ids);
+            let mut prefix = value_to_sortable_bytes(value);
+            prefix.push(separator);
+            if !seen_prefixes.insert(prefix.clone()) {
+                continue;
+            }
+            // Per-value error tolerance, as before: a failed lookup skips
+            // that value rather than failing the whole $in.
+            let Ok(iter) = engine.prefix_iterator(&partition, &prefix) else {
+                continue;
+            };
+            for (key, _) in iter.flatten() {
+                if let Some(id) = extract_doc_id_from_key(&key) {
+                    all_ids.push(id);
+                }
             }
         }
-        let mut seen = std::collections::HashSet::new();
-        all_ids.retain(|id| seen.insert(id.clone()));
         Some(all_ids)
     }
 }
