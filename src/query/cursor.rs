@@ -27,8 +27,10 @@ use crate::error::AppError;
 use super::filter::resolve_json_path;
 use super::sort::{SortField, compare_json_values, tiebreak_ascending};
 
-/// Inbound token length cap (base64 characters). Sort values are scalars in
-/// practice; anything larger than this is not a token we produced.
+/// Token length cap (base64 characters), enforced symmetrically: decode
+/// rejects longer inbound tokens, and encode omits rather than emit one
+/// (sort values are scalars in practice; anything larger than this is not a
+/// token we produced).
 pub const MAX_CURSOR_LEN: usize = 4096;
 
 /// One sort-key value captured in a cursor. `Missing` (field absent on the
@@ -59,8 +61,10 @@ struct CursorPayloadV1 {
 }
 
 /// Build the opaque token for the position of `doc` (the last document of a
-/// page, pre-projection). Returns `None` if the doc has no string `_id`,
-/// in which case the response simply omits `next_cursor`.
+/// page, pre-projection). Returns `None` — the response simply omits
+/// `next_cursor` — if the doc has no string `_id`, or if the token would
+/// exceed `MAX_CURSOR_LEN` and so be rejected by our own `decode_cursor` on
+/// replay (oversize sort values; `has_more` stays exact either way).
 pub fn encode_cursor(doc: &Value, sort_fields: &[SortField], collection: &str) -> Option<String> {
     let id = doc.get("_id")?.as_str()?.to_string();
     let s: Vec<Value> = sort_fields
@@ -77,7 +81,11 @@ pub fn encode_cursor(doc: &Value, sort_fields: &[SortField], collection: &str) -
         i: id,
     };
     let bytes = serde_json::to_vec(&payload).ok()?;
-    Some(URL_SAFE_NO_PAD.encode(bytes))
+    let token = URL_SAFE_NO_PAD.encode(bytes);
+    if token.len() > MAX_CURSOR_LEN {
+        return None;
+    }
+    Some(token)
 }
 
 /// Decode and validate a token against the request's collection + sort spec.
@@ -230,6 +238,21 @@ mod tests {
         // Oversize.
         let huge = "A".repeat(MAX_CURSOR_LEN + 1);
         assert!(decode_cursor(&huge, "products", &sort).is_err());
+    }
+
+    /// R3: encode never emits a token decode would reject; near-max legal
+    /// positions still roundtrip (DT-9).
+    #[test]
+    fn oversize_positions_omitted_at_encode() {
+        let sort = vec![sf("blob", true)];
+        let doc = json!({"_id": "d1", "blob": "y".repeat(5000)});
+        assert_eq!(encode_cursor(&doc, &sort, "c"), None);
+
+        let doc = json!({"_id": "d1", "blob": "y".repeat(2500)});
+        let token = encode_cursor(&doc, &sort, "c").expect("under-limit token must emit");
+        assert!(token.len() <= MAX_CURSOR_LEN);
+        let cursor = decode_cursor(&token, "c", &sort).unwrap();
+        assert_eq!(cursor.last_id, "d1");
     }
 
     #[test]

@@ -8295,3 +8295,74 @@ async fn test_compound_range_mixed_types_matches_full_scan() {
         }
     }
 }
+
+/// DT-9/R3: long-but-legal sort values roundtrip through a full cursor walk;
+/// oversize values omit `next_cursor` at emission instead of handing the
+/// client a token the server itself rejects on replay (pre-fix: the emitted
+/// cursor 400'd, making page 2 unreachable).
+#[tokio::test]
+async fn test_cursor_size_guard_long_sort_values() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    // ~2 KiB sort values: cursors stay under MAX_CURSOR_LEN and a paged walk
+    // must concatenate to the one-shot reference.
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "longsort"}))
+        .send()
+        .await
+        .unwrap();
+    let docs: Vec<Value> = (0..8)
+        .map(|i| json!({"_id": format!("L{i}"), "val": format!("{}{i:02}", "x".repeat(2000))}))
+        .collect();
+    let resp = client
+        .post(format!("{base_url}/longsort/docs/_bulk"))
+        .json(&json!({"documents": docs}))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+
+    let body = json!({"sort": [{"val": "asc"}], "limit": 3});
+    let walked = cursor_walk(&client, &base_url, "longsort", body.clone()).await;
+    assert_eq!(walked.len(), 8, "no docs dropped on long-value walk");
+    assert_eq!(
+        ids_of(&walked),
+        reference_ids(&client, &base_url, "longsort", body).await
+    );
+
+    // ~5 KiB sort values: the page still succeeds with exact has_more, but
+    // next_cursor is omitted (the token would exceed the decode cap).
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "hugesort"}))
+        .send()
+        .await
+        .unwrap();
+    let docs: Vec<Value> = (0..6)
+        .map(|i| json!({"_id": format!("H{i}"), "val": format!("{}{i:02}", "y".repeat(5000))}))
+        .collect();
+    let resp = client
+        .post(format!("{base_url}/hugesort/docs/_bulk"))
+        .json(&json!({"documents": docs}))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+
+    let resp = client
+        .post(format!("{base_url}/hugesort/query"))
+        .json(&json!({"sort": [{"val": "asc"}], "limit": 2}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["data"].as_array().unwrap().len(), 2);
+    assert_eq!(body["meta"]["has_more"], true, "has_more stays exact");
+    assert!(
+        body["meta"]["next_cursor"].is_null(),
+        "oversize boundary value must omit next_cursor"
+    );
+}
