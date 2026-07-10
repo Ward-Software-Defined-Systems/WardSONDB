@@ -338,6 +338,134 @@ fn bench_scan_all(c: &mut Criterion) {
     group.finish();
 }
 
+// DT-8: pins the reverse-bounded IndexSorted page walk (2169c82). The one-time
+// strategy assertion guards against the planner silently degrading this to an
+// in-memory sort — query_with_sort_10k sorts on a non-indexed field and never
+// exercised this path.
+fn bench_index_sorted_desc_page(c: &mut Criterion) {
+    let mut group = c.benchmark_group("index_sorted_desc_page");
+    group.sample_size(10);
+
+    let (storage, _tmp) = setup_storage_with_docs(100_000);
+    storage
+        .create_index(
+            "events",
+            "idx_type_time",
+            &["event_type".into(), "received_at".into()],
+        )
+        .unwrap();
+
+    let make_query = || {
+        parse_query(
+            QueryRequest {
+                filter: Some(json!({"event_type": "firewall"})),
+                sort: Some(json!([{"received_at": "desc"}])),
+                limit: Some(20),
+                offset: Some(0),
+                fields: None,
+                count_only: None,
+                cursor: None,
+            },
+            100_000,
+            "events",
+        )
+        .unwrap()
+    };
+
+    let probe = execute_query(&storage, "events", &make_query()).unwrap();
+    assert_eq!(
+        probe.scan_strategy.as_deref(),
+        Some("index_sorted"),
+        "bench must exercise the IndexSorted path"
+    );
+
+    group.bench_function("desc_limit_20", |b| {
+        b.iter(|| {
+            let query = make_query();
+            execute_query(&storage, "events", &query).unwrap();
+        });
+    });
+
+    group.finish();
+}
+
+// Brackets the $regex execution cost on a full scan (one compile per document
+// today vs one per query once compiled at parse time).
+fn bench_regex_scan(c: &mut Criterion) {
+    let mut group = c.benchmark_group("regex_scan");
+    group.sample_size(10);
+
+    let (storage, _tmp) = setup_storage_with_docs(10_000);
+
+    group.bench_function("full_scan_10k", |b| {
+        b.iter(|| {
+            let query = parse_query(
+                QueryRequest {
+                    filter: Some(json!({"message": {"$regex": "^Event number 1[0-9]{3}$"}})),
+                    sort: None,
+                    limit: Some(50),
+                    offset: Some(0),
+                    fields: None,
+                    count_only: None,
+                    cursor: None,
+                },
+                100_000,
+                "events",
+            )
+            .unwrap();
+            execute_query(&storage, "events", &query).unwrap();
+        });
+    });
+
+    group.finish();
+}
+
+// Brackets the page-window load on index scans: an eq filter matching ~50k of
+// 250k docs with limit 10 loads every candidate document today; with windowed
+// loading it should fetch only the page.
+fn bench_index_eq_page(c: &mut Criterion) {
+    let mut group = c.benchmark_group("index_eq_page");
+    group.sample_size(10);
+
+    let (storage, _tmp) = setup_storage_with_docs(250_000);
+    storage
+        .create_index("events", "idx_event_type", &["event_type".into()])
+        .unwrap();
+
+    let make_query = || {
+        parse_query(
+            QueryRequest {
+                filter: Some(json!({"event_type": "firewall"})),
+                sort: None,
+                limit: Some(10),
+                offset: Some(0),
+                fields: None,
+                count_only: None,
+                cursor: None,
+            },
+            100_000,
+            "events",
+        )
+        .unwrap()
+    };
+
+    let probe = execute_query(&storage, "events", &make_query()).unwrap();
+    assert_eq!(
+        probe.index_used.as_deref(),
+        Some("idx_event_type"),
+        "bench must run through the single-field index"
+    );
+
+    group.bench_function("limit_10_of_50k", |b| {
+        b.iter(|| {
+            let query = make_query();
+            execute_query(&storage, "events", &query).unwrap();
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_single_insert,
@@ -346,5 +474,8 @@ criterion_group!(
     bench_query_10k,
     bench_query_100k,
     bench_scan_all,
+    bench_index_sorted_desc_page,
+    bench_regex_scan,
+    bench_index_eq_page,
 );
 criterion_main!(benches);
