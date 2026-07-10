@@ -416,8 +416,10 @@ WardSONDB is designed for trusted network environments. Below are security consi
 - [x] Compound range scans — equality prefix + range suffix on compound indexes *(Alpha)*
 - [x] Bitmap planner priority — prefer bitmap over secondary index for count_only queries on bitmap-enabled fields
 - [x] Bitmap-accelerated aggregation — aggregate executor reads bitmap counts directly (zero doc reads)
+- [x] Cursor pagination — opaque `next_cursor` keyset tokens for gap-free walks (see API.md)
+- [x] Windowed page loads — index/bitmap scans with no residual filter/sort fetch only the requested `offset`/`limit` window
 - [ ] RSS memory optimization — investigate RocksDB/fjall mmap behaviour at scale
-- [ ] Streaming/cursors — large result sets beyond limit/offset
+- [ ] Streaming (NDJSON) — push large result sets over one response (cursors are the building block)
 - [ ] Query explain — show scan strategy and index usage
 - [ ] Schema validation — optional JSON Schema on collections
 - [ ] Performance profiling on Linux and Windows — current benchmarks are macOS only (Apple Silicon)

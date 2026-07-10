@@ -794,7 +794,7 @@ Return only specific fields (always includes `_id`):
 
 ### Cursor Pagination
 
-For walking large result sets, prefer cursors over `offset` — offset pagination re-scans and discards all skipped documents on every page, while a cursor resumes from the previous position.
+For walking large result sets, prefer cursors over `offset` — offset pagination re-walks all skipped index entries on every page (and, on paths with a post-filter or sort, re-loads the skipped documents too), while a cursor resumes directly from the previous position. Bare index/bitmap pages skip at the id level (see **Windowed pages** below), which softens but doesn't remove the cost of deep offsets.
 
 When a query has more matching documents than `limit`, the response includes an opaque token in `meta.next_cursor` (alongside `meta.has_more: true`). Echo it back in the `cursor` field of the next request, keeping the same collection, filter, and sort:
 
@@ -1724,7 +1724,7 @@ These values are reported in the `GET /_stats` response under `memory_config`. I
 
 | Feature | Endpoint / Config | Priority | Notes |
 |---------|-------------------|----------|-------|
-| Streaming/cursors | TBD | Medium | Large result sets beyond limit/offset |
+| Streaming (NDJSON) | TBD | Medium | Push large result sets over one response; cursor pagination (shipped — see **Cursor Pagination**) is the building block |
 | Query explain | `POST /{collection}/query?explain` | Medium | Show scan strategy and index usage |
 | Schema validation | `PUT /{collection}/schema` | Lower | Optional JSON Schema on inserts/updates |
 
