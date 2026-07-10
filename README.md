@@ -5,7 +5,7 @@
 # WardSONDB
 
 > [!WARNING]
-> **This branch (`code-review`) is under active RAD iteration and is currently untested beyond its own CI suite.** Changes here have not been validated against production workloads and may land in rapid succession without release notes. Do not deploy from this branch — use `main` until this work is merged.
+> **This branch (`code-review`) is under active RAD iteration and is currently untested beyond its own CI suite.** Changes here have not been validated against production workloads and may land in rapid succession; behavior changes are tracked in [CHANGELOG.md](CHANGELOG.md). Do not deploy from this branch — use `main` until this work is merged.
 
 A lightweight, high-performance JSON document database built in Rust. Designed for SIEM and security event workloads — fast ingest, indexed queries, aggregation pipelines, and automatic data retention in a single binary.
 
