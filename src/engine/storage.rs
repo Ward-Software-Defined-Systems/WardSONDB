@@ -66,10 +66,21 @@ impl DocCounters {
     }
 
     pub fn increment(&self, collection: &str, delta: i64) {
-        let map = self.counts.read();
-        if let Some(counter) = map.get(collection) {
-            counter.fetch_add(delta, Ordering::Relaxed);
+        {
+            let map = self.counts.read();
+            if let Some(counter) = map.get(collection) {
+                counter.fetch_add(delta, Ordering::Relaxed);
+                return;
+            }
         }
+        // Unseeded counter (a write racing collection creation, or any path
+        // the startup seed missed): dropping the delta would undercount
+        // forever — count_only serves straight from these counters.
+        self.counts
+            .write()
+            .entry(collection.to_string())
+            .or_insert_with(|| AtomicI64::new(0))
+            .fetch_add(delta, Ordering::Relaxed);
     }
 
     pub fn get(&self, collection: &str) -> i64 {
@@ -275,4 +286,29 @@ fn write_engine_marker(data_dir: &Path, engine_name: &str) -> Result<(), AppErro
     }
     std::fs::write(&marker, engine_name)
         .map_err(|e| AppError::Internal(format!("Failed to write engine marker: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn doc_counters_upsert_on_unseeded_increment() {
+        let counters = DocCounters::new();
+        counters.increment("logs", 1); // no initialize — must not be dropped
+        counters.increment("logs", 1);
+        assert_eq!(counters.get("logs"), 2);
+    }
+
+    #[test]
+    fn doc_counters_initialize_overrides_and_remove_clears() {
+        let counters = DocCounters::new();
+        counters.increment("logs", 5);
+        counters.initialize("logs", 100); // startup seeding is authoritative
+        assert_eq!(counters.get("logs"), 100);
+        counters.increment("logs", -1);
+        assert_eq!(counters.get("logs"), 99);
+        counters.remove("logs");
+        assert_eq!(counters.get("logs"), 0);
+    }
 }

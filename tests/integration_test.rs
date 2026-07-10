@@ -6723,3 +6723,38 @@ async fn test_request_body_limit() {
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["error"]["code"], "DOCUMENT_TOO_LARGE");
 }
+
+/// A doc inserted immediately after collection creation must be counted:
+/// the counter is seeded before the create commits (and increments upsert
+/// on miss), so no write can land in an unseeded window and vanish from
+/// the authoritative count_only path.
+#[tokio::test]
+async fn test_count_after_create_insert_immediately() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "fresh"}))
+        .send()
+        .await
+        .unwrap();
+
+    client
+        .post(format!("{base_url}/fresh/docs"))
+        .json(&json!({"kind": "first"}))
+        .send()
+        .await
+        .unwrap();
+
+    let resp = client
+        .post(format!("{base_url}/fresh/query"))
+        .json(&json!({"count_only": true}))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    assert!(body["ok"].as_bool().unwrap());
+    assert_eq!(body["data"]["count"], 1);
+    assert_eq!(body["meta"]["scan_strategy"], "doc_counter");
+}

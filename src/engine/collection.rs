@@ -39,11 +39,15 @@ impl Storage {
 
         let mut batch = self.write_batch();
         batch.insert(&self.meta, meta_key.as_bytes(), &meta_bytes);
+        // Seed before the collection becomes visible: initialize() overwrites,
+        // so seeding after commit could stomp a counter a racing insert already
+        // upserted. Pre-commit nothing can observe the collection, and a stale
+        // zero from a failed commit is unreadable (collection_exists gates
+        // every read/write path).
+        self.doc_counts.initialize(name, 0);
         self.commit_batch(batch)?;
 
         self.persist()?;
-
-        self.doc_counts.initialize(name, 0);
 
         if self.scan_accelerator.has_columns() {
             self.scan_accelerator.set_ready(true);
