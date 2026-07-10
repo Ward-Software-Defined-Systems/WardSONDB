@@ -6758,3 +6758,73 @@ async fn test_count_after_create_insert_immediately() {
     assert_eq!(body["data"]["count"], 1);
     assert_eq!(body["meta"]["scan_strategy"], "doc_counter");
 }
+
+/// An offset near u64::MAX must not overflow the IndexSorted page probe
+/// (offset + limit + 1 previously wrapped in release / panicked in debug,
+/// silently truncating the backend read) — it must behave like any offset
+/// past the end of the match set: 200, empty page, no more results.
+#[tokio::test]
+async fn test_giant_offset_no_overflow() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "events"}))
+        .send()
+        .await
+        .unwrap();
+
+    let docs: Vec<Value> = (0..10)
+        .map(|i| {
+            json!({
+                "event_type": "firewall",
+                "received_at": format!("2026-07-09T00:00:{i:02}Z")
+            })
+        })
+        .collect();
+    client
+        .post(format!("{base_url}/events/docs/_bulk"))
+        .json(&json!({"documents": docs}))
+        .send()
+        .await
+        .unwrap();
+
+    client
+        .post(format!("{base_url}/events/indexes"))
+        .json(&json!({"name": "idx_type_time", "fields": ["event_type", "received_at"]}))
+        .send()
+        .await
+        .unwrap();
+
+    // Sanity: this query shape plans index_sorted — the site that overflowed.
+    let resp = client
+        .post(format!("{base_url}/events/query"))
+        .json(&json!({
+            "filter": {"event_type": "firewall"},
+            "sort": [{"received_at": "desc"}],
+            "limit": 5
+        }))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["meta"]["scan_strategy"], "index_sorted");
+
+    let resp = client
+        .post(format!("{base_url}/events/query"))
+        .json(&json!({
+            "filter": {"event_type": "firewall"},
+            "sort": [{"received_at": "desc"}],
+            "limit": 5,
+            "offset": 18446744073709551615u64
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert!(body["ok"].as_bool().unwrap());
+    assert_eq!(body["data"].as_array().unwrap().len(), 0);
+    assert_ne!(body["meta"]["has_more"], json!(true));
+}

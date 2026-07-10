@@ -566,8 +566,13 @@ fn execute_index_sorted(
     // filtered away. An index entry whose doc vanished between iterator
     // creation and the `get` consumes a slot and could understate has_more,
     // but doc + index entries are deleted in one atomic batch, so the window
-    // is only the snapshot gap.
-    let max_results = plan.post_filter.is_none().then_some(offset + limit + 1);
+    // is only the snapshot gap. offset is unclamped user input — saturate
+    // (usize::MAX degrades to an unbounded read, which is the correct
+    // semantic for an offset past the end).
+    let max_results = plan
+        .post_filter
+        .is_none()
+        .then_some(offset.saturating_add(limit).saturating_add(1));
 
     let iter = if reverse {
         storage
