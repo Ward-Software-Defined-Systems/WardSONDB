@@ -146,15 +146,24 @@ pub async fn get_storage_info(
     State(state): State<Arc<AppState>>,
     Path(collection): Path<String>,
 ) -> Result<Json<ApiResponse>, AppError> {
-    let info = state.storage.get_collection_info(&collection)?;
-    let ttl = state.storage.get_ttl(&collection)?;
+    // Meta gets + first/last-key probes are KV work — keep them off the async
+    // workers under the read-path timeout, like the other KV read handlers.
+    let timeout_secs = state.config.query_timeout;
+    let st = state.clone();
+    let (info, ttl, oldest_doc, newest_doc) =
+        super::query::with_query_timeout(timeout_secs, move || {
+            let info = st.storage.get_collection_info(&collection)?;
+            let ttl = st.storage.get_ttl(&collection)?;
 
-    // Get oldest/newest doc timestamps from first/last UUIDv7 keys
-    // doc_count guard in get_doc_time_range prevents hang on empty partitions
-    let (oldest_doc, newest_doc) = state
-        .storage
-        .get_doc_time_range(&collection)
-        .unwrap_or((None, None));
+            // Get oldest/newest doc timestamps from first/last UUIDv7 keys
+            // doc_count guard in get_doc_time_range prevents hang on empty partitions
+            let (oldest_doc, newest_doc) = st
+                .storage
+                .get_doc_time_range(&collection)
+                .unwrap_or((None, None));
+            Ok((info, ttl, oldest_doc, newest_doc))
+        })
+        .await?;
 
     let mut data = serde_json::json!({
         "name": info.name,
