@@ -150,7 +150,7 @@ fn execute_full_scan(
             total_count: Some(total_count),
             docs_scanned,
             index_used: None,
-            scan_strategy: None,
+            scan_strategy: Some("full_scan".to_string()),
             has_more: false,
             next_cursor: None,
         });
@@ -279,7 +279,7 @@ fn execute_index_scan(
                     total_count: Some(count),
                     docs_scanned: 0,
                     index_used: Some(index_name.clone()),
-                    scan_strategy: None,
+                    scan_strategy: Some("index_eq".to_string()),
                     has_more: false,
                     next_cursor: None,
                 });
@@ -304,7 +304,14 @@ fn execute_index_scan(
                     .get_index_for_field(collection, field)
                     .is_some();
                 if has_index {
+                    // Dedup by encoded value — the identity the index prefix
+                    // uses — or $in: ["a","a"] double-counts (the non-count
+                    // path dedups by doc id and never had this).
+                    let mut seen = std::collections::HashSet::new();
                     for value in values {
+                        if !seen.insert(value_to_sortable_bytes(value)) {
+                            continue;
+                        }
                         if let Some(count) = storage.index_manager.count_eq(
                             &storage.engine,
                             collection,
@@ -319,7 +326,7 @@ fn execute_index_scan(
                         total_count: Some(total),
                         docs_scanned: 0,
                         index_used: Some(index_name.clone()),
-                        scan_strategy: None,
+                        scan_strategy: Some("index_in".to_string()),
                         has_more: false,
                         next_cursor: None,
                     });
@@ -354,7 +361,7 @@ fn execute_index_scan(
                         total_count: Some(count),
                         docs_scanned: 0,
                         index_used: Some(index_name.clone()),
-                        scan_strategy: None,
+                        scan_strategy: Some("index_range".to_string()),
                         has_more: false,
                         next_cursor: None,
                     });
@@ -444,12 +451,21 @@ fn execute_index_scan(
     let total_count = matching.len() as u64;
 
     if query.count_only {
+        // The materialized count (post-filter present, or a fast path that
+        // didn't apply) — label it with the strategy that produced it.
+        let strategy = match &plan.scan {
+            ScanPlan::IndexEq { .. } => "index_eq",
+            ScanPlan::IndexIn { .. } => "index_in",
+            ScanPlan::IndexRange { .. } => "index_range",
+            ScanPlan::CompoundEq { .. } => "compound_eq",
+            _ => unreachable!(),
+        };
         return Ok(QueryResult {
             docs: vec![],
             total_count: Some(total_count),
             docs_scanned,
             index_used: Some(index_name),
-            scan_strategy: None,
+            scan_strategy: Some(strategy.to_string()),
             has_more: false,
             next_cursor: None,
         });

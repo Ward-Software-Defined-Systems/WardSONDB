@@ -1342,6 +1342,7 @@ async fn test_count_only_with_index() {
     assert_eq!(body["meta"]["index_used"], "idx_event_type");
     // docs_scanned should be 0 (index-only count)
     assert_eq!(body["meta"]["docs_scanned"], 0);
+    assert_eq!(body["meta"]["scan_strategy"], "index_eq");
 }
 
 #[tokio::test]
@@ -6827,4 +6828,82 @@ async fn test_giant_offset_no_overflow() {
     assert!(body["ok"].as_bool().unwrap());
     assert_eq!(body["data"].as_array().unwrap().len(), 0);
     assert_ne!(body["meta"]["has_more"], json!(true));
+}
+
+/// Every count_only fast path must self-report its scan strategy (T8), and
+/// the $in count path must not double-count duplicate values — it sums
+/// per-value index counts, unlike the doc-returning path which dedups ids.
+#[tokio::test]
+async fn test_count_only_scan_strategy_labels() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "events"}))
+        .send()
+        .await
+        .unwrap();
+
+    // 100 docs: event_type cycles 4 values (indexed), seq 0..99 (indexed),
+    // shard cycles 3 values (never indexed — exercises the full-scan count).
+    let types = ["firewall", "dns", "dhcp", "ids"];
+    let docs: Vec<Value> = (0..100)
+        .map(|i| json!({"event_type": types[i % 4], "seq": i, "shard": i % 3}))
+        .collect();
+    client
+        .post(format!("{base_url}/events/docs/_bulk"))
+        .json(&json!({"documents": docs}))
+        .send()
+        .await
+        .unwrap();
+    for (name, field) in [("idx_event_type", "event_type"), ("idx_seq", "seq")] {
+        client
+            .post(format!("{base_url}/events/indexes"))
+            .json(&json!({"name": name, "field": field}))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let count = |filter: Value| {
+        let client = client.clone();
+        let url = format!("{base_url}/events/query");
+        async move {
+            let resp = client
+                .post(url)
+                .json(&json!({"filter": filter, "count_only": true}))
+                .send()
+                .await
+                .unwrap();
+            let body: Value = resp.json().await.unwrap();
+            assert!(body["ok"].as_bool().unwrap());
+            (
+                body["data"]["count"].as_u64().unwrap(),
+                body["meta"]["scan_strategy"].as_str().unwrap().to_string(),
+            )
+        }
+    };
+
+    // $in with a duplicate value: 25 firewall + 25 dns, NOT 50 + 25.
+    let (n, strategy) =
+        count(json!({"event_type": {"$in": ["firewall", "firewall", "dns"]}})).await;
+    assert_eq!(n, 50);
+    assert_eq!(strategy, "index_in");
+
+    let (n, strategy) = count(json!({"seq": {"$gte": 50, "$lt": 75}})).await;
+    assert_eq!(n, 25);
+    assert_eq!(strategy, "index_range");
+
+    // Unindexed field → full scan count.
+    let expected_shard1 = (0..100).filter(|i| i % 3 == 1).count() as u64;
+    let (n, strategy) = count(json!({"shard": 1})).await;
+    assert_eq!(n, expected_shard1);
+    assert_eq!(strategy, "full_scan");
+
+    // Indexed eq + unindexed residual → materialized count, still labeled.
+    let expected_fw_shard0 = (0..100).filter(|i| i % 4 == 0 && i % 3 == 0).count() as u64;
+    let (n, strategy) = count(json!({"event_type": "firewall", "shard": 0})).await;
+    assert_eq!(n, expected_fw_shard0);
+    assert_eq!(strategy, "index_eq");
 }
