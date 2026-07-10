@@ -74,9 +74,12 @@ pub async fn create(
         }
     }
 
-    let def = state
-        .storage
-        .create_index(&collection, &body.name, &fields)?;
+    // Backfill scans the whole collection — never run it on an async worker.
+    let name = body.name;
+    let def = super::query::with_query_timeout(0, move || {
+        state.storage.create_index(&collection, &name, &fields)
+    })
+    .await?;
 
     let data = serde_json::to_value(&def)?;
     Ok(ApiResponseWithStatus {
@@ -90,7 +93,10 @@ pub async fn drop_index(
     State(state): State<Arc<AppState>>,
     Path((collection, name)): Path<(String, String)>,
 ) -> Result<Json<ApiResponse>, AppError> {
-    state.storage.drop_index(&collection, &name)?;
+    // Drops scan and delete the whole index partition — offload like create.
+    let op_name = name.clone();
+    super::query::with_query_timeout(0, move || state.storage.drop_index(&collection, &op_name))
+        .await?;
     let data = serde_json::json!({ "dropped": true, "name": name });
     Ok(Json(ApiResponse::success(data)))
 }

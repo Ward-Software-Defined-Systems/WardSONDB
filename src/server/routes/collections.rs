@@ -69,7 +69,10 @@ pub async fn create(
     JsonBody(body): JsonBody<CreateCollectionRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     validate_collection_name(&body.name)?;
-    let info = state.storage.create_collection(&body.name)?;
+    // create_collection commits and flushes the WAL — blocking KV work.
+    let info =
+        super::query::with_query_timeout(0, move || state.storage.create_collection(&body.name))
+            .await?;
     let data = serde_json::to_value(&info)?;
     Ok(ApiResponseWithStatus {
         status: StatusCode::CREATED,
@@ -90,7 +93,10 @@ pub async fn drop_collection(
     State(state): State<Arc<AppState>>,
     Path(collection): Path<String>,
 ) -> Result<Json<ApiResponse>, AppError> {
-    state.storage.drop_collection(&collection)?;
+    // Drop scans every doc and every index entry to delete them — one of
+    // the two O(collection) admin ops (with index backfill). Offload.
+    let coll = collection.clone();
+    super::query::with_query_timeout(0, move || state.storage.drop_collection(&coll)).await?;
     let data = serde_json::json!({ "dropped": true, "name": collection });
     Ok(Json(ApiResponse::success(data)))
 }
@@ -117,9 +123,12 @@ pub async fn set_ttl(
             "retention_days must be greater than 0".into(),
         ));
     }
-    let config = state
-        .storage
-        .set_ttl(&collection, body.retention_days, &body.field)?;
+    let config = super::query::with_query_timeout(0, move || {
+        state
+            .storage
+            .set_ttl(&collection, body.retention_days, &body.field)
+    })
+    .await?;
     let data = serde_json::to_value(&config)?;
     Ok(Json(ApiResponse::success(data)))
 }
@@ -128,7 +137,7 @@ pub async fn delete_ttl(
     State(state): State<Arc<AppState>>,
     Path(collection): Path<String>,
 ) -> Result<Json<ApiResponse>, AppError> {
-    state.storage.delete_ttl(&collection)?;
+    super::query::with_query_timeout(0, move || state.storage.delete_ttl(&collection)).await?;
     let data = serde_json::json!({"deleted": true});
     Ok(Json(ApiResponse::success(data)))
 }

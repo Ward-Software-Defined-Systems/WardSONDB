@@ -18,29 +18,47 @@ pub async fn run_ttl_loop(state: Arc<AppState>, interval_secs: u64) {
     loop {
         tick.tick().await;
 
-        let configs = match state.storage.get_all_ttl_configs() {
-            Ok(c) => c,
+        // Config load is a _meta prefix scan and each cleanup is a full
+        // collection scan (delete_by_query) — all blocking KV work, so the
+        // whole tick body runs on the blocking pool, mirroring the bitmap
+        // persist task in main.rs. Only metrics/timestamp bookkeeping stays
+        // on the async runtime.
+        let st = state.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            let configs = match st.storage.get_all_ttl_configs() {
+                Ok(c) => c,
+                Err(e) => {
+                    error!(error = %e, "Failed to load TTL configs");
+                    return 0u64;
+                }
+            };
+
+            let mut total_deleted = 0u64;
+            for (collection, config) in &configs {
+                match st.storage.run_ttl_cleanup(collection, config) {
+                    Ok(deleted) => {
+                        total_deleted += deleted;
+                    }
+                    Err(e) => {
+                        error!(
+                            collection = collection,
+                            error = %e,
+                            "TTL cleanup failed for collection"
+                        );
+                    }
+                }
+            }
+            total_deleted
+        })
+        .await;
+
+        let total_deleted = match outcome {
+            Ok(n) => n,
             Err(e) => {
-                error!(error = %e, "Failed to load TTL configs");
-                continue;
+                error!(error = %e, "TTL cleanup task panicked");
+                0
             }
         };
-
-        let mut total_deleted = 0u64;
-        for (collection, config) in &configs {
-            match state.storage.run_ttl_cleanup(collection, config) {
-                Ok(deleted) => {
-                    total_deleted += deleted;
-                }
-                Err(e) => {
-                    error!(
-                        collection = collection,
-                        error = %e,
-                        "TTL cleanup failed for collection"
-                    );
-                }
-            }
-        }
 
         if total_deleted > 0 {
             state
