@@ -173,7 +173,10 @@ fn execute_group(spec: &Value, docs: &[Value], stage_idx: usize) -> Result<Vec<V
 
     for doc in docs {
         let group_key = extract_group_key(id_spec, doc);
-        let key_str = serde_json::to_string(&group_key).unwrap_or_default();
+        // Serialize failure is practically unreachable for a Value, but "" as a
+        // fallback key would silently merge every failing doc into one group.
+        let key_str = serde_json::to_string(&group_key)
+            .map_err(|e| AppError::Internal(format!("failed to serialize $group key: {e}")))?;
 
         let state = group_map.entry(key_str.clone()).or_insert_with(|| {
             group_order.push(key_str.clone());
@@ -187,7 +190,7 @@ fn execute_group(spec: &Value, docs: &[Value], stage_idx: usize) -> Result<Vec<V
         });
 
         for (idx, (_, def)) in accumulators.iter().enumerate() {
-            state.accumulators[idx].accumulate(doc, def);
+            state.accumulators[idx].accumulate(doc, def)?;
         }
     }
 
@@ -345,7 +348,7 @@ impl AccumulatorState {
         }
     }
 
-    fn accumulate(&mut self, doc: &Value, def: &AccumulatorDef) {
+    fn accumulate(&mut self, doc: &Value, def: &AccumulatorDef) -> Result<(), AppError> {
         match (self, def) {
             (AccumulatorState::Count(c), AccumulatorDef::Count) => {
                 *c += 1;
@@ -393,7 +396,11 @@ impl AccumulatorState {
             }
             (AccumulatorState::Collect { values, truncated }, AccumulatorDef::Collect(field)) => {
                 if !*truncated && let Some(val) = resolve_json_path(doc, field) {
-                    let key = serde_json::to_string(val).unwrap_or_default();
+                    // "" as a fallback key would silently collapse distinct
+                    // failing values into one collected entry.
+                    let key = serde_json::to_string(val).map_err(|e| {
+                        AppError::Internal(format!("failed to serialize $collect value: {e}"))
+                    })?;
                     if values.len() < COLLECT_CAP {
                         values.insert(key);
                     } else if !values.contains(&key) {
@@ -403,6 +410,7 @@ impl AccumulatorState {
             }
             _ => {}
         }
+        Ok(())
     }
 
     fn finalize(&self) -> Value {
