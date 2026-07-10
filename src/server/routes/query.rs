@@ -76,7 +76,9 @@ pub async fn search(
             },
         )))
     } else {
-        let data = serde_json::to_value(&result.docs)?;
+        // The docs are already Values — move them into the response instead
+        // of deep-cloning the whole page through to_value.
+        let data = Value::Array(result.docs);
         Ok(Json(ApiResponse::success_with_meta(
             data,
             ResponseMeta {
@@ -112,7 +114,7 @@ pub async fn aggregate(
     state.metrics.record_query();
     let duration_ms = (start.elapsed().as_secs_f64() * 1_000_000.0).round() / 1000.0;
 
-    let data = serde_json::to_value(&result.docs)?;
+    let data = Value::Array(result.docs);
     Ok(Json(ApiResponse::success_with_meta(
         data,
         ResponseMeta {
@@ -194,12 +196,14 @@ pub async fn distinct(
     state.metrics.record_query();
     let duration_ms = (start.elapsed().as_secs_f64() * 1_000_000.0).round() / 1000.0;
 
-    let data = serde_json::json!({
-        "field": body.field,
-        "values": result.values,
-        "count": result.count,
-        "truncated": result.truncated,
-    });
+    // Built by hand: json! expands interpolations through to_value, which
+    // would deep-clone the (up to 1000-entry) values Vec. Same key order.
+    let mut data = serde_json::Map::with_capacity(4);
+    data.insert("field".into(), Value::String(body.field));
+    data.insert("values".into(), Value::Array(result.values));
+    data.insert("count".into(), Value::from(result.count));
+    data.insert("truncated".into(), Value::Bool(result.truncated));
+    let data = Value::Object(data);
 
     Ok(Json(ApiResponse::success_with_meta(
         data,
