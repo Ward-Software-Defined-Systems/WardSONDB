@@ -729,14 +729,16 @@ impl ScanAccelerator {
             }
 
             FilterNode::Or(children) => {
-                // Bitmap-accelerated $or narrowing:
-                // If ALL children are bitmap-resolvable, return the union.
-                // If SOME are resolvable, return partial bitmap + residual.
-                // If NONE are resolvable, return None.
+                // A $or is bitmap-servable ONLY with full coverage: the plan's
+                // residual_filter is applied as a CONJUNCTION over bitmap-matched
+                // docs, so a partially-covered $or would execute as an intersection
+                // (covered-arm docs post-filtered by the uncovered arm; uncovered-arm
+                // docs never loaded). Partial coverage bails to the fallback
+                // strategies; per-arm union planning is H-P3.1 territory.
+                if children.is_empty() {
+                    return None;
+                }
                 let mut bitmap_result = RoaringBitmap::new();
-                let mut non_bitmap_children: Vec<FilterNode> = Vec::new();
-                let mut any_resolved = false;
-
                 for child in children {
                     match self.bitmap_scan_inner(child) {
                         Some(BitmapScanResult {
@@ -744,50 +746,14 @@ impl ScanAccelerator {
                             residual_filter: None,
                         }) => {
                             bitmap_result |= &bitmap;
-                            any_resolved = true;
                         }
-                        Some(BitmapScanResult {
-                            bitmap,
-                            residual_filter: Some(_residual),
-                        }) => {
-                            // Child was partially resolved — can't cleanly union partial results
-                            // for $or. Include the bitmap result but add original child as residual.
-                            bitmap_result |= &bitmap;
-                            non_bitmap_children.push(child.clone());
-                            any_resolved = true;
-                        }
-                        None => {
-                            non_bitmap_children.push(child.clone());
-                        }
+                        _ => return None,
                     }
                 }
-
-                if !any_resolved {
-                    return None;
-                }
-
-                if non_bitmap_children.is_empty() {
-                    // Fully resolved via bitmaps
-                    Some(BitmapScanResult {
-                        bitmap: bitmap_result,
-                        residual_filter: None,
-                    })
-                } else {
-                    // Partial coverage — return what we have, executor handles the rest.
-                    // TODO: Hybrid approach — for non-bitmap $or children, run mini
-                    // full-scans excluding positions already in bitmap_result, then union.
-                    // This avoids scanning 2.1M docs when most $or branches are
-                    // bitmap-resolvable. See SCAN-ACCELERATOR-DESIGN.md section 4.4.
-                    let residual = if non_bitmap_children.len() == 1 {
-                        non_bitmap_children.into_iter().next().unwrap()
-                    } else {
-                        FilterNode::Or(non_bitmap_children)
-                    };
-                    Some(BitmapScanResult {
-                        bitmap: bitmap_result,
-                        residual_filter: Some(residual),
-                    })
-                }
+                Some(BitmapScanResult {
+                    bitmap: bitmap_result,
+                    residual_filter: None,
+                })
             }
 
             // $not and other ops — not bitmap-eligible

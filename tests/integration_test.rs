@@ -3451,6 +3451,75 @@ async fn test_bitmap_partial_coverage() {
     assert_eq!(body["meta"]["scan_strategy"], "bitmap");
 }
 
+/// S3-1 regression: a $or with PARTIAL bitmap coverage must not be served from
+/// bitmaps — the plan's residual is conjunctive, so pre-fix this returned the
+/// INTERSECTION (2 docs here) instead of the union. Partial coverage now falls
+/// back to a full scan; fully-covered $or (test_bitmap_scan_or) stays on bitmap.
+#[tokio::test]
+async fn test_bitmap_or_partial_coverage_falls_back() {
+    let (base_url, _tmp) = start_test_server_with_bitmap("category,status").await;
+    let client = Client::new();
+    setup_bitmap_test_data(&base_url, &client).await;
+
+    // "category" has a bitmap, "severity" does not.
+    // firewall = indices {0,4,8,12,16}; severity>2 = i%5∈{3,4} = 8 docs;
+    // overlap = {4,8} → union 11 (pre-fix bitmap path returned the overlap: 2).
+    let mixed_or = json!({
+        "$or": [
+            {"category": "firewall"},
+            {"severity": {"$gt": 2}}
+        ]
+    });
+
+    let resp = client
+        .post(format!("{base_url}/events/query"))
+        .json(&json!({"filter": mixed_or}))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], true);
+    let docs = body["data"].as_array().unwrap();
+    assert_eq!(docs.len(), 11);
+    // Doc-returning full scans don't label scan_strategy (S3-9); the
+    // load-bearing assertion is that the bitmap path was NOT taken.
+    assert_ne!(body["meta"]["scan_strategy"], "bitmap");
+
+    // count_only takes the same planning decision (count paths ARE labeled).
+    let resp = client
+        .post(format!("{base_url}/events/query"))
+        .json(&json!({"filter": mixed_or, "count_only": true}))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["data"]["count"], 11);
+    assert_eq!(body["meta"]["scan_strategy"], "full_scan");
+
+    // A child that itself resolves only PARTIALLY (And with a non-bitmap
+    // conjunct) must also force the bail: firewall∧sev>2 = {4,8}, threat =
+    // {2,6,10,14,18} → union 7.
+    let resp = client
+        .post(format!("{base_url}/events/query"))
+        .json(&json!({
+            "filter": {
+                "$or": [
+                    {"$and": [{"category": "firewall"}, {"severity": {"$gt": 2}}]},
+                    {"category": "threat"}
+                ]
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], true);
+    let docs = body["data"].as_array().unwrap();
+    assert_eq!(docs.len(), 7);
+    assert_ne!(body["meta"]["scan_strategy"], "bitmap");
+}
+
 /// Test 68: Bitmap correctness — compare bitmap scan results with full scan results
 #[tokio::test]
 async fn test_bitmap_correctness() {
