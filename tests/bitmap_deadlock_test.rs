@@ -174,6 +174,64 @@ async fn test_bitmap_no_deadlock_under_concurrent_load() {
     );
 }
 
+/// Regression: `stats()` used to call `total_memory_bytes()` while already
+/// holding `columns.read()`, re-acquiring the same lock. parking_lot readers
+/// queued behind a waiting writer are not reentrant, so `stats()` racing any
+/// `columns` writer (`configure_fields`, auto-detect completion, `clear`,
+/// `load_from_disk`) deadlocked the process. The workload tests above never
+/// caught this: with pre-configured fields the profiler is already done, so
+/// nothing on their insert/update path ever takes the `columns` write lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_stats_under_concurrent_columns_writer() {
+    let accel = make_accelerator(&["category", "status"]);
+
+    for i in 0..1_000u64 {
+        let (id, doc) = synthetic_doc(i);
+        accel.on_insert(&id, &doc);
+    }
+
+    let mut set = JoinSet::new();
+    {
+        let accel = accel.clone();
+        set.spawn(async move {
+            for _ in 0..2_000 {
+                let _ = accel.stats();
+                tokio::task::yield_now().await;
+            }
+        });
+    }
+    {
+        let accel = accel.clone();
+        set.spawn(async move {
+            for _ in 0..2_000 {
+                accel.configure_fields(vec!["category".into(), "status".into()]);
+                tokio::task::yield_now().await;
+            }
+        });
+    }
+
+    let result = timeout(Duration::from_secs(15), async {
+        while set.join_next().await.is_some() {}
+    })
+    .await;
+
+    assert!(
+        result.is_ok(),
+        "stats() under a concurrent columns writer deadlocked (recursive \
+         columns.read() inside total_memory_bytes — pre-fix behavior)"
+    );
+
+    // Value sanity: the single-pass memory total must equal the sum of the
+    // per-column stats plus the position map, and positions must be intact.
+    let stats = accel.stats();
+    let column_sum: usize = stats.columns.iter().map(|c| c.memory_bytes).sum();
+    assert_eq!(
+        stats.memory_bytes,
+        column_sum + accel.positions.memory_bytes()
+    );
+    assert_eq!(stats.total_positions, 1_000);
+}
+
 /// Smaller smoke variant — catches regressions in ~2 s on CI.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_bitmap_no_deadlock_smoke() {

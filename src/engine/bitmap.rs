@@ -789,20 +789,31 @@ impl ScanAccelerator {
     // ── Stats ───────────────────────────────────────────────────────────
 
     pub fn stats(&self) -> AcceleratorStats {
-        let columns = self.columns.read();
+        // Single `columns` guard scope: calling total_memory_bytes() while
+        // holding it re-acquires `columns.read()`, and parking_lot readers
+        // queued behind a waiting writer (configure_fields / auto-detect /
+        // clear / load_from_disk) deadlock on re-entry. Sum column memory in
+        // the same pass instead and touch every other lock after the guard
+        // drops.
         let mut column_stats = Vec::new();
-        for (field, column) in columns.iter() {
-            column_stats.push(ColumnStat {
-                field: field.clone(),
-                cardinality: column.cardinality.load(Ordering::Relaxed),
-                memory_bytes: column.memory_bytes(),
-            });
+        let mut columns_memory = 0usize;
+        {
+            let columns = self.columns.read();
+            for (field, column) in columns.iter() {
+                let memory_bytes = column.memory_bytes();
+                columns_memory += memory_bytes;
+                column_stats.push(ColumnStat {
+                    field: field.clone(),
+                    cardinality: column.cardinality.load(Ordering::Relaxed),
+                    memory_bytes,
+                });
+            }
         }
         AcceleratorStats {
             ready: self.is_ready(),
             total_positions: self.positions.len(),
             columns: column_stats,
-            memory_bytes: self.total_memory_bytes(),
+            memory_bytes: columns_memory + self.positions.memory_bytes(),
             memory_budget_bytes: self.config.read().max_memory_bytes,
             over_budget: self.over_budget.load(Ordering::Relaxed),
         }
