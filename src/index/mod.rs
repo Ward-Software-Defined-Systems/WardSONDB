@@ -12,8 +12,8 @@ use crate::error::AppError;
 use crate::query::filter::resolve_json_path;
 
 use self::secondary::{
-    IndexDef, extract_doc_id_from_key, make_compound_index_key, make_index_key, prefix_successor,
-    value_to_sortable_bytes,
+    IndexDef, RangeScanBounds, extract_doc_id_from_key, make_compound_index_key, make_index_key,
+    range_scan_bounds, value_to_sortable_bytes,
 };
 
 /// Cached index: definition + opaque partition handle.
@@ -329,39 +329,21 @@ impl IndexManager {
     ) -> Option<Vec<String>> {
         let (_def, partition) = self.get_index_for_field(collection, field)?;
 
-        let lower_bytes = lower.map(|(v, _)| value_to_sortable_bytes(v));
-        let upper_bytes = upper.map(|(v, inclusive)| {
-            let mut b = value_to_sortable_bytes(v);
-            if inclusive {
-                b.push(0x00);
-                b.extend_from_slice(&[0xFF; 37]);
-            }
-            b
-        });
-
-        let start: &[u8] = lower_bytes.as_deref().unwrap_or(&[]);
-        let default_end: [u8; 10] = [0xFF; 10];
-        let end: &[u8] = upper_bytes.as_deref().unwrap_or(&default_end);
-
-        let lower_exact_prefix = if let Some((lower_val, false)) = lower {
-            let mut p = value_to_sortable_bytes(lower_val);
-            p.push(0x00);
-            Some(p)
-        } else {
-            None
+        let lower_bytes = lower.map(|(v, inclusive)| (value_to_sortable_bytes(v), inclusive));
+        let upper_bytes = upper.map(|(v, inclusive)| (value_to_sortable_bytes(v), inclusive));
+        let (start, end) = match range_scan_bounds(
+            &[],
+            lower_bytes.as_ref().map(|(b, i)| (b.as_slice(), *i)),
+            upper_bytes.as_ref().map(|(b, i)| (b.as_slice(), *i)),
+        ) {
+            RangeScanBounds::Empty => return Some(Vec::new()),
+            RangeScanBounds::Span { start, end } => (start, end),
         };
 
         let mut doc_ids = Vec::new();
-        let iter = engine.range_iterator(&partition, start, end, None).ok()?;
+        let iter = engine.range_iterator(&partition, &start, &end, None).ok()?;
         for item in iter.flatten() {
             let (key, _) = item;
-
-            if let Some(ref prefix) = lower_exact_prefix
-                && key.starts_with(prefix)
-            {
-                continue;
-            }
-
             if let Some(id) = extract_doc_id_from_key(&key) {
                 doc_ids.push(id);
             }
@@ -404,34 +386,18 @@ impl IndexManager {
     ) -> Option<u64> {
         let (_def, partition) = self.get_index_for_field(collection, field)?;
 
-        // Exclusive lower: lookup_range drops exactly the keys prefixed by
-        // `value_bytes ++ 0x00`; starting at that prefix's successor counts
-        // the same set (no index key sorts between the bare value bytes and
-        // its 0x00-prefixed entries — every key continues with a separator).
-        let start: Vec<u8> = match lower {
-            Some((v, inclusive)) => {
-                let mut b = value_to_sortable_bytes(v);
-                if !inclusive {
-                    b.push(0x00);
-                    b = prefix_successor(&b);
-                }
-                b
-            }
-            None => Vec::new(),
+        let lower_bytes = lower.map(|(v, inclusive)| (value_to_sortable_bytes(v), inclusive));
+        let upper_bytes = upper.map(|(v, inclusive)| (value_to_sortable_bytes(v), inclusive));
+        let (start, end) = match range_scan_bounds(
+            &[],
+            lower_bytes.as_ref().map(|(b, i)| (b.as_slice(), *i)),
+            upper_bytes.as_ref().map(|(b, i)| (b.as_slice(), *i)),
+        ) {
+            RangeScanBounds::Empty => return Some(0),
+            RangeScanBounds::Span { start, end } => (start, end),
         };
 
-        let upper_bytes = upper.map(|(v, inclusive)| {
-            let mut b = value_to_sortable_bytes(v);
-            if inclusive {
-                b.push(0x00);
-                b.extend_from_slice(&[0xFF; 37]);
-            }
-            b
-        });
-        let default_end: [u8; 10] = [0xFF; 10];
-        let end: &[u8] = upper_bytes.as_deref().unwrap_or(&default_end);
-
-        engine.count_range(&partition, &start, end).ok()
+        engine.count_range(&partition, &start, &end).ok()
     }
 
     /// $in: union of equality lookups over ONE resolved index handle (the

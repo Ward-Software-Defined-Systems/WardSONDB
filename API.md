@@ -732,6 +732,8 @@ curl -X POST http://localhost:8080/events/query \
 {"tags": {"$contains": "important"}}
 ```
 
+**Range comparisons are type-bracketed:** `$gt`/`$gte`/`$lt`/`$lte` only match values of the operand's own comparable type — a number operand matches numbers, a string operand strings, a boolean operand booleans (`{"$gt": false}` matches `true`). Operands of type `null`, array, or object match nothing, even against values of the same type. Indexed and in-memory evaluation agree on this. (Cross-type *ordering* exists too, but only for sorting — see [Sorting](#sorting).)
+
 #### Logical Operators
 
 ```json

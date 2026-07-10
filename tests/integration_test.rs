@@ -8019,3 +8019,279 @@ async fn test_aggregate_sort_mixed_types() {
         );
     }
 }
+
+// ─── Type-bracketed index range scans (R10/S3-10) ─────────────────────────────
+
+/// Same docs into an indexed collection and an unindexed twin: range results
+/// must be identical. Docs carry the field explicitly (null, never missing —
+/// missing-field index exclusion is T6, out of scope here).
+async fn seed_range_twins(client: &Client, base_url: &str) {
+    for coll in ["vals_idx", "vals_plain"] {
+        client
+            .post(format!("{base_url}/_collections"))
+            .json(&json!({"name": coll}))
+            .send()
+            .await
+            .unwrap();
+        let docs = json!({
+            "documents": [
+                {"_id": "v01", "val": 1},
+                {"_id": "v02", "val": 5},
+                {"_id": "v03", "val": 9},
+                {"_id": "v04", "val": 9},
+                {"_id": "v05", "val": "a"},
+                {"_id": "v06", "val": "m"},
+                {"_id": "v07", "val": true},
+                {"_id": "v08", "val": false},
+                {"_id": "v09", "val": null},
+                {"_id": "v10", "val": [1]},
+                {"_id": "v11", "val": {"k": 1}},
+                {"_id": "v12", "val": 5},
+            ]
+        });
+        let resp = client
+            .post(format!("{base_url}/{coll}/docs/_bulk"))
+            .json(&docs)
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+    }
+    let resp = client
+        .post(format!("{base_url}/vals_idx/indexes"))
+        .json(&json!({"name": "idx_val", "field": "val"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+}
+
+/// The sweep every range test below shares: operator × operand-type cases
+/// with their expected matching ids under type-bracketed semantics.
+fn range_bracket_cases() -> Vec<(Value, Vec<&'static str>)> {
+    vec![
+        (json!({"$gt": 5}), vec!["v03", "v04"]),
+        (json!({"$gte": 5}), vec!["v02", "v03", "v04", "v12"]),
+        (json!({"$lt": 5}), vec!["v01"]),
+        (json!({"$lte": 5}), vec!["v01", "v02", "v12"]),
+        (json!({"$gt": "c"}), vec!["v06"]),
+        (json!({"$lte": "a"}), vec!["v05"]),
+        (json!({"$gt": false}), vec!["v07"]),
+        (json!({"$gte": false}), vec!["v07", "v08"]),
+        (json!({"$lt": true}), vec!["v08"]),
+        (json!({"$lte": true}), vec!["v07", "v08"]),
+        (json!({"$gt": null}), vec![]),
+        (json!({"$gte": null}), vec![]),
+        (json!({"$lt": [2]}), vec![]),
+        (json!({"$gte": {"k": 1}}), vec![]),
+    ]
+}
+
+/// R10: indexed range queries return exactly what the in-memory filter
+/// matches — no cross-type leakage past open bounds (pre-fix an indexed
+/// `$gt: 5` returned strings/arrays/objects; `$gt: null` returned every
+/// non-null doc), and null/array/object operands match nothing on any path.
+#[tokio::test]
+async fn test_index_range_mixed_types_matches_full_scan() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+    seed_range_twins(&client, &base_url).await;
+
+    for (op, expected) in range_bracket_cases() {
+        let filter = json!({"val": op});
+        let mut results = Vec::new();
+        for coll in ["vals_idx", "vals_plain"] {
+            let resp = client
+                .post(format!("{base_url}/{coll}/query"))
+                .json(&json!({"filter": filter, "limit": 1000}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            let body: Value = resp.json().await.unwrap();
+            if coll == "vals_idx" {
+                assert_eq!(
+                    body["meta"]["index_used"], "idx_val",
+                    "index must serve {filter}"
+                );
+            }
+            let mut ids = ids_of(body["data"].as_array().unwrap());
+            ids.sort();
+            results.push(ids);
+        }
+        assert_eq!(results[0], results[1], "indexed == full scan for {filter}");
+        assert_eq!(results[0], expected, "expected match set for {filter}");
+    }
+}
+
+/// R10: `count_only` takes the keys-only `count_range` path — counts must
+/// bracket identically.
+#[tokio::test]
+async fn test_count_range_mixed_types_matches_full_scan() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+    seed_range_twins(&client, &base_url).await;
+
+    for (op, expected) in range_bracket_cases() {
+        let filter = json!({"val": op});
+        let mut counts = Vec::new();
+        for (coll, strategy) in [("vals_idx", "index_range"), ("vals_plain", "full_scan")] {
+            let resp = client
+                .post(format!("{base_url}/{coll}/query"))
+                .json(&json!({"filter": filter, "count_only": true}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            let body: Value = resp.json().await.unwrap();
+            assert_eq!(
+                body["meta"]["scan_strategy"], strategy,
+                "count strategy for {filter} on {coll}"
+            );
+            counts.push(body["meta"]["total_count"].as_u64().unwrap());
+        }
+        assert_eq!(
+            counts[0], counts[1],
+            "indexed == full scan count for {filter}"
+        );
+        assert_eq!(counts[0], expected.len() as u64, "count for {filter}");
+    }
+}
+
+/// R10: bounds from two different type buckets can never both hold for one
+/// value — empty everywhere, without scanning.
+#[tokio::test]
+async fn test_index_range_cross_type_bounds_empty() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+    seed_range_twins(&client, &base_url).await;
+
+    let filter = json!({"val": {"$gt": 5, "$lt": "z"}});
+    for coll in ["vals_idx", "vals_plain"] {
+        let resp = client
+            .post(format!("{base_url}/{coll}/query"))
+            .json(&json!({"filter": filter, "limit": 1000}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["data"].as_array().unwrap().len(),
+            0,
+            "cross-bucket bounds match nothing on {coll}"
+        );
+
+        let resp = client
+            .post(format!("{base_url}/{coll}/query"))
+            .json(&json!({"filter": filter, "count_only": true}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["meta"]["total_count"], 0, "count on {coll}");
+    }
+}
+
+/// R10: the CompoundRange path (equality prefix + range suffix) brackets its
+/// range field the same way — cross-type entries inside the equality group
+/// stay excluded, and other groups never leak in.
+#[tokio::test]
+async fn test_compound_range_mixed_types_matches_full_scan() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    for coll in ["cvals_idx", "cvals_plain"] {
+        client
+            .post(format!("{base_url}/_collections"))
+            .json(&json!({"name": coll}))
+            .send()
+            .await
+            .unwrap();
+        let docs = json!({
+            "documents": [
+                {"_id": "c01", "grp": "a", "val": 1},
+                {"_id": "c02", "grp": "a", "val": 5},
+                {"_id": "c03", "grp": "a", "val": 9},
+                {"_id": "c04", "grp": "a", "val": "m"},
+                {"_id": "c05", "grp": "a", "val": true},
+                {"_id": "c06", "grp": "a", "val": null},
+                {"_id": "c07", "grp": "a", "val": [1]},
+                {"_id": "c08", "grp": "b", "val": 5},
+            ]
+        });
+        let resp = client
+            .post(format!("{base_url}/{coll}/docs/_bulk"))
+            .json(&docs)
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+    }
+    let resp = client
+        .post(format!("{base_url}/cvals_idx/indexes"))
+        .json(&json!({"name": "idx_grp_val", "fields": ["grp", "val"]}))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+
+    let cases: Vec<(Value, Vec<&str>)> = vec![
+        (json!({"$gt": 5}), vec!["c03"]),
+        (json!({"$lt": 5}), vec!["c01"]),
+        (json!({"$gte": "c"}), vec!["c04"]),
+        (json!({"$gt": null}), vec![]),
+        (json!({"$gt": 5, "$lte": "z"}), vec![]),
+    ];
+    for (op, expected) in cases {
+        let filter = json!({"grp": "a", "val": op});
+        for count_only in [false, true] {
+            let mut per_coll = Vec::new();
+            for coll in ["cvals_idx", "cvals_plain"] {
+                let body_json = if count_only {
+                    json!({"filter": filter, "count_only": true})
+                } else {
+                    json!({"filter": filter, "limit": 1000})
+                };
+                let resp = client
+                    .post(format!("{base_url}/{coll}/query"))
+                    .json(&body_json)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), 200);
+                let body: Value = resp.json().await.unwrap();
+                if coll == "cvals_idx" {
+                    assert_eq!(
+                        body["meta"]["scan_strategy"], "compound_range",
+                        "compound index must serve {filter} (count_only={count_only})"
+                    );
+                }
+                if count_only {
+                    per_coll.push(vec![format!(
+                        "count:{}",
+                        body["meta"]["total_count"].as_u64().unwrap()
+                    )]);
+                } else {
+                    let mut ids = ids_of(body["data"].as_array().unwrap());
+                    ids.sort();
+                    per_coll.push(ids);
+                }
+            }
+            assert_eq!(
+                per_coll[0], per_coll[1],
+                "indexed == full scan for {filter} (count_only={count_only})"
+            );
+            if !count_only {
+                assert_eq!(per_coll[0], expected, "expected match set for {filter}");
+            } else {
+                assert_eq!(
+                    per_coll[0][0],
+                    format!("count:{}", expected.len()),
+                    "expected count for {filter}"
+                );
+            }
+        }
+    }
+}

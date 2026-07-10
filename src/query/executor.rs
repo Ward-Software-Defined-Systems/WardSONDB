@@ -3,7 +3,10 @@ use serde_json::Value;
 use crate::engine::backend::StorageBackend;
 use crate::engine::storage::Storage;
 use crate::error::AppError;
-use crate::index::secondary::{extract_doc_id_from_key, prefix_successor, value_to_sortable_bytes};
+use crate::index::secondary::{
+    RangeScanBounds, extract_doc_id_from_key, prefix_successor, range_scan_bounds,
+    value_to_sortable_bytes,
+};
 
 use super::cursor::{Cursor, CursorValue, compare_doc_to_cursor, encode_cursor};
 use super::filter::resolve_json_path;
@@ -737,58 +740,35 @@ fn execute_compound_range(
         .get_index_partition(collection, index_name)
         .ok_or_else(|| AppError::Internal(format!("Index partition not found: {index_name}")))?;
 
-    // Build range start key: eq_prefix already has trailing 0x01
-    let start_key: Vec<u8> = if let Some((lower_bytes, _inclusive)) = lower {
-        let mut k = eq_prefix.to_vec();
-        k.extend_from_slice(lower_bytes);
-        k
-    } else {
-        eq_prefix.to_vec()
-    };
-
-    // Build range end key
-    let end_key: Vec<u8> = if let Some((upper_bytes, inclusive)) = upper {
-        let mut k = eq_prefix.to_vec();
-        k.extend_from_slice(upper_bytes);
-        if *inclusive {
-            // Include all entries with this prefix (append high bytes)
-            k.push(0x00);
-            k.extend_from_slice(&[0xFF; 37]);
+    // Shared bounds builder: eq_prefix (with its trailing 0x01) glued to the
+    // range-field bounds, open ends closed over the operand's type bracket,
+    // exclusive lower folded into the start key (no skip loop needed).
+    let (start_key, end_key) = match range_scan_bounds(
+        eq_prefix,
+        lower.map(|(b, i)| (b.as_slice(), *i)),
+        upper.map(|(b, i)| (b.as_slice(), *i)),
+    ) {
+        RangeScanBounds::Empty => {
+            // The range predicate can never match (null/array/object operand
+            // or cross-bucket bounds) — serve every path without a scan.
+            return Ok(QueryResult {
+                docs: vec![],
+                total_count: Some(0),
+                docs_scanned: 0,
+                index_used: Some(index_name.to_string()),
+                scan_strategy: Some("compound_range".to_string()),
+                has_more: false,
+                next_cursor: None,
+            });
         }
-        k
-    } else {
-        // End of this eq_prefix range: 0x01 → 0x02 bumps past separator
-        let mut k = eq_prefix.to_vec();
-        // Replace trailing 0x01 separator with 0x02 to get end of prefix range
-        if let Some(last) = k.last_mut() {
-            *last = 0x02;
-        }
-        k
-    };
-
-    // For non-inclusive lower bound, build the exact prefix to skip
-    let lower_exact_prefix = if let Some((lower_bytes, false)) = lower {
-        let mut p = eq_prefix.to_vec();
-        p.extend_from_slice(lower_bytes);
-        p.push(0x00); // separator before doc_id
-        Some(p)
-    } else {
-        None
+        RangeScanBounds::Span { start, end } => (start, end),
     };
 
     // count_only optimization: count index keys without loading docs.
-    // Starting at the successor of the exclusive-lower exact prefix counts
-    // exactly what the old skip loop counted (the skipped keys are precisely
-    // the `lower_exact_prefix`-prefixed span at the start of the range),
-    // without materializing a single entry.
     if query.count_only && plan.post_filter.is_none() {
-        let effective_start = match &lower_exact_prefix {
-            Some(p) => prefix_successor(p),
-            None => start_key.clone(),
-        };
         let count = storage
             .engine
-            .count_range(&partition, &effective_start, &end_key)?;
+            .count_range(&partition, &start_key, &end_key)?;
         return Ok(QueryResult {
             docs: vec![],
             total_count: Some(count),
@@ -808,13 +788,6 @@ fn execute_compound_range(
             .range_iterator(&partition, start_key.as_slice(), end_key.as_slice(), None)?
     {
         let (key, _) = kv?;
-
-        if let Some(ref prefix) = lower_exact_prefix
-            && key.starts_with(prefix)
-        {
-            continue;
-        }
-
         if let Some(id) = extract_doc_id_from_key(&key) {
             candidate_ids.push(id);
         }

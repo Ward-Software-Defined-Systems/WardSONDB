@@ -165,6 +165,121 @@ pub fn prefix_successor(prefix: &[u8]) -> Vec<u8> {
     vec![0xFF; prefix.len() + 1]
 }
 
+/// `[start, end)` prefix-byte window of the type bucket a range operand can
+/// match, mirroring the in-memory filter's type bracketing (see
+/// `query::filter::compare_values`): a comparison only matches values of the
+/// operand's own comparable type. Bool spans BOTH prefixes (`$gt: false`
+/// must match `true`, which encodes under a different prefix byte). Null,
+/// arrays, and objects match nothing — even same-type — so they have no
+/// bracket.
+fn type_bracket(first_byte: u8) -> Option<(u8, u8)> {
+    match first_byte {
+        0x01 | 0x02 => Some((0x01, 0x03)), // bool
+        0x03 => Some((0x03, 0x04)),        // number
+        0x04 => Some((0x04, 0x05)),        // string
+        _ => None,                         // null (0x00), array/object (0x05)
+    }
+}
+
+/// Index scan bounds for a range predicate.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RangeScanBounds {
+    /// The predicate can never match (null/array/object operand, or bounds
+    /// from two different type buckets) — skip the scan entirely.
+    Empty,
+    /// Scan the half-open key window `[start, end)`.
+    Span { start: Vec<u8>, end: Vec<u8> },
+}
+
+/// The one bounds builder for every index range scan (single-field and
+/// compound). `prefix` is empty for single-field scans, or the equality
+/// prefix INCLUDING its trailing 0x01 separator for compound ones; `lower`/
+/// `upper` are `(value_to_sortable_bytes output, inclusive)`.
+///
+/// Present bounds keep the byte recipes the scans have always used:
+/// inclusive upper appends `0x00 ++ [0xFF; 37]` (UTF-8 doc ids never contain
+/// 0xFF, so this sits above every id of that exact value); exclusive lower
+/// starts at `prefix_successor(bound ++ 0x00)`, which skips exactly the
+/// bound's own entries (set-equivalent to the historical skip loop,
+/// including its compound-partition boundary behavior). ABSENT bounds close
+/// over the operand's type bracket instead of sweeping to the start/end of
+/// the partition — an open-ended `$gt: 5` must not return strings, which
+/// sort above every number.
+pub fn range_scan_bounds(
+    prefix: &[u8],
+    lower: Option<(&[u8], bool)>,
+    upper: Option<(&[u8], bool)>,
+) -> RangeScanBounds {
+    let bracket_of = |bound: Option<(&[u8], bool)>| {
+        bound.map(|(bytes, _)| bytes.first().copied().and_then(type_bracket))
+    };
+    // A present bound whose operand type has no bracket ⇒ nothing matches.
+    let lower_bracket = match bracket_of(lower) {
+        Some(None) => return RangeScanBounds::Empty,
+        other => other.flatten(),
+    };
+    let upper_bracket = match bracket_of(upper) {
+        Some(None) => return RangeScanBounds::Empty,
+        other => other.flatten(),
+    };
+    // Two bounds from different buckets ⇒ nothing matches on any path (the
+    // in-memory filter can't satisfy both predicates with one value either).
+    if let (Some(l), Some(u)) = (lower_bracket, upper_bracket)
+        && l != u
+    {
+        return RangeScanBounds::Empty;
+    }
+    let bracket = lower_bracket.or(upper_bracket);
+    // The planner never builds a range without at least one bound; fall back
+    // to the whole prefix window to keep the function total.
+    debug_assert!(bracket.is_some(), "range with no bounds");
+
+    let start = match lower {
+        Some((bytes, true)) => {
+            let mut k = prefix.to_vec();
+            k.extend_from_slice(bytes);
+            k
+        }
+        Some((bytes, false)) => {
+            let mut k = prefix.to_vec();
+            k.extend_from_slice(bytes);
+            k.push(0x00);
+            prefix_successor(&k)
+        }
+        None => match bracket {
+            Some((lo, _)) => {
+                let mut k = prefix.to_vec();
+                k.push(lo);
+                k
+            }
+            None => prefix.to_vec(),
+        },
+    };
+    let end = match upper {
+        Some((bytes, false)) => {
+            let mut k = prefix.to_vec();
+            k.extend_from_slice(bytes);
+            k
+        }
+        Some((bytes, true)) => {
+            let mut k = prefix.to_vec();
+            k.extend_from_slice(bytes);
+            k.push(0x00);
+            k.extend_from_slice(&[0xFF; 37]);
+            k
+        }
+        None => match bracket {
+            Some((_, hi)) => {
+                let mut k = prefix.to_vec();
+                k.push(hi);
+                k
+            }
+            None => prefix_successor(prefix),
+        },
+    };
+    RangeScanBounds::Span { start, end }
+}
+
 /// Decode sortable bytes back into a JSON value (inverse of value_to_sortable_bytes).
 pub fn decode_sortable_bytes(bytes: &[u8]) -> Option<Value> {
     if bytes.is_empty() {
@@ -288,5 +403,130 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn type_bracket_table() {
+        assert_eq!(type_bracket(0x00), None, "null operands match nothing");
+        assert_eq!(type_bracket(0x01), Some((0x01, 0x03)), "false spans bool");
+        assert_eq!(type_bracket(0x02), Some((0x01, 0x03)), "true spans bool");
+        assert_eq!(type_bracket(0x03), Some((0x03, 0x04)));
+        assert_eq!(type_bracket(0x04), Some((0x04, 0x05)));
+        assert_eq!(
+            type_bracket(0x05),
+            None,
+            "array/object operands match nothing"
+        );
+    }
+
+    /// Present bounds must keep the exact byte recipes the scans have always
+    /// used — only the open-bound sentinels changed.
+    #[test]
+    fn range_scan_bounds_preserves_present_bound_recipes() {
+        let five = value_to_sortable_bytes(&json!(5));
+        let nine = value_to_sortable_bytes(&json!(9));
+
+        // Inclusive lower + exclusive upper: bounds pass through verbatim.
+        assert_eq!(
+            range_scan_bounds(&[], Some((&five, true)), Some((&nine, false))),
+            RangeScanBounds::Span {
+                start: five.clone(),
+                end: nine.clone()
+            }
+        );
+
+        // Exclusive lower: successor of `bound ++ 0x00` (== bound ++ 0x01),
+        // the same set the historical skip loop excluded.
+        let mut after_five = five.clone();
+        after_five.push(0x01);
+        let RangeScanBounds::Span { start, .. } =
+            range_scan_bounds(&[], Some((&five, false)), Some((&nine, false)))
+        else {
+            panic!("expected a span");
+        };
+        assert_eq!(start, after_five);
+
+        // Inclusive upper: bound ++ 0x00 ++ [0xFF; 37].
+        let mut through_nine = nine.clone();
+        through_nine.push(0x00);
+        through_nine.extend_from_slice(&[0xFF; 37]);
+        let RangeScanBounds::Span { end, .. } =
+            range_scan_bounds(&[], Some((&five, true)), Some((&nine, true)))
+        else {
+            panic!("expected a span");
+        };
+        assert_eq!(end, through_nine);
+    }
+
+    /// Open bounds close over the operand's type bucket instead of sweeping
+    /// the partition; the compound eq-prefix stays glued to every bound.
+    #[test]
+    fn range_scan_bounds_brackets_open_ends() {
+        let five = value_to_sortable_bytes(&json!(5));
+
+        // Open upper on a number: end at the string bucket's first byte.
+        assert_eq!(
+            range_scan_bounds(&[], Some((&five, true)), None),
+            RangeScanBounds::Span {
+                start: five.clone(),
+                end: vec![0x04]
+            }
+        );
+        // Open lower on a number: start at the number bucket's first byte.
+        assert_eq!(
+            range_scan_bounds(&[], None, Some((&five, false))),
+            RangeScanBounds::Span {
+                start: vec![0x03],
+                end: five.clone()
+            }
+        );
+        // Bool bracket spans both prefixes: $gt:false must reach true (0x02).
+        let false_bytes = value_to_sortable_bytes(&json!(false));
+        let RangeScanBounds::Span { end, .. } =
+            range_scan_bounds(&[], Some((&false_bytes, false)), None)
+        else {
+            panic!("expected a span");
+        };
+        assert_eq!(end, vec![0x03], "bool bracket must include true");
+
+        // Compound: the eq prefix (with its trailing 0x01) wraps both ends.
+        let prefix = [0xAA, 0x01];
+        let mut expected_start = prefix.to_vec();
+        expected_start.extend_from_slice(&five);
+        assert_eq!(
+            range_scan_bounds(&prefix, Some((&five, true)), None),
+            RangeScanBounds::Span {
+                start: expected_start,
+                end: vec![0xAA, 0x01, 0x04]
+            }
+        );
+    }
+
+    /// Null/array/object operands and cross-bucket bound pairs match nothing
+    /// anywhere (the in-memory filter returns `None` for them, even
+    /// same-type) — the scan must not run at all.
+    #[test]
+    fn range_scan_bounds_empty_cases() {
+        let null_b = value_to_sortable_bytes(&json!(null));
+        let arr_b = value_to_sortable_bytes(&json!([1]));
+        let obj_b = value_to_sortable_bytes(&json!({"k": 1}));
+        let five = value_to_sortable_bytes(&json!(5));
+        let zed = value_to_sortable_bytes(&json!("z"));
+
+        for b in [&null_b, &arr_b, &obj_b] {
+            assert_eq!(
+                range_scan_bounds(&[], Some((b, true)), None),
+                RangeScanBounds::Empty
+            );
+            assert_eq!(
+                range_scan_bounds(&[], None, Some((b, false))),
+                RangeScanBounds::Empty
+            );
+        }
+        // $gt:5 combined with $lt:"z": no single value satisfies both.
+        assert_eq!(
+            range_scan_bounds(&[], Some((&five, false)), Some((&zed, false))),
+            RangeScanBounds::Empty
+        );
     }
 }
