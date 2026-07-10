@@ -68,7 +68,9 @@ impl RowPositionMap {
         self.id_to_pos.read().get(doc_id).copied()
     }
 
-    /// Lookup document ID by row position.
+    /// Lookup document ID by row position. Query paths batch through
+    /// `resolve_window` instead; kept for single-position callers.
+    #[allow(dead_code)]
     pub fn get_doc_id(&self, pos: u32) -> Option<Arc<str>> {
         let vec = self.pos_to_id.read();
         vec.get(pos as usize).and_then(|opt| opt.clone())
@@ -111,6 +113,27 @@ impl RowPositionMap {
         }
         let holes = self.hole_count.load(Ordering::Relaxed);
         holes as f32 / total as f32
+    }
+
+    /// Resolve bitmap positions (ascending order) to doc ids under ONE short
+    /// guard, dropped before the caller does any IO — never hold a position
+    /// or column guard across blocking work (the b965de5 rule). `skip`/`take`
+    /// window the *resolved ids* (matching the materialized paths, which
+    /// offset over docs), so hole positions from transient delete races are
+    /// skipped without consuming the window.
+    pub fn resolve_window(
+        &self,
+        positions: &RoaringBitmap,
+        skip: usize,
+        take: usize,
+    ) -> Vec<Arc<str>> {
+        let vec = self.pos_to_id.read();
+        positions
+            .iter()
+            .filter_map(|pos| vec.get(pos as usize).and_then(|slot| slot.clone()))
+            .skip(skip)
+            .take(take)
+            .collect()
     }
 
     /// Estimated memory usage in bytes, accounting for variable-length IDs.
@@ -210,6 +233,10 @@ pub struct ScanAccelerator {
     pub positions: RowPositionMap,
     /// Configuration.
     config: RwLock<AcceleratorConfig>,
+    /// Cached copy of `config.max_cardinality` — read on every insert/update,
+    /// so the hot path takes an atomic load instead of the config lock. Kept
+    /// in sync by `set_max_cardinality`.
+    max_cardinality: AtomicU32,
     /// false during rebuild; queries fall back to full scan.
     ready: AtomicBool,
     /// Cardinality profiler for auto-detection.
@@ -232,10 +259,12 @@ impl ScanAccelerator {
             }
         }
         let has_fields = !config.bitmap_fields.is_empty();
+        let max_cardinality = AtomicU32::new(config.max_cardinality);
         ScanAccelerator {
             columns,
             positions: RowPositionMap::new(),
             config: RwLock::new(config),
+            max_cardinality,
             ready: AtomicBool::new(false),
             profiler: CardinalityProfiler::new(has_fields),
             over_budget: AtomicBool::new(false),
@@ -243,8 +272,15 @@ impl ScanAccelerator {
         }
     }
 
-    pub fn config_mut(&self) -> parking_lot::RwLockWriteGuard<'_, AcceleratorConfig> {
-        self.config.write()
+    /// Set the per-column cardinality cap, keeping the hot-path atomic cache
+    /// in sync with the config (guard-based mutation would bypass the cache).
+    pub fn set_max_cardinality(&self, v: u32) {
+        self.config.write().max_cardinality = v;
+        self.max_cardinality.store(v, Ordering::Relaxed);
+    }
+
+    pub fn set_max_memory_bytes(&self, v: u64) {
+        self.config.write().max_memory_bytes = v;
     }
 
     pub fn config_read(&self) -> parking_lot::RwLockReadGuard<'_, AcceleratorConfig> {
@@ -322,7 +358,7 @@ impl ScanAccelerator {
             self.profiler.observe(doc);
             // Check if profiling just completed (we hit sample_target)
             if self.profiler.is_done() && self.columns.read().is_empty() {
-                let max_card = self.config.read().max_cardinality;
+                let max_card = self.max_cardinality.load(Ordering::Relaxed);
                 let detected = self.profiler.analyze(max_card);
                 if !detected.is_empty() {
                     let fields: Vec<String> = detected.iter().map(|(f, _)| f.clone()).collect();
@@ -380,7 +416,7 @@ impl ScanAccelerator {
         }
 
         let columns = self.columns.read();
-        let max_card = self.config.read().max_cardinality;
+        let max_card = self.max_cardinality.load(Ordering::Relaxed);
 
         for (field_path, column) in columns.iter() {
             if let Some(value) = resolve_json_path(doc, field_path) {
@@ -430,8 +466,12 @@ impl ScanAccelerator {
                     bitmaps.remove(&value_key);
                     column.cardinality.fetch_sub(1, Ordering::Relaxed);
                 }
+                drop(bitmaps);
+                // Inside the field-present guard (symmetric with on_insert):
+                // exists_bitmap only ever holds positions whose doc had the
+                // field, so absent fields need no write lock here.
+                column.exists_bitmap.write().remove(pos);
             }
-            column.exists_bitmap.write().remove(pos);
         }
         self.positions.remove(doc_id);
     }
@@ -445,11 +485,21 @@ impl ScanAccelerator {
         };
 
         let columns = self.columns.read();
-        let max_card = self.config.read().max_cardinality;
+        let max_card = self.max_cardinality.load(Ordering::Relaxed);
 
         for (field_path, column) in columns.iter() {
-            let old_val = resolve_json_path(old_doc, field_path).map(value_to_string_key);
-            let new_val = resolve_json_path(new_doc, field_path).map(value_to_string_key);
+            // Compare the resolved values first: an update that doesn't touch
+            // this column costs zero allocations. Only genuine changes pay
+            // for the string keys (whose comparison stays authoritative —
+            // distinct Values can share a key, e.g. null vs "__null__", and
+            // must keep no-oping).
+            let old_ref = resolve_json_path(old_doc, field_path);
+            let new_ref = resolve_json_path(new_doc, field_path);
+            if old_ref == new_ref {
+                continue;
+            }
+            let old_val = old_ref.map(value_to_string_key);
+            let new_val = new_ref.map(value_to_string_key);
 
             if old_val != new_val {
                 // Single write lock for both remove and insert
@@ -1248,5 +1298,115 @@ impl CardinalityProfiler {
     #[allow(dead_code)]
     pub fn sample_count(&self) -> u32 {
         self.sample_count.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn accel(fields: &[&str]) -> ScanAccelerator {
+        let a = ScanAccelerator::new(AcceleratorConfig {
+            bitmap_fields: fields.iter().map(|s| s.to_string()).collect(),
+            max_cardinality: 1000,
+            max_memory_bytes: 0,
+        });
+        a.set_ready(true);
+        a
+    }
+
+    fn exists_len(a: &ScanAccelerator, field: &str) -> u64 {
+        a.columns
+            .read()
+            .get(field)
+            .unwrap()
+            .exists_bitmap
+            .read()
+            .len()
+    }
+
+    /// The invariant that lets on_delete keep the exists write lock inside
+    /// the field-present guard: exists_bitmap never contains positions of
+    /// docs lacking the field, so absent fields have nothing to remove.
+    #[test]
+    fn on_delete_missing_field_leaves_other_columns_alone() {
+        let a = accel(&["kind", "tier"]);
+        a.on_insert("doc-1", &json!({"kind": "a"})); // no tier
+        a.on_insert("doc-2", &json!({"kind": "b", "tier": "x"}));
+        assert_eq!(exists_len(&a, "kind"), 2);
+        assert_eq!(exists_len(&a, "tier"), 1);
+
+        a.on_delete("doc-1", &json!({"kind": "a"}));
+        assert_eq!(exists_len(&a, "kind"), 1);
+        assert_eq!(exists_len(&a, "tier"), 1); // untouched — doc-1 had none
+    }
+
+    /// An update that doesn't change a column's value must leave its bitmaps
+    /// byte-identical (the zero-allocation fast path is a pure no-op).
+    #[test]
+    fn on_update_unchanged_column_is_noop() {
+        let a = accel(&["kind", "tier"]);
+        a.on_insert("doc-1", &json!({"kind": "a", "tier": "x"}));
+        a.on_insert("doc-2", &json!({"kind": "a", "tier": "y"}));
+
+        // Same values on both sides for kind; only tier changes.
+        a.on_update(
+            "doc-1",
+            &json!({"kind": "a", "tier": "x"}),
+            &json!({"kind": "a", "tier": "z"}),
+        );
+
+        let cols = a.columns.read();
+        let kind = cols.get("kind").unwrap();
+        assert_eq!(kind.cardinality.load(Ordering::Relaxed), 1);
+        assert_eq!(kind.value_bitmaps.read().get("a").unwrap().len(), 2);
+        let tier = cols.get("tier").unwrap();
+        let tiers = tier.value_bitmaps.read();
+        assert!(!tiers.contains_key("x"));
+        assert_eq!(tiers.get("z").unwrap().len(), 1);
+        assert_eq!(tiers.get("y").unwrap().len(), 1);
+    }
+
+    /// set_max_cardinality must be visible to subsequent inserts (the hot
+    /// path reads the atomic cache, not the config lock).
+    #[test]
+    fn set_max_cardinality_applies_to_next_insert() {
+        let a = accel(&["kind"]);
+        a.set_max_cardinality(2);
+        a.on_insert("d1", &json!({"kind": "a"}));
+        a.on_insert("d2", &json!({"kind": "b"}));
+        a.on_insert("d3", &json!({"kind": "c"})); // over the cap — not tracked
+
+        let cols = a.columns.read();
+        let kind = cols.get("kind").unwrap();
+        assert_eq!(kind.cardinality.load(Ordering::Relaxed), 2);
+        assert!(!kind.value_bitmaps.read().contains_key("c"));
+        // Presence is still tracked past the cap.
+        assert_eq!(kind.exists_bitmap.read().len(), 3);
+    }
+
+    /// resolve_window windows over resolved ids (holes from deletes are
+    /// skipped without consuming the window) in ascending position order.
+    #[test]
+    fn resolve_window_skips_holes_without_consuming_window() {
+        let a = accel(&["kind"]);
+        for i in 0..5 {
+            a.on_insert(&format!("doc-{i}"), &json!({"kind": "a"}));
+        }
+        a.on_delete("doc-2", &json!({"kind": "a"})); // hole at position 2
+
+        let all: RoaringBitmap = (0u32..5).collect();
+        let ids = a.positions.resolve_window(&all, 0, usize::MAX);
+        assert_eq!(
+            ids.iter().map(|s| s.as_ref()).collect::<Vec<_>>(),
+            ["doc-0", "doc-1", "doc-3", "doc-4"]
+        );
+
+        let ids = a.positions.resolve_window(&all, 1, 2);
+        assert_eq!(
+            ids.iter().map(|s| s.as_ref()).collect::<Vec<_>>(),
+            ["doc-1", "doc-3"]
+        );
     }
 }

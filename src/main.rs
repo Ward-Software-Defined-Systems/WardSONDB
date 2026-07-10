@@ -111,11 +111,12 @@ async fn main() {
             storage
                 .scan_accelerator
                 .configure_fields(bitmap_fields.clone());
-            {
-                let mut cfg = storage.scan_accelerator.config_mut();
-                cfg.max_cardinality = config.bitmap_max_cardinality;
-                cfg.max_memory_bytes = resolve_bitmap_memory_limit(config.bitmap_memory_mb);
-            }
+            storage
+                .scan_accelerator
+                .set_max_cardinality(config.bitmap_max_cardinality);
+            storage
+                .scan_accelerator
+                .set_max_memory_bytes(resolve_bitmap_memory_limit(config.bitmap_memory_mb));
 
             // Try loading from disk first, then rebuild from storage
             let loaded = storage.scan_accelerator.load_from_disk(data_dir, "_all");

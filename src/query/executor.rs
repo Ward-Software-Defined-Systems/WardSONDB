@@ -864,14 +864,22 @@ fn execute_bitmap_scan(
         });
     }
 
-    // Load documents by position
+    // Resolve every matching position to its id under ONE short guard —
+    // the per-position lookup took the position read lock once per doc, and
+    // holding any single guard across the get() IO loop is the b965de5
+    // deadlock pattern.
+    let ids = storage
+        .scan_accelerator
+        .positions
+        .resolve_window(&bitmap, 0, usize::MAX);
+
+    // Load documents by id
     let docs_partition = storage.get_docs_partition(collection)?;
-    let mut loaded_docs = Vec::new();
+    let mut loaded_docs = Vec::with_capacity(ids.len());
     let mut docs_scanned = 0u64;
 
-    for pos in bitmap.iter() {
-        if let Some(doc_id) = storage.scan_accelerator.positions.get_doc_id(pos)
-            && let Ok(Some(bytes)) = storage.engine.get(&docs_partition, doc_id.as_bytes())
+    for doc_id in &ids {
+        if let Ok(Some(bytes)) = storage.engine.get(&docs_partition, doc_id.as_bytes())
             && let Ok(doc) = serde_json::from_slice::<Value>(&bytes)
         {
             docs_scanned += 1;

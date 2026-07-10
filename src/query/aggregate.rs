@@ -366,13 +366,14 @@ impl AccumulatorState {
                 }
             }
             (AccumulatorState::Min(current), AccumulatorDef::Min(field)) => {
+                // Compare borrowed, clone only when the value becomes the new
+                // extreme — not once per document.
                 if let Some(val) = resolve_json_path(doc, field) {
-                    let val = val.clone();
                     match current {
-                        None => *current = Some(val),
+                        None => *current = Some(val.clone()),
                         Some(cur) => {
-                            if compare_for_minmax(&val, cur) == std::cmp::Ordering::Less {
-                                *current = Some(val);
+                            if compare_for_minmax(val, cur) == std::cmp::Ordering::Less {
+                                *current = Some(val.clone());
                             }
                         }
                     }
@@ -380,12 +381,11 @@ impl AccumulatorState {
             }
             (AccumulatorState::Max(current), AccumulatorDef::Max(field)) => {
                 if let Some(val) = resolve_json_path(doc, field) {
-                    let val = val.clone();
                     match current {
-                        None => *current = Some(val),
+                        None => *current = Some(val.clone()),
                         Some(cur) => {
-                            if compare_for_minmax(&val, cur) == std::cmp::Ordering::Greater {
-                                *current = Some(val);
+                            if compare_for_minmax(val, cur) == std::cmp::Ordering::Greater {
+                                *current = Some(val.clone());
                             }
                         }
                     }

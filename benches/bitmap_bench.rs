@@ -32,10 +32,7 @@ fn setup_storage_with_bitmap(n: u64, bitmap_fields: Vec<String>) -> (Storage, Te
     storage
         .scan_accelerator
         .configure_fields(bitmap_fields.clone());
-    {
-        let mut cfg = storage.scan_accelerator.config_mut();
-        cfg.max_cardinality = 1000;
-    }
+    storage.scan_accelerator.set_max_cardinality(1000);
 
     // Insert in batches
     let batch_size = 500;

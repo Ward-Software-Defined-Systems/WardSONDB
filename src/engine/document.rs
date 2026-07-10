@@ -51,11 +51,14 @@ impl Storage {
             .as_object_mut()
             .ok_or_else(|| AppError::InvalidDocument("Document must be a JSON object".into()))?;
 
+        // Resolved once — the custom-id duplicate check and the write below
+        // share it instead of re-deriving the handle per use.
+        let docs_partition = self.get_docs_partition(collection)?;
+
         // Determine ID: use custom _id if provided, otherwise generate UUIDv7
         let id = if let Some(raw_id) = obj.remove("_id") {
             let custom_id = validate_custom_id(&raw_id)?;
             // Check for duplicate
-            let docs_partition = self.get_docs_partition(collection)?;
             if self
                 .engine
                 .get(&docs_partition, custom_id.as_bytes())?
@@ -82,7 +85,6 @@ impl Storage {
             return Err(AppError::DocumentTooLarge);
         }
 
-        let docs_partition = self.get_docs_partition(collection)?;
         let mut batch = self.write_batch();
         batch.insert(&docs_partition, id.as_bytes(), &bytes);
         self.index_manager
