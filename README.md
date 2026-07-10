@@ -327,7 +327,7 @@ To add, remove, or change bitmap fields, update the `--bitmap-fields` flag and r
 
 - **Alpha feature** — API and behavior may change
 - Only effective for low-cardinality fields (< ~100 distinct values)
-- Auto-detection profiles field cardinality from new inserts only during the sample window (default 10,000 inserts). Existing documents loaded from storage on restart are not profiled. If you restart with millions of existing documents and no `--bitmap-fields` flag, auto-detection won't activate until 10,000 new documents are inserted. For existing datasets, always specify `--bitmap-fields` explicitly
+- **Activation requires `--bitmap-fields` at startup.** Auto-detection is recommendation-only: it profiles the first N new inserts (default 10,000, `--bitmap-sample-size`) and logs a suggested `--bitmap-fields` value — it never enables bitmaps by itself, because documents inserted before detection completes would be missing from the bitmaps (the startup flag rebuilds them from storage before serving). Existing documents are not profiled
 - Bitmap scan is used for count-only queries and aggregations; document-return queries may still use index paths
 
 ### Query Planner Priority

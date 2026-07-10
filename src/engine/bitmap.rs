@@ -283,6 +283,12 @@ impl ScanAccelerator {
         self.config.write().max_memory_bytes = v;
     }
 
+    /// Number of inserts the cardinality profiler samples before it reports
+    /// its `--bitmap-fields` recommendation (`--bitmap-sample-size`).
+    pub fn set_sample_size(&self, n: u32) {
+        self.profiler.set_sample_target(n);
+    }
+
     pub fn config_read(&self) -> parking_lot::RwLockReadGuard<'_, AcceleratorConfig> {
         self.config.read()
     }
@@ -333,12 +339,6 @@ impl ScanAccelerator {
         !self.columns.read().is_empty()
     }
 
-    /// Check if a rebuild is needed (auto-detection completed but accelerator not ready).
-    #[allow(dead_code)]
-    pub fn needs_rebuild(&self) -> bool {
-        !self.is_ready() && self.has_columns() && self.profiler.is_done()
-    }
-
     /// Check if position map has excessive holes from TTL deletes (>25%).
     pub fn needs_compaction(&self) -> bool {
         self.positions.hole_ratio() > 0.25
@@ -361,26 +361,25 @@ impl ScanAccelerator {
                 let max_card = self.max_cardinality.load(Ordering::Relaxed);
                 let detected = self.profiler.analyze(max_card);
                 if !detected.is_empty() {
-                    let fields: Vec<String> = detected.iter().map(|(f, _)| f.clone()).collect();
                     let field_info: Vec<String> = detected
                         .iter()
                         .map(|(f, c)| format!("{f} ({c} values)"))
                         .collect();
+                    let flag_value: Vec<String> = detected.iter().map(|(f, _)| f.clone()).collect();
+                    // Recommendation ONLY — never create columns here. Docs
+                    // inserted before detection were only profiled, so columns
+                    // born now would be missing them forever (no safe live
+                    // rebuild exists yet), and create_collection's re-arm
+                    // (set_ready on has_columns) would start serving those
+                    // incomplete bitmaps: silent false negatives. Activation
+                    // requires --bitmap-fields at startup, which rebuilds from
+                    // storage before serving.
                     info!(
                         fields = %field_info.join(", "),
-                        "Scan accelerator: auto-detected bitmap fields"
+                        flag = %format!("--bitmap-fields {}", flag_value.join(",")),
+                        "Scan accelerator: low-cardinality fields detected — \
+                         inactive; restart with the suggested flag to enable"
                     );
-                    let mut cols = self.columns.write();
-                    for (field, _) in &detected {
-                        if !cols.contains_key(field) {
-                            cols.insert(field.clone(), BitmapColumn::new(field.clone()));
-                        }
-                    }
-                    drop(cols);
-                    self.config.write().bitmap_fields = fields;
-                    // Note: The accelerator needs a full rebuild to populate
-                    // the newly detected columns. This is handled externally
-                    // (the caller checks needs_rebuild()).
                 }
                 self.profiler.finish();
             }
@@ -1193,7 +1192,7 @@ pub struct CardinalityProfiler {
     /// field_path -> set of observed distinct values
     observed: RwLock<HashMap<String, HashSet<String>>>,
     sample_count: AtomicU32,
-    sample_target: u32,
+    sample_target: AtomicU32,
     done: AtomicBool,
     /// If true, skip profiling (fields were explicitly configured)
     skip: bool,
@@ -1204,15 +1203,17 @@ impl CardinalityProfiler {
         CardinalityProfiler {
             observed: RwLock::new(HashMap::new()),
             sample_count: AtomicU32::new(0),
-            sample_target: 10_000,
+            sample_target: AtomicU32::new(10_000),
             done: AtomicBool::new(skip),
             skip,
         }
     }
 
-    #[allow(dead_code)]
-    pub fn set_sample_target(&self, _target: u32) {
-        // sample_target is set at construction time; this is a no-op placeholder
+    /// Set how many inserts to profile before detection completes
+    /// (`--bitmap-sample-size`). Was a no-op placeholder until the flag was
+    /// wired up; a zero target is clamped to 1 so detection still terminates.
+    pub fn set_sample_target(&self, target: u32) {
+        self.sample_target.store(target.max(1), Ordering::Relaxed);
     }
 
     pub fn is_done(&self) -> bool {
@@ -1261,7 +1262,7 @@ impl CardinalityProfiler {
             }
         }
 
-        if count >= self.sample_target {
+        if count >= self.sample_target.load(Ordering::Relaxed) {
             self.done.store(true, Ordering::Relaxed);
         }
     }

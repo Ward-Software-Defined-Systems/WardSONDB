@@ -100,6 +100,10 @@ async fn main() {
 
     // Configure scan accelerator
     if !config.no_bitmap {
+        storage
+            .scan_accelerator
+            .set_sample_size(config.bitmap_sample_size);
+
         let bitmap_fields: Vec<String> = config
             .bitmap_fields
             .split(',')
@@ -126,7 +130,8 @@ async fn main() {
             storage.scan_accelerator.set_ready(true);
             info!(fields = ?bitmap_fields, "Scan accelerator configured");
         }
-        // If no explicit fields, auto-detection happens during inserts
+        // With no explicit fields, the profiler samples inserts and logs a
+        // --bitmap-fields recommendation; nothing activates without the flag.
     } else {
         info!("Scan accelerator disabled (--no-bitmap)");
     }

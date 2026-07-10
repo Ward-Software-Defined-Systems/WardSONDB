@@ -3622,8 +3622,31 @@ async fn test_bitmap_cardinality_cap() {
 /// get auto-detected. Uses bitmap_sample_size=100 in test config.
 #[tokio::test]
 async fn test_bitmap_auto_detection() {
-    // Start server WITHOUT explicit bitmap fields — relies on auto-detection
-    let (base_url, _tmp) = start_test_server().await;
+    // Server WITHOUT explicit bitmap fields, sample window shrunk to 100 so
+    // detection completes inside the test (the profiler target is what
+    // --bitmap-sample-size wires in main.rs).
+    let tmp = TempDir::new().unwrap();
+    let storage = Storage::open(tmp.path()).unwrap();
+    storage.scan_accelerator.set_sample_size(100);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let state = Arc::new(AppState {
+        storage,
+        config: test_config(&tmp, port),
+        started_at: Instant::now(),
+        metrics: Arc::new(Metrics::new()),
+        api_keys: vec![],
+    });
+    let app = build_router(state);
+    let addr = format!("127.0.0.1:{port}");
+    let tcp = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    tokio::spawn(async move {
+        axum::serve(tcp, app).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let base_url = format!("http://{addr}");
     let client = Client::new();
 
     client
@@ -3633,7 +3656,9 @@ async fn test_bitmap_auto_detection() {
         .await
         .unwrap();
 
-    // Insert 120 docs (> sample_size of 100) with low-cardinality fields
+    // 120 docs (> sample target of 100): docs 1..=100 are only PROFILED —
+    // detection fires at #100, so any columns created then would be missing
+    // them forever.
     let docs: Vec<Value> = (0..120)
         .map(|i| {
             json!({
@@ -3643,8 +3668,6 @@ async fn test_bitmap_auto_detection() {
             })
         })
         .collect();
-
-    // Bulk insert in batches
     for chunk in docs.chunks(60) {
         client
             .post(format!("{base_url}/events/docs/_bulk"))
@@ -3654,16 +3677,66 @@ async fn test_bitmap_auto_detection() {
             .unwrap();
     }
 
-    // Check stats to see if accelerator detected fields
-    let resp = client
+    // Detection is recommendation-only: nothing activates, no columns exist.
+    let body: Value = client
         .get(format!("{base_url}/_stats"))
         .send()
         .await
+        .unwrap()
+        .json()
+        .await
         .unwrap();
-    let body: Value = resp.json().await.unwrap();
-    // The accelerator may or may not be ready depending on timing,
-    // but the scan_accelerator section should exist in stats
-    assert!(body["data"]["scan_accelerator"].is_object());
+    let accel = &body["data"]["scan_accelerator"];
+    assert_eq!(accel["ready"], false);
+    assert_eq!(accel["bitmap_columns"].as_array().unwrap().len(), 0);
+
+    // The old landmine: create_collection re-arms (set_ready) whenever
+    // columns exist. With auto-created columns that meant serving bitmaps
+    // missing every pre-detection doc — silent false negatives. Pin that a
+    // later collection creation neither activates the accelerator nor
+    // changes query results.
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "other"}))
+        .send()
+        .await
+        .unwrap();
+
+    let body: Value = client
+        .get(format!("{base_url}/_stats"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["data"]["scan_accelerator"]["ready"], false);
+
+    let body: Value = client
+        .post(format!("{base_url}/events/query"))
+        .json(&json!({"filter": {"event_type": "A"}, "count_only": true}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // 0..120 step 3 → 40 matches. Pre-fix this returned only the ~7
+    // post-detection docs via scan_strategy "bitmap".
+    assert_eq!(body["data"]["count"], 40);
+    assert_eq!(body["meta"]["scan_strategy"], "full_scan");
+
+    let body: Value = client
+        .post(format!("{base_url}/events/query"))
+        .json(&json!({"filter": {"event_type": "A"}, "limit": 200}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["data"].as_array().unwrap().len(), 40);
+    assert_ne!(body["meta"]["scan_strategy"], "bitmap");
 }
 
 /// Test 72: Bitmap persistence — build accelerator, check stats show data
