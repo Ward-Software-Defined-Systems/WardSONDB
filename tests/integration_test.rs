@@ -8366,3 +8366,92 @@ async fn test_cursor_size_guard_long_sort_values() {
         "oversize boundary value must omit next_cursor"
     );
 }
+
+/// DT-13/S3-7: sort values containing the index key encoding's separator
+/// bytes — NUL (the doc-id separator) and 0x01 (the compound field
+/// separator) — resume correctly through `index_sorted` cursor seeks. The
+/// seek key builder (`index_cursor_key`) must stay byte-identical to
+/// `make_compound_index_key`, or a walk skips/repeats around these values.
+#[tokio::test]
+async fn test_cursor_walk_index_sorted_separator_bytes() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "seps"}))
+        .send()
+        .await
+        .unwrap();
+    // Byte order of the values: "a" < "a\0b" < "a\0c" < "a\u{1}b" < "ab"
+    // < "b" < "b\0" — adjacent pairs differ exactly around the separator
+    // bytes a wrongly-built seek key would collide with.
+    let vals = [
+        "a",
+        "a\u{0000}b",
+        "a\u{0000}c",
+        "a\u{0001}b",
+        "ab",
+        "b",
+        "b\u{0000}",
+    ];
+    let docs: Vec<Value> = vals
+        .iter()
+        .enumerate()
+        .map(|(i, v)| json!({"_id": format!("s{i}"), "grp": "g", "val": v}))
+        .collect();
+    let resp = client
+        .post(format!("{base_url}/seps/docs/_bulk"))
+        .json(&json!({"documents": docs}))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let resp = client
+        .post(format!("{base_url}/seps/indexes"))
+        .json(&json!({"name": "idx_grp_val", "fields": ["grp", "val"]}))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+
+    for dir in ["asc", "desc"] {
+        let body = json!({
+            "filter": {"grp": "g"},
+            "sort": [{"val": dir}],
+            "limit": 2
+        });
+        // Inline walk so every page can assert it stayed on the seek path.
+        let mut all = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut req = body.clone();
+            if let Some(c) = &cursor {
+                req["cursor"] = json!(c);
+            }
+            let resp = client
+                .post(format!("{base_url}/seps/query"))
+                .json(&req)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            let resp_body: Value = resp.json().await.unwrap();
+            assert_eq!(
+                resp_body["meta"]["scan_strategy"], "index_sorted",
+                "direction {dir}: cursor pages must stay on the seek path"
+            );
+            all.extend(resp_body["data"].as_array().unwrap().iter().cloned());
+            match resp_body["meta"]["next_cursor"].as_str() {
+                Some(c) => cursor = Some(c.to_string()),
+                None => break,
+            }
+        }
+        assert_eq!(all.len(), vals.len(), "direction {dir}: no skips, no dups");
+        assert_eq!(
+            ids_of(&all),
+            reference_ids(&client, &base_url, "seps", body).await,
+            "direction {dir}: pages must equal the one-shot result"
+        );
+    }
+}

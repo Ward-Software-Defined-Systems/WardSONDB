@@ -4,8 +4,8 @@ use crate::engine::backend::StorageBackend;
 use crate::engine::storage::Storage;
 use crate::error::AppError;
 use crate::index::secondary::{
-    RangeScanBounds, extract_doc_id_from_key, prefix_successor, range_scan_bounds,
-    value_to_sortable_bytes,
+    RangeScanBounds, extract_doc_id_from_key, make_compound_index_key, prefix_successor,
+    range_scan_bounds, value_to_sortable_bytes,
 };
 
 use super::cursor::{Cursor, CursorValue, compare_doc_to_cursor, encode_cursor};
@@ -548,23 +548,28 @@ fn execute_index_scan(
 }
 
 /// Rebuild the exact index key for a cursor position under this plan's
-/// prefix: `prefix ++ join(0x01, sortable(values)) ++ 0x00 ++ last_id` —
-/// byte-identical to `make_compound_index_key` for the eq+sort fields (the
-/// planner prefix already carries its trailing 0x01 separator).
+/// prefix: the cursor's (sort values, last_id) tail IS a compound index key,
+/// so reuse `make_compound_index_key` — the planner prefix already carries
+/// its trailing 0x01 separator.
 fn index_cursor_key(prefix: &[u8], cursor: &Cursor) -> Vec<u8> {
+    // Missing is unreachable on this path (the planner rejects such cursors
+    // before choosing an index seek); filter_map keeps the function total and
+    // the debug_assert pins the invariant.
+    let values: Vec<&Value> = cursor
+        .sort_values
+        .iter()
+        .filter_map(|cv| match cv {
+            CursorValue::Present(v) => Some(v),
+            CursorValue::Missing => None,
+        })
+        .collect();
+    debug_assert_eq!(
+        values.len(),
+        cursor.sort_values.len(),
+        "cursor with Missing sort values must not reach the index seek path"
+    );
     let mut key = prefix.to_vec();
-    for (i, cv) in cursor.sort_values.iter().enumerate() {
-        if i > 0 {
-            key.push(0x01);
-        }
-        // Missing is unreachable on this path (the planner rejects such
-        // cursors); encoding nothing keeps the function total.
-        if let CursorValue::Present(v) = cv {
-            key.extend_from_slice(&value_to_sortable_bytes(v));
-        }
-    }
-    key.push(0x00);
-    key.extend_from_slice(cursor.last_id.as_bytes());
+    key.extend_from_slice(&make_compound_index_key(&values, &cursor.last_id));
     key
 }
 
