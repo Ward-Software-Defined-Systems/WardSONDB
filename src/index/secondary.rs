@@ -97,6 +97,26 @@ pub fn make_compound_index_key(values: &[&Value], doc_id: &str) -> Vec<u8> {
     key
 }
 
+/// Smallest byte string greater than every key that has `prefix` as a
+/// prefix — the exclusive upper bound of a prefix window, or the inclusive
+/// start that skips exactly that prefix's keys. Planner-built prefixes always
+/// end with a 0x00/0x01 separator, so in practice this bumps that byte; the
+/// loop handles trailing 0xFF for generality. An all-0xFF prefix has no
+/// finite successor (unreachable here), so a maximal sentinel keeps the
+/// function total.
+pub fn prefix_successor(prefix: &[u8]) -> Vec<u8> {
+    let mut p = prefix.to_vec();
+    while let Some(&last) = p.last() {
+        if last == 0xFF {
+            p.pop();
+        } else {
+            *p.last_mut().unwrap() = last + 1;
+            return p;
+        }
+    }
+    vec![0xFF; prefix.len() + 1]
+}
+
 /// Decode sortable bytes back into a JSON value (inverse of value_to_sortable_bytes).
 pub fn decode_sortable_bytes(bytes: &[u8]) -> Option<Value> {
     if bytes.is_empty() {

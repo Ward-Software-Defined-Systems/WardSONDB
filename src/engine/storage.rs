@@ -181,7 +181,11 @@ impl Storage {
             let col_name = key_str.strip_prefix("collection:").unwrap_or(key_str);
 
             let docs_partition = self.create_partition(&format!("{col_name}#docs"))?;
-            let count = self.engine.full_iterator(&docs_partition)?.count() as i64;
+            // Keys-only exact count — full_iterator materializes every doc's
+            // key+value just to count them (O(dataset) transient RAM at
+            // startup). Exactness is required: these counters are
+            // authoritative for count_only.
+            let count = self.engine.count_prefix(&docs_partition, b"")? as i64;
             self.doc_counts.initialize(col_name, count);
         }
         Ok(())

@@ -6989,3 +6989,117 @@ async fn test_regex_semantics_preserved() {
     assert_eq!(status, 400);
     assert_eq!(body["error"]["code"], "INVALID_QUERY");
 }
+
+/// Restart seeding must stay EXACT — DocCounters is authoritative for
+/// count_only — and now counts keys without materializing values. Covers
+/// both engines and mixes custom ids with UUIDv7 ids (partially discharges
+/// DT-17's restart half).
+#[test]
+fn test_doc_count_reseed_on_restart() {
+    use wardsondb::engine::storage::MemoryConfig;
+
+    for engine in ["rocksdb", "fjall"] {
+        let tmp = TempDir::new().unwrap();
+        {
+            let storage =
+                Storage::open_with_config(tmp.path(), engine, MemoryConfig::default()).unwrap();
+            storage.create_collection("events").unwrap();
+            for i in 0..25 {
+                storage
+                    .insert_document("events", json!({"seq": i}))
+                    .unwrap();
+            }
+            for i in 0..5 {
+                storage
+                    .insert_document(
+                        "events",
+                        json!({"_id": format!("custom-{i}"), "seq": 100 + i}),
+                    )
+                    .unwrap();
+            }
+            assert_eq!(storage.doc_counts.get("events"), 30, "{engine}: live count");
+        } // storage dropped — engine closed
+
+        let storage =
+            Storage::open_with_config(tmp.path(), engine, MemoryConfig::default()).unwrap();
+        assert_eq!(
+            storage.doc_counts.get("events"),
+            30,
+            "{engine}: reseeded count after restart must be exact"
+        );
+    }
+}
+
+/// Range-count boundary math: the backend count_range starts at the
+/// successor of the exclusive-lower exact prefix — it must agree with the
+/// materializing (non-count) path on every bound shape, including empty and
+/// inverted windows.
+#[tokio::test]
+async fn test_count_range_exclusive_bounds() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "nums"}))
+        .send()
+        .await
+        .unwrap();
+    let docs: Vec<Value> = (0..20).map(|i| json!({"seq": i})).collect();
+    client
+        .post(format!("{base_url}/nums/docs/_bulk"))
+        .json(&json!({"documents": docs}))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base_url}/nums/indexes"))
+        .json(&json!({"name": "idx_seq", "field": "seq"}))
+        .send()
+        .await
+        .unwrap();
+
+    let cases = [
+        (json!({"seq": {"$gt": 5}}), 14u64),
+        (json!({"seq": {"$gte": 5}}), 15),
+        (json!({"seq": {"$lt": 5}}), 5),
+        (json!({"seq": {"$lte": 5}}), 6),
+        (json!({"seq": {"$gt": 5, "$lte": 10}}), 5),
+        (json!({"seq": {"$gte": 5, "$lt": 10}}), 5),
+        (json!({"seq": {"$gt": 4, "$lt": 5}}), 0),
+        (json!({"seq": {"$gte": 10, "$lt": 5}}), 0), // inverted → guarded zero
+    ];
+
+    for (filter, expected) in cases {
+        let resp = client
+            .post(format!("{base_url}/nums/query"))
+            .json(&json!({"filter": filter.clone(), "count_only": true}))
+            .send()
+            .await
+            .unwrap();
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["data"]["count"].as_u64().unwrap(),
+            expected,
+            "count_only for {filter}"
+        );
+
+        let resp = client
+            .post(format!("{base_url}/nums/query"))
+            .json(&json!({"filter": filter.clone(), "limit": 100}))
+            .send()
+            .await
+            .unwrap();
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["meta"]["total_count"].as_u64().unwrap(),
+            expected,
+            "non-count total_count for {filter}"
+        );
+        assert_eq!(
+            body["data"].as_array().unwrap().len() as u64,
+            expected,
+            "returned docs for {filter}"
+        );
+    }
+}

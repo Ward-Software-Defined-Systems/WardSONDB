@@ -152,6 +152,42 @@ impl StorageBackend for FjallBackend {
         Ok(BackendIterator::from_fjall(items))
     }
 
+    fn count_prefix(&self, partition: &PartitionId, prefix: &[u8]) -> BackendResult<u64> {
+        let PartitionId::Fjall(handle) = partition else {
+            return Err(BackendError::Internal(
+                "PartitionId/backend mismatch".into(),
+            ));
+        };
+        // Slices are refcounted views — counting drops them without the
+        // to_vec copies the iterator methods pay. Snapshot-exact (MVCC tx).
+        let rtx = self.db.read_tx();
+        let mut count = 0u64;
+        for item in rtx.prefix(handle, prefix) {
+            item.map_err(|e| BackendError::Internal(e.to_string()))?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    fn count_range(&self, partition: &PartitionId, start: &[u8], end: &[u8]) -> BackendResult<u64> {
+        if start >= end {
+            // fjall's RangeBounds would panic on an inverted range.
+            return Ok(0);
+        }
+        let PartitionId::Fjall(handle) = partition else {
+            return Err(BackendError::Internal(
+                "PartitionId/backend mismatch".into(),
+            ));
+        };
+        let rtx = self.db.read_tx();
+        let mut count = 0u64;
+        for item in rtx.range(handle, start.to_vec()..end.to_vec()) {
+            item.map_err(|e| BackendError::Internal(e.to_string()))?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
     fn first_key(&self, partition: &PartitionId) -> BackendResult<Option<Vec<u8>>> {
         let PartitionId::Fjall(handle) = partition else {
             return Err(BackendError::Internal(

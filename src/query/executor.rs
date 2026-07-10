@@ -3,7 +3,7 @@ use serde_json::Value;
 use crate::engine::backend::StorageBackend;
 use crate::engine::storage::Storage;
 use crate::error::AppError;
-use crate::index::secondary::{extract_doc_id_from_key, value_to_sortable_bytes};
+use crate::index::secondary::{extract_doc_id_from_key, prefix_successor, value_to_sortable_bytes};
 
 use super::cursor::{Cursor, CursorValue, compare_doc_to_cursor, encode_cursor};
 use super::filter::resolve_json_path;
@@ -385,11 +385,9 @@ fn execute_index_scan(
                     .ok_or_else(|| {
                         AppError::Internal(format!("Index partition not found: {index_name}"))
                     })?;
-                let count = storage
-                    .engine
-                    .prefix_iterator(&partition, prefix)?
-                    .flatten()
-                    .count() as u64;
+                // Keys-only backend count; errors propagate instead of the
+                // old flatten().count() silently undercounting on them.
+                let count = storage.engine.count_prefix(&partition, prefix)?;
                 return Ok(QueryResult {
                     docs: vec![],
                     total_count: Some(count),
@@ -482,25 +480,6 @@ fn execute_index_scan(
         has_more,
         next_cursor,
     })
-}
-
-/// Smallest byte string greater than every key that has `prefix` as a
-/// prefix — the exclusive upper bound of the prefix window. IndexSorted
-/// prefixes always end with the 0x01 field separator, so in practice this
-/// bumps that byte; the loop handles trailing 0xFF for generality. An
-/// all-0xFF prefix has no finite successor (unreachable here), so a maximal
-/// sentinel keeps the function total.
-fn prefix_successor(prefix: &[u8]) -> Vec<u8> {
-    let mut p = prefix.to_vec();
-    while let Some(&last) = p.last() {
-        if last == 0xFF {
-            p.pop();
-        } else {
-            *p.last_mut().unwrap() = last + 1;
-            return p;
-        }
-    }
-    vec![0xFF; prefix.len() + 1]
 }
 
 /// Rebuild the exact index key for a cursor position under this plan's
@@ -735,23 +714,19 @@ fn execute_compound_range(
         None
     };
 
-    // count_only optimization: count index keys without loading docs
+    // count_only optimization: count index keys without loading docs.
+    // Starting at the successor of the exclusive-lower exact prefix counts
+    // exactly what the old skip loop counted (the skipped keys are precisely
+    // the `lower_exact_prefix`-prefixed span at the start of the range),
+    // without materializing a single entry.
     if query.count_only && plan.post_filter.is_none() {
-        let mut count = 0u64;
-        for kv in storage.engine.range_iterator(
-            &partition,
-            start_key.as_slice(),
-            end_key.as_slice(),
-            None,
-        )? {
-            let (key, _) = kv?;
-            if let Some(ref prefix) = lower_exact_prefix
-                && key.starts_with(prefix)
-            {
-                continue;
-            }
-            count += 1;
-        }
+        let effective_start = match &lower_exact_prefix {
+            Some(p) => prefix_successor(p),
+            None => start_key.clone(),
+        };
+        let count = storage
+            .engine
+            .count_range(&partition, &effective_start, &end_key)?;
         return Ok(QueryResult {
             docs: vec![],
             total_count: Some(count),

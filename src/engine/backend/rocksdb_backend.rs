@@ -295,6 +295,49 @@ impl StorageBackend for RocksDbBackend {
         )))
     }
 
+    fn count_prefix(&self, partition: &PartitionId, prefix: &[u8]) -> BackendResult<u64> {
+        let (db, cf_name) = unwrap_rocks(partition)?;
+        let cf = db
+            .cf_handle(cf_name)
+            .ok_or_else(|| BackendError::Internal(format!("CF not found: {cf_name}")))?;
+        // Raw iterator: keys are only borrowed to test the prefix, values are
+        // never copied. status() after the loop surfaces iteration errors.
+        let mut iter = db.raw_iterator_cf(&cf);
+        iter.seek(prefix);
+        let mut count = 0u64;
+        while let Some(k) = iter.key() {
+            if !k.starts_with(prefix) {
+                break;
+            }
+            count += 1;
+            iter.next();
+        }
+        iter.status().map_err(rocks_err)?;
+        Ok(count)
+    }
+
+    fn count_range(&self, partition: &PartitionId, start: &[u8], end: &[u8]) -> BackendResult<u64> {
+        if start >= end {
+            return Ok(0);
+        }
+        let (db, cf_name) = unwrap_rocks(partition)?;
+        let cf = db
+            .cf_handle(cf_name)
+            .ok_or_else(|| BackendError::Internal(format!("CF not found: {cf_name}")))?;
+        let mut iter = db.raw_iterator_cf(&cf);
+        iter.seek(start);
+        let mut count = 0u64;
+        while let Some(k) = iter.key() {
+            if k >= end {
+                break;
+            }
+            count += 1;
+            iter.next();
+        }
+        iter.status().map_err(rocks_err)?;
+        Ok(count)
+    }
+
     fn first_key(&self, partition: &PartitionId) -> BackendResult<Option<Vec<u8>>> {
         let (db, cf_name) = unwrap_rocks(partition)?;
         let cf = db

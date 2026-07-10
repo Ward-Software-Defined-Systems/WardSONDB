@@ -197,6 +197,15 @@ pub trait StorageBackend: Send + Sync {
         max_results: Option<usize>,
     ) -> BackendResult<BackendIterator>;
     fn full_iterator(&self, partition: &PartitionId) -> BackendResult<BackendIterator>;
+    /// Count keys with the given prefix WITHOUT materializing keys or values
+    /// (the iterator methods buffer everything they visit). Exact, under the
+    /// same snapshot semantics as `prefix_iterator`; an empty prefix counts
+    /// the whole partition. Iteration errors surface as `Err` — unlike the
+    /// buffering iterators, which truncate on a mid-stream error.
+    fn count_prefix(&self, partition: &PartitionId, prefix: &[u8]) -> BackendResult<u64>;
+    /// Count keys `start <= k < end` without materializing. `start >= end`
+    /// counts zero (guarded — an inverted range must not reach the engine).
+    fn count_range(&self, partition: &PartitionId, start: &[u8], end: &[u8]) -> BackendResult<u64>;
     fn first_key(&self, partition: &PartitionId) -> BackendResult<Option<Vec<u8>>>;
     fn last_key(&self, partition: &PartitionId) -> BackendResult<Option<Vec<u8>>>;
     fn write_batch(&self) -> WriteBatchWrapper;
@@ -276,6 +285,18 @@ impl StorageBackend for Engine {
         match self {
             Engine::Fjall(b) => b.full_iterator(partition),
             Engine::RocksDb(b) => b.full_iterator(partition),
+        }
+    }
+    fn count_prefix(&self, partition: &PartitionId, prefix: &[u8]) -> BackendResult<u64> {
+        match self {
+            Engine::Fjall(b) => b.count_prefix(partition, prefix),
+            Engine::RocksDb(b) => b.count_prefix(partition, prefix),
+        }
+    }
+    fn count_range(&self, partition: &PartitionId, start: &[u8], end: &[u8]) -> BackendResult<u64> {
+        match self {
+            Engine::Fjall(b) => b.count_range(partition, start, end),
+            Engine::RocksDb(b) => b.count_range(partition, start, end),
         }
     }
     fn first_key(&self, partition: &PartitionId) -> BackendResult<Option<Vec<u8>>> {
