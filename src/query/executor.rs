@@ -254,6 +254,50 @@ fn execute_full_scan_id_seek(
     })
 }
 
+/// Load only the `offset..offset+limit` window of an ordered candidate id
+/// list — the bare-page fast path where no post-filter, sort, or cursor can
+/// change which ids form the page. Framing matches `paginate_materialized`
+/// exactly (`start = offset.min(len)`, `end = (start+limit).min(len)`,
+/// `has_more = len > end`). Ids whose doc vanished in the index-read→get gap
+/// shorten the page rather than shifting it — the same snapshot-gap semantic
+/// as the count fast paths. Returns `(docs, docs_scanned, has_more)`;
+/// `docs_scanned` counts the gets performed (the window), not the candidates.
+fn load_id_window(
+    storage: &Storage,
+    collection: &str,
+    query: &ParsedQuery,
+    candidate_ids: &[String],
+) -> Result<(Vec<Value>, u64, bool), AppError> {
+    let total = candidate_ids.len();
+    let start = (query.offset as usize).min(total);
+    let end = start.saturating_add(query.limit as usize).min(total);
+
+    let docs_partition = storage.get_docs_partition(collection)?;
+    let mut docs = Vec::with_capacity(end - start);
+    for id in &candidate_ids[start..end] {
+        if let Ok(Some(bytes)) = storage.engine.get(&docs_partition, id.as_bytes())
+            && let Ok(doc) = serde_json::from_slice::<Value>(&bytes)
+        {
+            docs.push(doc);
+        }
+    }
+    let docs_scanned = (end - start) as u64;
+    let has_more = total > end;
+
+    let docs = if let Some(ref fields) = query.fields {
+        docs.iter().map(|doc| project_fields(doc, fields)).collect()
+    } else {
+        docs
+    };
+    Ok((docs, docs_scanned, has_more))
+}
+
+/// True when nothing after the scan can change which candidates form the
+/// page: no residual filter, no sort, no cursor, and docs are wanted.
+fn bare_page(query: &ParsedQuery, post_filter: &Option<crate::query::filter::FilterNode>) -> bool {
+    !query.count_only && post_filter.is_none() && query.sort.is_empty() && query.cursor.is_none()
+}
+
 fn execute_index_scan(
     storage: &Storage,
     collection: &str,
@@ -422,6 +466,24 @@ fn execute_index_scan(
         | ScanPlan::CompoundRange { .. }
         | ScanPlan::BitmapScan => unreachable!(),
     };
+
+    // Bare page: the page is exactly candidate_ids[offset..offset+limit] in
+    // index order — load only that window instead of every candidate (an eq
+    // filter matching 50k docs with limit 10 was doing 50k gets + parses).
+    if bare_page(query, &plan.post_filter) {
+        let total = candidate_ids.len() as u64;
+        let (docs, docs_scanned, has_more) =
+            load_id_window(storage, collection, query, &candidate_ids)?;
+        return Ok(QueryResult {
+            docs,
+            total_count: Some(total),
+            docs_scanned,
+            index_used: Some(index_name),
+            scan_strategy: None,
+            has_more,
+            next_cursor: None,
+        });
+    }
 
     let docs_scanned = candidate_ids.len() as u64;
 
@@ -758,6 +820,23 @@ fn execute_compound_range(
         }
     }
 
+    // Bare page: window the range-ordered candidates (same rationale and
+    // semantics as the index-scan fast path above).
+    if bare_page(query, &plan.post_filter) {
+        let total = candidate_ids.len() as u64;
+        let (docs, docs_scanned, has_more) =
+            load_id_window(storage, collection, query, &candidate_ids)?;
+        return Ok(QueryResult {
+            docs,
+            total_count: Some(total),
+            docs_scanned,
+            index_used: Some(index_name.to_string()),
+            scan_strategy: Some("compound_range".to_string()),
+            has_more,
+            next_cursor: None,
+        });
+    }
+
     let docs_scanned = candidate_ids.len() as u64;
 
     // Load documents by ID
@@ -835,6 +914,49 @@ fn execute_bitmap_scan(
             index_used: None,
             scan_strategy: Some("bitmap".to_string()),
             has_more: false,
+            next_cursor: None,
+        });
+    }
+
+    // Bare page: the page is the offset..offset+limit window of the
+    // ascending-position order — resolve and load only that window, with a
+    // +1 probe id so has_more stays exact even across transient holes.
+    // total_count is the bitmap cardinality, matching the count fast path
+    // above (same snapshot-gap semantic as the index windows).
+    if bare_page(query, &bitmap_result.residual_filter) {
+        let total = bitmap.len();
+        let offset = query.offset as usize;
+        let limit = query.limit as usize;
+        let mut ids = storage.scan_accelerator.positions.resolve_window(
+            &bitmap,
+            offset,
+            limit.saturating_add(1),
+        );
+        let has_more = ids.len() > limit;
+        ids.truncate(limit);
+
+        let docs_partition = storage.get_docs_partition(collection)?;
+        let mut docs = Vec::with_capacity(ids.len());
+        for doc_id in &ids {
+            if let Ok(Some(bytes)) = storage.engine.get(&docs_partition, doc_id.as_bytes())
+                && let Ok(doc) = serde_json::from_slice::<Value>(&bytes)
+            {
+                docs.push(doc);
+            }
+        }
+        let docs_scanned = ids.len() as u64;
+        let docs = if let Some(ref fields) = query.fields {
+            docs.iter().map(|doc| project_fields(doc, fields)).collect()
+        } else {
+            docs
+        };
+        return Ok(QueryResult {
+            docs,
+            total_count: Some(total),
+            docs_scanned,
+            index_used: None,
+            scan_strategy: Some("bitmap".to_string()),
+            has_more,
             next_cursor: None,
         });
     }

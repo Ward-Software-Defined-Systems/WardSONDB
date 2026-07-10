@@ -7103,3 +7103,325 @@ async fn test_count_range_exclusive_bounds() {
         );
     }
 }
+
+async fn setup_window_collection(base_url: &str, client: &Client) {
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "events"}))
+        .send()
+        .await
+        .unwrap();
+    // 30 docs, event_type cycles 3 values → 10 "firewall" docs in insertion
+    // (= UUIDv7 id = index within-value) order, seq marks identity.
+    let types = ["firewall", "dns", "dhcp"];
+    let docs: Vec<Value> = (0..30)
+        .map(|i| {
+            json!({
+                "event_type": types[i % 3],
+                "seq": i,
+                "received_at": format!("2026-07-09T00:00:{i:02}Z"),
+            })
+        })
+        .collect();
+    client
+        .post(format!("{base_url}/events/docs/_bulk"))
+        .json(&json!({"documents": docs}))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base_url}/events/indexes"))
+        .json(&json!({"name": "idx_event_type", "field": "event_type"}))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base_url}/events/indexes"))
+        .json(&json!({"name": "idx_type_time", "fields": ["event_type", "received_at"]}))
+        .send()
+        .await
+        .unwrap();
+}
+
+fn seqs(body: &Value) -> Vec<i64> {
+    body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["seq"].as_i64().unwrap())
+        .collect()
+}
+
+/// The windowed fast path must return byte-identical pages to the
+/// materializing path (forced via an always-true residual, which keeps the
+/// same candidate order but disables the window). docs_scanned proves which
+/// path served each side.
+#[tokio::test]
+async fn test_index_eq_window_page_equivalence() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+    setup_window_collection(&base_url, &client).await;
+
+    for (offset, limit) in [(0u64, 3u64), (3, 3), (2, 5), (9, 5)] {
+        let fast: Value = client
+            .post(format!("{base_url}/events/query"))
+            .json(&json!({
+                "filter": {"event_type": "firewall"},
+                "limit": limit, "offset": offset
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let slow: Value = client
+            .post(format!("{base_url}/events/query"))
+            .json(&json!({
+                "filter": {"event_type": "firewall", "_id": {"$exists": true}},
+                "limit": limit, "offset": offset
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            fast["data"], slow["data"],
+            "page mismatch at offset {offset} limit {limit}"
+        );
+        assert_eq!(fast["meta"]["total_count"], slow["meta"]["total_count"]);
+        assert_eq!(fast["meta"]["total_count"], 10);
+        assert_eq!(fast["meta"]["index_used"], "idx_event_type");
+        // Proof the fast path engaged: it loads only the window…
+        let page_len = fast["data"].as_array().unwrap().len() as u64;
+        assert_eq!(fast["meta"]["docs_scanned"].as_u64().unwrap(), page_len);
+        // …while the residual-forced path loads every candidate.
+        assert_eq!(slow["meta"]["docs_scanned"], 10);
+    }
+}
+
+/// Contract §2 pin: growing-offset tiling with a constant filter must cover
+/// every doc exactly once, matching a one-shot fetch.
+#[tokio::test]
+async fn test_index_eq_window_tiling() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+    setup_window_collection(&base_url, &client).await;
+
+    let one_shot: Value = client
+        .post(format!("{base_url}/events/query"))
+        .json(&json!({"filter": {"event_type": "firewall"}, "limit": 100}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let expected = seqs(&one_shot);
+    assert_eq!(expected.len(), 10);
+
+    let mut tiled: Vec<i64> = Vec::new();
+    let mut offset = 0u64;
+    loop {
+        let page: Value = client
+            .post(format!("{base_url}/events/query"))
+            .json(&json!({
+                "filter": {"event_type": "firewall"},
+                "limit": 3, "offset": offset
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        tiled.extend(seqs(&page));
+        if page["meta"]["has_more"] != json!(true) {
+            break;
+        }
+        offset += 3;
+    }
+    assert_eq!(tiled, expected, "tiled pages must equal the one-shot fetch");
+}
+
+/// Window framing edges: has_more flips exactly at the boundary; windows
+/// straddling or past the end truncate/empty with exact total_count.
+#[tokio::test]
+async fn test_index_eq_window_boundaries() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+    setup_window_collection(&base_url, &client).await;
+
+    // (offset, limit, expected_len, expected_has_more) over 10 matches
+    for (offset, limit, len, more) in [
+        (6u64, 3u64, 3usize, true), // end=9 < 10
+        (7, 3, 3, false),           // end=10 == total
+        (9, 3, 1, false),           // straddles the end
+        (10, 3, 0, false),          // exactly past the end
+        (100, 3, 0, false),         // far past the end
+    ] {
+        let body: Value = client
+            .post(format!("{base_url}/events/query"))
+            .json(&json!({
+                "filter": {"event_type": "firewall"},
+                "limit": limit, "offset": offset
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            body["data"].as_array().unwrap().len(),
+            len,
+            "len at offset {offset}"
+        );
+        assert_eq!(
+            body["meta"]["has_more"] == json!(true),
+            more,
+            "has_more at offset {offset}"
+        );
+        assert_eq!(body["meta"]["total_count"], 10, "total at offset {offset}");
+    }
+}
+
+/// The compound-range window must match its residual-forced page and keep
+/// the compound_range strategy label.
+#[tokio::test]
+async fn test_compound_range_window_page() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+    setup_window_collection(&base_url, &client).await;
+
+    // firewall docs are seq 0,3,…,27; received_at >= :15 → seqs 15..27 step 3 (5 docs)
+    let range_filter = json!({
+        "event_type": "firewall",
+        "received_at": {"$gte": "2026-07-09T00:00:15Z"}
+    });
+    let mut residual_filter = range_filter.clone();
+    residual_filter["_id"] = json!({"$exists": true});
+
+    for (offset, limit) in [(0u64, 2u64), (1, 2), (3, 5)] {
+        let fast: Value = client
+            .post(format!("{base_url}/events/query"))
+            .json(&json!({"filter": range_filter, "limit": limit, "offset": offset}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let slow: Value = client
+            .post(format!("{base_url}/events/query"))
+            .json(&json!({"filter": residual_filter, "limit": limit, "offset": offset}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        assert_eq!(fast["meta"]["scan_strategy"], "compound_range");
+        assert_eq!(slow["meta"]["scan_strategy"], "compound_range");
+        assert_eq!(
+            fast["data"], slow["data"],
+            "page mismatch at offset {offset} limit {limit}"
+        );
+        assert_eq!(fast["meta"]["total_count"], 5);
+        let page_len = fast["data"].as_array().unwrap().len() as u64;
+        assert_eq!(fast["meta"]["docs_scanned"].as_u64().unwrap(), page_len);
+    }
+}
+
+/// Bitmap window: pages must match the residual-forced bitmap path and tile
+/// without skips or duplicates in ascending position (insertion) order.
+#[tokio::test]
+async fn test_bitmap_window_page() {
+    let (base_url, _tmp) = start_test_server_with_bitmap("category").await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "items"}))
+        .send()
+        .await
+        .unwrap();
+    let docs: Vec<Value> = (0..12)
+        .map(|i| json!({"category": if i % 2 == 0 { "a" } else { "b" }, "seq": i}))
+        .collect();
+    client
+        .post(format!("{base_url}/items/docs/_bulk"))
+        .json(&json!({"documents": docs}))
+        .send()
+        .await
+        .unwrap();
+
+    let one_shot: Value = client
+        .post(format!("{base_url}/items/query"))
+        .json(&json!({"filter": {"category": "a"}, "limit": 100}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(one_shot["meta"]["scan_strategy"], "bitmap");
+    let expected = seqs(&one_shot);
+    assert_eq!(expected, [0, 2, 4, 6, 8, 10]);
+
+    // Window equivalence vs the residual-forced path.
+    for (offset, limit) in [(0u64, 2u64), (2, 2), (4, 4)] {
+        let fast: Value = client
+            .post(format!("{base_url}/items/query"))
+            .json(&json!({"filter": {"category": "a"}, "limit": limit, "offset": offset}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let slow: Value = client
+            .post(format!("{base_url}/items/query"))
+            .json(&json!({
+                "filter": {"category": "a", "_id": {"$exists": true}},
+                "limit": limit, "offset": offset
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(fast["meta"]["scan_strategy"], "bitmap");
+        assert_eq!(slow["meta"]["scan_strategy"], "bitmap");
+        assert_eq!(fast["data"], slow["data"], "bitmap page at offset {offset}");
+        assert_eq!(fast["meta"]["total_count"], 6);
+        let page_len = fast["data"].as_array().unwrap().len() as u64;
+        assert_eq!(fast["meta"]["docs_scanned"].as_u64().unwrap(), page_len);
+    }
+
+    // Tiling.
+    let mut tiled: Vec<i64> = Vec::new();
+    let mut offset = 0u64;
+    loop {
+        let page: Value = client
+            .post(format!("{base_url}/items/query"))
+            .json(&json!({"filter": {"category": "a"}, "limit": 2, "offset": offset}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        tiled.extend(seqs(&page));
+        if page["meta"]["has_more"] != json!(true) {
+            break;
+        }
+        offset += 2;
+    }
+    assert_eq!(tiled, expected);
+}
