@@ -6907,3 +6907,85 @@ async fn test_count_only_scan_strategy_labels() {
     assert_eq!(n, expected_fw_shard0);
     assert_eq!(strategy, "index_eq");
 }
+
+/// $regex behavior must be identical with parse-time compilation: match set,
+/// $not composition, non-string fields never match, non-string pattern
+/// operands are accepted-but-never-match, invalid/oversize patterns 400.
+#[tokio::test]
+async fn test_regex_semantics_preserved() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "notes"}))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base_url}/notes/docs/_bulk"))
+        .json(&json!({"documents": [
+            {"tag": "alpha-1", "n": 1},
+            {"tag": "alpha-2", "n": 2},
+            {"tag": "beta-1", "n": 3},
+            {"tag": 42, "n": 4},          // non-string field value
+            {"n": 5},                      // field missing
+        ]}))
+        .send()
+        .await
+        .unwrap();
+
+    let query = |filter: Value| {
+        let client = client.clone();
+        let url = format!("{base_url}/notes/query");
+        async move {
+            let resp = client
+                .post(url)
+                .json(&json!({"filter": filter, "sort": [{"n": "asc"}]}))
+                .send()
+                .await
+                .unwrap();
+            let status = resp.status();
+            let body: Value = resp.json().await.unwrap();
+            (status, body)
+        }
+    };
+
+    // Plain match set.
+    let (status, body) = query(json!({"tag": {"$regex": "^alpha-[0-9]$"}})).await;
+    assert_eq!(status, 200);
+    let ns: Vec<i64> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["n"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ns, [1, 2]);
+
+    // $not composition inverts, including non-string and missing fields.
+    let (status, body) = query(json!({"$not": {"tag": {"$regex": "^alpha-"}}})).await;
+    assert_eq!(status, 200);
+    let ns: Vec<i64> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["n"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ns, [3, 4, 5]);
+
+    // Non-string pattern operand: accepted, matches nothing.
+    let (status, body) = query(json!({"tag": {"$regex": 123}})).await;
+    assert_eq!(status, 200);
+    assert_eq!(body["data"].as_array().unwrap().len(), 0);
+
+    // Invalid pattern still rejected at parse time.
+    let (status, body) = query(json!({"tag": {"$regex": "[unclosed"}})).await;
+    assert_eq!(status, 400);
+    assert_eq!(body["error"]["code"], "INVALID_QUERY");
+
+    // Oversize pattern still rejected.
+    let big = "a".repeat(2000);
+    let (status, body) = query(json!({"tag": {"$regex": big}})).await;
+    assert_eq!(status, 400);
+    assert_eq!(body["error"]["code"], "INVALID_QUERY");
+}

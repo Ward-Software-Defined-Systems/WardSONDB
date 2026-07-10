@@ -15,6 +15,13 @@ pub enum FilterNode {
         op: FilterOp,
         value: Value,
     },
+    /// `$regex` with a string pattern, compiled once at parse time —
+    /// recompiling per document dominated `$regex` scans. Clone shares the
+    /// compiled program through the Arc.
+    Regex {
+        field: String,
+        regex: std::sync::Arc<regex::Regex>,
+    },
     And(Vec<FilterNode>),
     Or(Vec<FilterNode>),
     Not(Box<FilterNode>),
@@ -42,6 +49,10 @@ impl FilterNode {
                 let field_val = resolve_json_path(doc, field);
                 evaluate_op(op, field_val, value)
             }
+            FilterNode::Regex { field, regex } => match resolve_json_path(doc, field) {
+                Some(Value::String(s)) => regex.is_match(s),
+                _ => false,
+            },
             FilterNode::And(nodes) => nodes.iter().all(|n| n.matches(doc)),
             FilterNode::Or(nodes) => nodes.iter().any(|n| n.matches(doc)),
             FilterNode::Not(node) => !node.matches(doc),
@@ -113,11 +124,10 @@ fn evaluate_op(op: &FilterOp, field_val: Option<&Value>, operand: &Value) -> boo
                     }
                 }
                 FilterOp::Regex => {
-                    if let (Value::String(s), Value::String(pattern)) = (field_val, operand) {
-                        regex_match(s, pattern)
-                    } else {
-                        false
-                    }
+                    // String patterns compile at parse time into
+                    // FilterNode::Regex; a Comparison only carries this op
+                    // for non-string operands, which can never match.
+                    false
                 }
                 FilterOp::Contains => {
                     if let Value::Array(arr) = field_val {
@@ -156,17 +166,6 @@ fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
         (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
         (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
         _ => None,
-    }
-}
-
-fn regex_match(s: &str, pattern: &str) -> bool {
-    // Use the `regex` crate which guarantees linear-time matching (no backtracking)
-    if pattern.len() > MAX_REGEX_PATTERN_LEN {
-        return false;
-    }
-    match regex::Regex::new(pattern) {
-        Ok(re) => re.is_match(s),
-        Err(_) => false,
     }
 }
 
@@ -256,19 +255,32 @@ fn parse_field_filter(field: &str, value: &Value) -> Result<Vec<FilterNode>, App
                     "$nin" => FilterOp::Nin,
                     "$exists" => FilterOp::Exists,
                     "$regex" => {
-                        // Validate regex pattern at parse time
+                        // Validate AND compile at parse time (the `regex`
+                        // crate guarantees linear-time matching); execution
+                        // reuses the compiled program.
                         if let Some(pat) = operand.as_str() {
                             if pat.len() > MAX_REGEX_PATTERN_LEN {
                                 return Err(AppError::InvalidQuery(format!(
                                     "Regex pattern exceeds maximum length of {MAX_REGEX_PATTERN_LEN}"
                                 )));
                             }
-                            if regex::Regex::new(pat).is_err() {
-                                return Err(AppError::InvalidQuery(format!(
-                                    "Invalid regex pattern: {pat}"
-                                )));
+                            match regex::Regex::new(pat) {
+                                Ok(re) => {
+                                    conditions.push(FilterNode::Regex {
+                                        field: field.to_string(),
+                                        regex: std::sync::Arc::new(re),
+                                    });
+                                    continue;
+                                }
+                                Err(_) => {
+                                    return Err(AppError::InvalidQuery(format!(
+                                        "Invalid regex pattern: {pat}"
+                                    )));
+                                }
                             }
                         }
+                        // Non-string operand keeps the always-false
+                        // Comparison, matching pre-compile behavior.
                         FilterOp::Regex
                     }
                     "$contains" => FilterOp::Contains,
