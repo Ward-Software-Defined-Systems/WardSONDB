@@ -781,6 +781,8 @@ Validation is strict: an unrecognized direction value, a sort entry with more th
 
 Documents missing a sort field sort to the **beginning** in ascending order, **end** in descending order.
 
+**Cross-type ordering:** when a sort field holds values of different JSON types, they order `null < false < true < numbers < strings < arrays < objects` (ascending; reversed descending). Arrays and objects order among themselves by their serialized JSON text. This is the same order the index key encoding defines, so indexed and in-memory sorts agree. A missing field is **not** the same as `null`: missing sorts before every present value ascending (`null` is the smallest *present* value).
+
 ### Projection
 
 Return only specific fields (always includes `_id`):
@@ -1084,9 +1086,9 @@ Stages execute sequentially — the output of one stage feeds the input of the n
 | `$count` | `{}` | Count documents in group |
 | `$sum` | `"field.path"` | Sum numeric values |
 | `$avg` | `"field.path"` | Average of numeric values |
-| `$min` | `"field.path"` | Minimum value (numbers or strings) |
-| `$max` | `"field.path"` | Maximum value (numbers or strings) |
-| `$collect` | `"field.path"` | Collect unique values into sorted array (capped at 1000) |
+| `$min` | `"field.path"` | Minimum value by the cross-type sort order (see [Sorting](#sorting)) |
+| `$max` | `"field.path"` | Maximum value by the cross-type sort order (see [Sorting](#sorting)) |
+| `$collect` | `"field.path"` | Collect unique values into an array sorted by the cross-type sort order (capped at 1000) |
 
 ### $sort Stage (in aggregation)
 

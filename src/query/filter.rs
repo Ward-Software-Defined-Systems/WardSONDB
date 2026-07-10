@@ -156,6 +156,13 @@ fn values_equal(a: &Value, b: &Value) -> bool {
     }
 }
 
+// DELIBERATE divergence from `index::secondary::compare_values_total`: range
+// FILTERS are type-bracketed — a comparison only ever matches values of the
+// operand's own comparable type (numbers, strings, bools), and null/array/
+// object operands match nothing, even same-type (`None` here means "no
+// match"). Ordering surfaces (sort, cursors, $min/$max, $collect) instead use
+// the total encoding order. The indexed range path must preserve this
+// bracketing — see `index/mod.rs` `lookup_range`/`count_range`.
 fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     match (a, b) {
         (Value::Number(a), Value::Number(b)) => {

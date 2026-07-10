@@ -9,6 +9,7 @@ const MAX_PIPELINE_STAGES: usize = 100;
 use crate::engine::backend::StorageBackend;
 use crate::engine::storage::Storage;
 use crate::error::AppError;
+use crate::index::secondary::compare_values_total;
 
 use super::executor::execute_query;
 use super::filter::{parse_filter, resolve_json_path};
@@ -375,7 +376,7 @@ impl AccumulatorState {
                     match current {
                         None => *current = Some(val.clone()),
                         Some(cur) => {
-                            if compare_for_minmax(val, cur) == std::cmp::Ordering::Less {
+                            if compare_values_total(val, cur) == std::cmp::Ordering::Less {
                                 *current = Some(val.clone());
                             }
                         }
@@ -387,7 +388,7 @@ impl AccumulatorState {
                     match current {
                         None => *current = Some(val.clone()),
                         Some(cur) => {
-                            if compare_for_minmax(val, cur) == std::cmp::Ordering::Greater {
+                            if compare_values_total(val, cur) == std::cmp::Ordering::Greater {
                                 *current = Some(val.clone());
                             }
                         }
@@ -436,7 +437,7 @@ impl AccumulatorState {
                     .iter()
                     .filter_map(|s| serde_json::from_str(s).ok())
                     .collect();
-                sorted.sort_by(compare_for_minmax);
+                sorted.sort_by(compare_values_total);
                 if *truncated {
                     serde_json::json!({"values": sorted, "_truncated": true})
                 } else {
@@ -450,19 +451,6 @@ impl AccumulatorState {
 struct GroupState {
     id_value: Value,
     accumulators: Vec<AccumulatorState>,
-}
-
-fn compare_for_minmax(a: &Value, b: &Value) -> std::cmp::Ordering {
-    match (a, b) {
-        (Value::Number(a), Value::Number(b)) => {
-            let af = a.as_f64().unwrap_or(0.0);
-            let bf = b.as_f64().unwrap_or(0.0);
-            af.partial_cmp(&bf).unwrap_or(std::cmp::Ordering::Equal)
-        }
-        (Value::String(a), Value::String(b)) => a.cmp(b),
-        (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
-        _ => std::cmp::Ordering::Equal,
-    }
 }
 
 /// Try to execute an aggregation entirely from an index (0 docs scanned).

@@ -268,4 +268,44 @@ mod tests {
             Ordering::Equal
         );
     }
+
+    /// Cross-type positions follow the total encoding order (T3/R2): with an
+    /// ascending sort anchored at a number, every lower bucket is on the
+    /// already-returned side and every higher bucket strictly after —
+    /// independent of `_id`s (chosen adversarially here).
+    #[test]
+    fn compare_doc_to_cursor_mixed_types() {
+        let sort = vec![sf("val", true)];
+        let anchor = json!({"_id": "m", "val": 5});
+        let token = encode_cursor(&anchor, &sort, "c").unwrap();
+        let cursor = decode_cursor(&token, "c", &sort).unwrap();
+
+        // _ids all sort AFTER the anchor's "m", so a comparator that
+        // collapses cross-type pairs onto the _id tiebreak would call every
+        // one of these Greater; the encoding order must win instead.
+        for before in [
+            json!({"_id": "z1", "val": null}),
+            json!({"_id": "z2", "val": false}),
+            json!({"_id": "z3", "val": true}),
+            json!({"_id": "z4", "val": 4}),
+        ] {
+            assert_eq!(
+                compare_doc_to_cursor(&before, &cursor, &sort),
+                Ordering::Less,
+                "{before} sorts before the anchor"
+            );
+        }
+        // _ids all sort BEFORE "m"; encoding order must still place these after.
+        for after in [
+            json!({"_id": "a1", "val": "text"}),
+            json!({"_id": "a2", "val": [1]}),
+            json!({"_id": "a3", "val": {"k": 1}}),
+        ] {
+            assert_eq!(
+                compare_doc_to_cursor(&after, &cursor, &sort),
+                Ordering::Greater,
+                "{after} sorts after the anchor"
+            );
+        }
+    }
 }

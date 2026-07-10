@@ -42,6 +42,11 @@ impl IndexDef {
 ///   0x01 = false, 0x02 = true
 ///   0x03 = number (IEEE 754 with sign-flip for correct ordering)
 ///   0x04 = string (raw UTF-8 bytes)
+///   0x05 = array/object (serialized JSON text)
+///
+/// Cross-type order: null < false < true < number < string < array/object.
+/// `compare_values_total` below must stay byte-for-byte consistent with this
+/// encoding — the lockstep test in this file enforces it.
 pub fn value_to_sortable_bytes(value: &Value) -> Vec<u8> {
     match value {
         Value::Null => vec![0x00],
@@ -71,6 +76,49 @@ pub fn value_to_sortable_bytes(value: &Value) -> Vec<u8> {
             bytes.extend_from_slice(serde_json::to_string(other).unwrap_or_default().as_bytes());
             bytes
         }
+    }
+}
+
+/// The encoding's type prefix byte for a value (see `value_to_sortable_bytes`).
+fn type_prefix_byte(v: &Value) -> u8 {
+    match v {
+        Value::Null => 0x00,
+        Value::Bool(false) => 0x01,
+        Value::Bool(true) => 0x02,
+        Value::Number(_) => 0x03,
+        Value::String(_) => 0x04,
+        Value::Array(_) | Value::Object(_) => 0x05,
+    }
+}
+
+/// Total order over JSON values, byte-for-byte identical to the order of
+/// `value_to_sortable_bytes` output (the lockstep test below enforces this).
+/// This is the database's ONE collation for ordering surfaces: /query sort,
+/// cursor positions, aggregate $sort, $min/$max, $collect. Range FILTERS
+/// deliberately do not use it — see `query::filter::compare_values`.
+pub fn compare_values_total(a: &Value, b: &Value) -> std::cmp::Ordering {
+    match (a, b) {
+        (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        // total_cmp is the same transform as the encoding's sign-flip bit
+        // order for every f64, including -0.0 < 0.0; as_f64 mirrors the
+        // encoding's lossy conversion (>2^53 collisions stay consistent).
+        (Value::Number(x), Value::Number(y)) => x
+            .as_f64()
+            .unwrap_or(0.0)
+            .total_cmp(&y.as_f64().unwrap_or(0.0)),
+        (Value::String(x), Value::String(y)) => x.cmp(y),
+        // Arrays/objects share prefix 0x05 and order by serialized JSON text.
+        // This arm must catch (Array, Object) pairs too — '[' < '{' — so they
+        // never reach the prefix-byte arm and compare as a spurious Equal.
+        (Value::Array(_) | Value::Object(_), Value::Array(_) | Value::Object(_)) => {
+            serde_json::to_string(a)
+                .unwrap_or_default()
+                .cmp(&serde_json::to_string(b).unwrap_or_default())
+        }
+        // Cross-bucket: only differing prefix bytes reach here (every
+        // same-bucket pair is handled above), so this never returns Equal.
+        _ => type_prefix_byte(a).cmp(&type_prefix_byte(b)),
     }
 }
 
@@ -163,4 +211,82 @@ pub fn extract_doc_id_from_key(key: &[u8]) -> Option<String> {
         return None;
     }
     String::from_utf8(key[sep_pos + 1..].to_vec()).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Corpus spanning every encoding bucket plus the known edge values:
+    /// signed zeros, negative/fractional numbers, the 2^53/2^53+1 lossy
+    /// collision, empty string/array/object, nesting, '[' vs '{' text order.
+    fn corpus() -> Vec<Value> {
+        vec![
+            json!(null),
+            json!(false),
+            json!(true),
+            json!(-3.5),
+            json!(-0.0),
+            json!(0.0),
+            json!(1),
+            json!(1.5),
+            json!(42),
+            json!(9007199254740992u64), // 2^53
+            json!(9007199254740993u64), // 2^53 + 1: as_f64-collides with 2^53
+            json!(""),
+            json!("A"),
+            json!("a"),
+            json!("ab"),
+            json!("z"),
+            json!([]),
+            json!([1]),
+            json!([1, 2]),
+            json!(["a"]),
+            json!({}),
+            json!({"a": 1}),
+            json!({"a": {"b": [1]}}),
+            json!({"b": 1}),
+        ]
+    }
+
+    /// THE invariant of this module: the in-memory comparator and the key
+    /// encoding define the same order, for every ordered pair. Any future
+    /// change to `value_to_sortable_bytes` or `compare_values_total` that
+    /// breaks byte parity fails here.
+    #[test]
+    fn compare_values_total_matches_encoding_byte_order() {
+        let values = corpus();
+        for a in &values {
+            for b in &values {
+                assert_eq!(
+                    compare_values_total(a, b),
+                    value_to_sortable_bytes(a).cmp(&value_to_sortable_bytes(b)),
+                    "comparator vs encoding disagree for {a} vs {b}"
+                );
+            }
+        }
+    }
+
+    /// The property whose absence caused R2: transitivity across buckets.
+    #[test]
+    fn total_order_transitive_on_mixed_sample() {
+        let values = corpus();
+        for a in &values {
+            for b in &values {
+                for c in &values {
+                    use std::cmp::Ordering::Greater;
+                    if compare_values_total(a, b) != Greater
+                        && compare_values_total(b, c) != Greater
+                    {
+                        assert_ne!(
+                            compare_values_total(a, c),
+                            Greater,
+                            "intransitive: {a} <= {b} <= {c} but {a} > {c}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

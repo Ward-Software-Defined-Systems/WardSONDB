@@ -7647,3 +7647,375 @@ async fn test_bitmap_window_page() {
     }
     assert_eq!(tiled, expected);
 }
+
+// ─── Cross-type value ordering (T3/R2) ────────────────────────────────────────
+
+/// One doc per corner of the six encoding buckets (null < false < true <
+/// number < string < array/object; 0x05 values order by serialized JSON
+/// text). Custom `_id`s are assigned so `_id` order differs from encoding
+/// order: a comparator that collapses cross-type pairs to the `_id` tiebreak
+/// cannot accidentally produce the expected order.
+const MIXED_ASC_IDS: [&str; 13] = [
+    "m06", // null
+    "m05", // false
+    "m04", // true
+    "m08", // -3.5
+    "m10", // 7
+    "m03", // 42
+    "m11", // ""
+    "m09", // "Zebra"  ('Z' < 'a')
+    "m02", // "apple"
+    "m07", // [1,2]    ("[1,2]" < "[]")
+    "m12", // []
+    "m01", // {"b":1}  ("{\"b\":1}" < "{}"; all arrays < all objects)
+    "m13", // {}
+];
+
+async fn seed_mixed_type_fixture(client: &Client, base_url: &str, collection: &str) {
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": collection}))
+        .send()
+        .await
+        .unwrap();
+    let docs = json!({
+        "documents": [
+            {"_id": "m01", "val": {"b": 1}},
+            {"_id": "m02", "val": "apple"},
+            {"_id": "m03", "val": 42},
+            {"_id": "m04", "val": true},
+            {"_id": "m05", "val": false},
+            {"_id": "m06", "val": null},
+            {"_id": "m07", "val": [1, 2]},
+            {"_id": "m08", "val": -3.5},
+            {"_id": "m09", "val": "Zebra"},
+            {"_id": "m10", "val": 7},
+            {"_id": "m11", "val": ""},
+            {"_id": "m12", "val": []},
+            {"_id": "m13", "val": {}},
+        ]
+    });
+    let resp = client
+        .post(format!("{base_url}/{collection}/docs/_bulk"))
+        .json(&docs)
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+}
+
+/// T3/R2: sorting a field holding every JSON type returns 200 (pre-fix the
+/// intransitive comparator could panic Rust's total-order check → 500) and
+/// orders by the index encoding's cross-type order, both directions.
+#[tokio::test]
+async fn test_mixed_type_sort_all_buckets() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+    seed_mixed_type_fixture(&client, &base_url, "mixed").await;
+
+    let resp = client
+        .post(format!("{base_url}/mixed/query"))
+        .json(&json!({"sort": [{"val": "asc"}], "limit": 100}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(ids_of(body["data"].as_array().unwrap()), MIXED_ASC_IDS);
+
+    let resp = client
+        .post(format!("{base_url}/mixed/query"))
+        .json(&json!({"sort": [{"val": "desc"}], "limit": 100}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let mut desc_expected = MIXED_ASC_IDS;
+    desc_expected.reverse();
+    assert_eq!(ids_of(body["data"].as_array().unwrap()), desc_expected);
+}
+
+/// T3/R2: cursor walks over a mixed-type sort field lose no documents. A
+/// non-total comparator breaks `partition_point` monotonicity, silently
+/// skipping docs between pages (and long mixed runs can panic the sort).
+#[tokio::test]
+async fn test_mixed_type_cursor_walk_matches_reference() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "mixedwalk"}))
+        .send()
+        .await
+        .unwrap();
+    // Values anti-correlate with `_id`s (59 - i): a comparator that collapses
+    // cross-type pairs onto the `_id` tiebreak produces an order that
+    // conflicts with the within-type order, which is exactly what breaks
+    // `partition_point` monotonicity on cursor resume.
+    let docs: Vec<Value> = (0..60)
+        .map(|i| {
+            let val = match i % 6 {
+                0 => json!(59 - i),
+                1 => json!(format!("s{:02}", 59 - i)),
+                2 => json!(i % 4 == 2),
+                3 => json!(null),
+                4 => json!([59 - i]),
+                _ => json!({"k": 59 - i}),
+            };
+            json!({"_id": format!("d{i:02}"), "val": val})
+        })
+        .collect();
+    let resp = client
+        .post(format!("{base_url}/mixedwalk/docs/_bulk"))
+        .json(&json!({"documents": docs}))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+
+    for direction in ["asc", "desc"] {
+        let body = json!({"sort": [{"val": direction}], "limit": 7});
+        let walked = cursor_walk(&client, &base_url, "mixedwalk", body.clone()).await;
+        let reference = reference_ids(&client, &base_url, "mixedwalk", body).await;
+        assert_eq!(walked.len(), 60, "no docs dropped ({direction})");
+        assert_eq!(ids_of(&walked), reference, "walk == one-shot ({direction})");
+    }
+}
+
+/// T3/R2: the in-memory comparator and the index encoding agree — the same
+/// mixed-type query returns byte-identical order as a full scan and as an
+/// `index_sorted` walk over a covering compound index.
+#[tokio::test]
+async fn test_mixed_type_index_sorted_matches_in_memory() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "mixedidx"}))
+        .send()
+        .await
+        .unwrap();
+    // Every doc carries both fields (explicit null, never missing: docs
+    // missing an indexed field are absent from the index — T6, out of scope).
+    let docs = json!({
+        "documents": [
+            {"_id": "i01", "group": "g", "val": {"o": 2}},
+            {"_id": "i02", "group": "g", "val": "mango"},
+            {"_id": "i03", "group": "g", "val": 99},
+            {"_id": "i04", "group": "g", "val": true},
+            {"_id": "i05", "group": "g", "val": null},
+            {"_id": "i06", "group": "g", "val": [5]},
+            {"_id": "i07", "group": "g", "val": false},
+            {"_id": "i08", "group": "g", "val": -1},
+            {"_id": "i09", "group": "g", "val": "Apple"},
+            {"_id": "i10", "group": "g", "val": {"a": 1}},
+            {"_id": "i11", "group": "g", "val": 7},
+            {"_id": "i12", "group": "g", "val": 7},
+        ]
+    });
+    let resp = client
+        .post(format!("{base_url}/mixedidx/docs/_bulk"))
+        .json(&json!(docs))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+
+    let query = |dir: &str| json!({"filter": {"group": "g"}, "sort": [{"val": dir}], "limit": 50});
+
+    // Reference order first: full scan + in-memory sort (no index exists yet).
+    let mut in_memory = std::collections::HashMap::new();
+    for dir in ["asc", "desc"] {
+        let resp = client
+            .post(format!("{base_url}/mixedidx/query"))
+            .json(&query(dir))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+        in_memory.insert(dir, ids_of(body["data"].as_array().unwrap()));
+    }
+
+    let resp = client
+        .post(format!("{base_url}/mixedidx/indexes"))
+        .json(&json!({"name": "idx_group_val", "fields": ["group", "val"]}))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+
+    for dir in ["asc", "desc"] {
+        let resp = client
+            .post(format!("{base_url}/mixedidx/query"))
+            .json(&query(dir))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(
+            body["meta"]["scan_strategy"], "index_sorted",
+            "compound index must serve the sorted query ({dir})"
+        );
+        assert_eq!(
+            ids_of(body["data"].as_array().unwrap()),
+            in_memory[dir],
+            "index order == in-memory order ({dir})"
+        );
+    }
+}
+
+/// T3: `$min`/`$max` on a mixed-type group return the encoding-order extremes
+/// (pre-fix: cross-type pairs compared Equal, so whichever value was scanned
+/// first stuck as both min and max). The strings-only group pins the
+/// unaffected same-type behavior alongside.
+#[tokio::test]
+async fn test_min_max_mixed_and_single_type() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "acc"}))
+        .send()
+        .await
+        .unwrap();
+    // "x" first: the pre-fix first-seen-wins accumulator would report
+    // min == max == "x", never null / {"z":1}.
+    let docs = json!({
+        "documents": [
+            {"g": "mixed", "v": "x"},
+            {"g": "mixed", "v": 9},
+            {"g": "mixed", "v": false},
+            {"g": "mixed", "v": null},
+            {"g": "mixed", "v": [1]},
+            {"g": "mixed", "v": {"z": 1}},
+            {"g": "pure", "v": "zeta"},
+            {"g": "pure", "v": "alpha"},
+            {"g": "pure", "v": "beta"},
+        ]
+    });
+    client
+        .post(format!("{base_url}/acc/docs/_bulk"))
+        .json(&docs)
+        .send()
+        .await
+        .unwrap();
+
+    let resp = client
+        .post(format!("{base_url}/acc/aggregate"))
+        .json(&json!({
+            "pipeline": [
+                {"$group": {"_id": "g", "min_v": {"$min": "v"}, "max_v": {"$max": "v"}}},
+                {"$sort": {"_id": "asc"}}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 2);
+
+    let mixed = &data[0];
+    assert_eq!(mixed["_id"], "mixed");
+    assert!(mixed.as_object().unwrap().contains_key("min_v"));
+    assert_eq!(mixed["min_v"], Value::Null, "encoding minimum is null");
+    assert_eq!(
+        mixed["max_v"],
+        json!({"z": 1}),
+        "encoding maximum is the object"
+    );
+
+    let pure = &data[1];
+    assert_eq!(pure["_id"], "pure");
+    assert_eq!(pure["min_v"], "alpha");
+    assert_eq!(pure["max_v"], "zeta");
+}
+
+/// T3: `$collect` over mixed types returns 200 (its finalize sorts collected
+/// values — pre-fix that sort could panic) with values in encoding order
+/// (pre-fix: effectively HashSet iteration order).
+#[tokio::test]
+async fn test_collect_mixed_types_sorted_encoding_order() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "coll5"}))
+        .send()
+        .await
+        .unwrap();
+    let docs = json!({
+        "documents": [
+            {"v": {"m": 1}},
+            {"v": "a"},
+            {"v": -2},
+            {"v": true},
+            {"v": null},
+            {"v": [3]},
+            {"v": false},
+            {"v": 10},
+        ]
+    });
+    client
+        .post(format!("{base_url}/coll5/docs/_bulk"))
+        .json(&docs)
+        .send()
+        .await
+        .unwrap();
+
+    let resp = client
+        .post(format!("{base_url}/coll5/aggregate"))
+        .json(&json!({
+            "pipeline": [{"$group": {"_id": null, "vals": {"$collect": "v"}}}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    let data = body["data"].as_array().unwrap();
+    assert_eq!(data.len(), 1);
+    assert_eq!(
+        data[0]["vals"],
+        json!([null, false, true, -2, 10, "a", [3], {"m": 1}])
+    );
+}
+
+/// T3/R2: the aggregate `$sort` stage uses the same fixed comparator.
+#[tokio::test]
+async fn test_aggregate_sort_mixed_types() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+    seed_mixed_type_fixture(&client, &base_url, "aggmixed").await;
+
+    for (dir, expected) in [
+        ("asc", MIXED_ASC_IDS),
+        ("desc", {
+            let mut rev = MIXED_ASC_IDS;
+            rev.reverse();
+            rev
+        }),
+    ] {
+        let resp = client
+            .post(format!("{base_url}/aggmixed/aggregate"))
+            .json(&json!({"pipeline": [{"$sort": [{"val": dir}]}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(
+            ids_of(body["data"].as_array().unwrap()),
+            expected,
+            "aggregate $sort {dir}"
+        );
+    }
+}

@@ -1,6 +1,7 @@
 use serde_json::Value;
 
 use super::filter::resolve_json_path;
+use crate::index::secondary::compare_values_total;
 
 #[derive(Debug, Clone)]
 pub struct SortField {
@@ -129,25 +130,14 @@ pub fn compare_docs(a: &Value, b: &Value, sort_fields: &[SortField]) -> std::cmp
     }
 }
 
+/// Missing (`None`) sorts before every present value; present values compare
+/// in the database's total order (`compare_values_total`, byte-identical to
+/// the index key encoding). Missing stays distinct from present `null`.
 pub(crate) fn compare_json_values(a: Option<&Value>, b: Option<&Value>) -> std::cmp::Ordering {
     match (a, b) {
         (None, None) => std::cmp::Ordering::Equal,
         (None, Some(_)) => std::cmp::Ordering::Less,
         (Some(_), None) => std::cmp::Ordering::Greater,
-        (Some(a), Some(b)) => compare_values(a, b),
-    }
-}
-
-fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
-    match (a, b) {
-        (Value::Number(a), Value::Number(b)) => {
-            let af = a.as_f64().unwrap_or(0.0);
-            let bf = b.as_f64().unwrap_or(0.0);
-            af.partial_cmp(&bf).unwrap_or(std::cmp::Ordering::Equal)
-        }
-        (Value::String(a), Value::String(b)) => a.cmp(b),
-        (Value::Bool(a), Value::Bool(b)) => a.cmp(b),
-        (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
-        _ => std::cmp::Ordering::Equal,
+        (Some(a), Some(b)) => compare_values_total(a, b),
     }
 }
