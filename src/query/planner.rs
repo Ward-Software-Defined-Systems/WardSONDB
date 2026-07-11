@@ -78,6 +78,18 @@ pub enum ScanPlan {
     /// limit where a compound index exists, IndexSorted (higher priority)
     /// will be chosen instead.
     BitmapScan { bitmap: roaring::RoaringBitmap },
+
+    /// `$or` union — every arm of the `$or` is individually servable by a
+    /// secondary index; the executor unions the per-arm candidate ids,
+    /// dedups, and restores `_id` order so results are byte-identical to
+    /// the full scan this replaces (same docs, same order, same pages and
+    /// tiling) — only `docs_scanned`/`index_used`/`scan_strategy` change.
+    /// Arms are the index-servable ScanPlan variants only (never FullScan,
+    /// IndexSorted, BitmapScan, or a nested OrUnion). When any arm
+    /// over-approximates its `$or` child (a residual-carrying And arm), the
+    /// plan's post_filter is the ORIGINAL `$or` filter — one filter pass
+    /// over loaded candidates, trivially equivalent to full-scan filtering.
+    OrUnion { arms: Vec<ScanPlan> },
 }
 
 impl ScanPlan {
@@ -96,6 +108,7 @@ impl ScanPlan {
             ScanPlan::CompoundRange { .. } => "compound_range",
             ScanPlan::IndexSorted { .. } => "index_sorted",
             ScanPlan::BitmapScan { .. } => "bitmap",
+            ScanPlan::OrUnion { .. } => "or_union",
         }
     }
 }
@@ -144,13 +157,20 @@ pub fn plan_query(
         return plan;
     }
 
+    // S3-14: compute the bitmap plan at most once per plan_query call. The
+    // count_only gate below and the per-filter-shape fallback sites used to
+    // each redo the Roaring AND/OR work for partially-covered filters; the
+    // memo hands the gate's rejected plan to whichever fallback site runs
+    // (exactly one does — every match arm returns).
+    let mut bitmap_memo: Option<Option<QueryPlan>> = None;
+
     // For count_only queries, bitmap is ~2500x faster than index counting.
     // Try bitmap before indexes when all filter fields have bitmap columns.
-    if count_only
-        && let Some(plan) = try_bitmap_scan(scan_accelerator, filter)
-        && plan.post_filter.is_none()
-    {
-        return plan;
+    if count_only {
+        match try_bitmap_scan(scan_accelerator, filter) {
+            Some(plan) if plan.post_filter.is_none() => return plan,
+            other => bitmap_memo = Some(other),
+        }
     }
 
     match filter {
@@ -164,7 +184,10 @@ pub fn plan_query(
                 };
             }
             // Try bitmap scan before full scan
-            if let Some(plan) = try_bitmap_scan(scan_accelerator, filter) {
+            if let Some(plan) = bitmap_memo
+                .take()
+                .unwrap_or_else(|| try_bitmap_scan(scan_accelerator, filter))
+            {
                 return plan;
             }
             QueryPlan {
@@ -254,7 +277,10 @@ pub fn plan_query(
             }
 
             // Try bitmap scan before full scan
-            if let Some(plan) = try_bitmap_scan(scan_accelerator, filter) {
+            if let Some(plan) = bitmap_memo
+                .take()
+                .unwrap_or_else(|| try_bitmap_scan(scan_accelerator, filter))
+            {
                 return plan;
             }
             QueryPlan {
@@ -264,9 +290,32 @@ pub fn plan_query(
             }
         }
 
-        // OR and NOT cannot efficiently use indexes — try bitmap scan before full scan
+        // OR — bitmap first (a fully-covered $or is one Roaring union, and
+        // partial coverage bails per S3-1), then the per-arm index union,
+        // then full scan.
+        FilterNode::Or(children) => {
+            if let Some(plan) = bitmap_memo
+                .take()
+                .unwrap_or_else(|| try_bitmap_scan(scan_accelerator, filter))
+            {
+                return plan;
+            }
+            if let Some(plan) = try_or_union(index_manager, collection, children, filter) {
+                return plan;
+            }
+            QueryPlan {
+                scan: ScanPlan::FullScan,
+                post_filter: None,
+                original_filter: Some(filter.clone()),
+            }
+        }
+
+        // NOT cannot efficiently use indexes — try bitmap scan before full scan
         _ => {
-            if let Some(plan) = try_bitmap_scan(scan_accelerator, filter) {
+            if let Some(plan) = bitmap_memo
+                .take()
+                .unwrap_or_else(|| try_bitmap_scan(scan_accelerator, filter))
+            {
                 return plan;
             }
             QueryPlan {
@@ -276,6 +325,79 @@ pub fn plan_query(
             }
         }
     }
+}
+
+/// Plan one `$or` arm onto an index-servable scan, returning the scan and
+/// whether it is EXACT (selects precisely the arm's matches) or an
+/// over-approximation (a superset — the caller then post-filters with the
+/// original `$or`). Arms that can't be served by an index return None, which
+/// disables the union entirely: one unindexable arm already forces a full
+/// scan, so a partial union would only add index work on top of it.
+fn plan_or_arm(
+    index_manager: &IndexManager,
+    collection: &str,
+    arm: &FilterNode,
+) -> Option<(ScanPlan, bool)> {
+    match arm {
+        FilterNode::Comparison { field, op, value } => {
+            try_index_comparison(index_manager, collection, field, op, value)
+                .map(|scan| (scan, true))
+        }
+        FilterNode::And(children) => {
+            // Same ladder as the top-level And arm, minus bitmap/full-scan:
+            // compound eq, compound eq-prefix + range, single-field eq with
+            // the rest as residual, merged range with the rest as residual.
+            // Exactness = the sub-plan needed no post-filter.
+            if let Some(plan) = try_compound_eq(index_manager, collection, children, arm) {
+                let exact = plan.post_filter.is_none();
+                return Some((plan.scan, exact));
+            }
+            if let Some(plan) = try_compound_range(index_manager, collection, children, arm) {
+                let exact = plan.post_filter.is_none();
+                return Some((plan.scan, exact));
+            }
+            for child in children {
+                if let FilterNode::Comparison { field, op, value } = child
+                    && let Some(scan) =
+                        try_index_comparison(index_manager, collection, field, op, value)
+                {
+                    // children.len() >= 2 (parser guarantees And has multiple
+                    // nodes), so the untouched siblings make this inexact.
+                    return Some((scan, false));
+                }
+            }
+            try_range_from_and(index_manager, collection, children).map(|scan| (scan, false))
+        }
+        // Nested $or / $not / $regex arms: not index-servable (v1).
+        _ => None,
+    }
+}
+
+/// `$or` whose arms are ALL individually index-servable: plan the per-arm
+/// union (see `ScanPlan::OrUnion`). The union is an over-approximation
+/// whenever any arm is, in which case the original `$or` filter rides along
+/// as the post-filter.
+fn try_or_union(
+    index_manager: &IndexManager,
+    collection: &str,
+    children: &[FilterNode],
+    filter: &FilterNode,
+) -> Option<QueryPlan> {
+    if children.is_empty() {
+        return None;
+    }
+    let mut arms = Vec::with_capacity(children.len());
+    let mut exact_all = true;
+    for child in children {
+        let (scan, exact) = plan_or_arm(index_manager, collection, child)?;
+        exact_all &= exact;
+        arms.push(scan);
+    }
+    Some(QueryPlan {
+        scan: ScanPlan::OrUnion { arms },
+        post_filter: (!exact_all).then(|| filter.clone()),
+        original_filter: Some(filter.clone()),
+    })
 }
 
 /// Try to plan an IndexSorted scan using a compound index that covers

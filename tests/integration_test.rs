@@ -8455,3 +8455,377 @@ async fn test_cursor_walk_index_sorted_separator_bytes() {
         );
     }
 }
+
+// ─── $or index-union planning (H-P3.1) ────────────────────────────────────────
+
+/// Twin collections: `orvals_idx` carries single-field indexes on `t` and
+/// `n`; `orvals_plain` carries none, so it full-scans — the reference the
+/// union must match byte-for-byte. `u` stays unindexed everywhere.
+async fn seed_or_union_twins(client: &Client, base_url: &str) {
+    for coll in ["orvals_idx", "orvals_plain"] {
+        client
+            .post(format!("{base_url}/_collections"))
+            .json(&json!({"name": coll}))
+            .send()
+            .await
+            .unwrap();
+        let docs = json!({
+            "documents": [
+                {"_id": "o01", "t": "a", "n": 1,  "u": "x"},
+                {"_id": "o02", "t": "a", "n": 5,  "u": "x"},
+                {"_id": "o03", "t": "b", "n": 5,  "u": "x"},
+                {"_id": "o04", "t": "b", "n": 9,  "u": "x"},
+                {"_id": "o05", "t": "c", "n": 2,  "u": "x"},
+                {"_id": "o06", "t": "c", "n": 7,  "u": "x"},
+                {"_id": "o07", "t": "d", "n": 3,  "u": "y"},
+                {"_id": "o08", "t": "d", "n": 8,  "u": "y"},
+                {"_id": "o09", "t": "e", "n": 4,  "u": "y"},
+                {"_id": "o10", "t": "e", "n": 6,  "u": "y"},
+                {"_id": "o11", "t": "a", "n": 10, "u": "y"},
+                {"_id": "o12", "t": "b", "n": 0,  "u": "y"},
+            ]
+        });
+        let resp = client
+            .post(format!("{base_url}/{coll}/docs/_bulk"))
+            .json(&docs)
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+    }
+    for (name, field) in [("idx_t", "t"), ("idx_n", "n")] {
+        let resp = client
+            .post(format!("{base_url}/orvals_idx/indexes"))
+            .json(&json!({"name": name, "field": field}))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success());
+    }
+}
+
+/// H-P3.1: a fully-indexable `$or` plans the per-arm union and returns
+/// byte-identical pages to the full scan it replaces — verified by tiling
+/// both twins across offset windows for eq/eq, eq/range (with an
+/// arm-overlapping doc), and in/range shapes.
+#[tokio::test]
+async fn test_or_union_matches_full_scan() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+    seed_or_union_twins(&client, &base_url).await;
+
+    let shapes = [
+        json!({"$or": [{"t": "a"}, {"t": "b"}]}),
+        json!({"$or": [{"t": "a"}, {"n": {"$gte": 8}}]}), // o11 matches both arms
+        json!({"$or": [{"t": {"$in": ["c", "e"]}}, {"n": {"$lt": 2}}]}),
+    ];
+    for filter in &shapes {
+        // One-shot equality + union metadata.
+        let idx: Value = client
+            .post(format!("{base_url}/orvals_idx/query"))
+            .json(&json!({"filter": filter, "limit": 100}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let plain: Value = client
+            .post(format!("{base_url}/orvals_plain/query"))
+            .json(&json!({"filter": filter, "limit": 100}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            ids_of(idx["data"].as_array().unwrap()),
+            ids_of(plain["data"].as_array().unwrap()),
+            "one-shot ids and order must match for {filter}"
+        );
+        assert_eq!(
+            idx["meta"]["scan_strategy"], "or_union",
+            "union must serve {filter}"
+        );
+        assert!(
+            idx["meta"]["index_used"].as_str().unwrap().contains("idx_"),
+            "index_used names the arm indexes for {filter}"
+        );
+        // The union reads only per-arm candidates, never the collection.
+        let matches = plain["data"].as_array().unwrap().len() as u64;
+        assert!(
+            idx["meta"]["docs_scanned"].as_u64().unwrap() <= matches,
+            "union must not scan beyond its candidates for {filter}"
+        );
+
+        // Bare-page tiling: identical windows on both twins.
+        let mut offset = 0u64;
+        loop {
+            let idx_page: Value = client
+                .post(format!("{base_url}/orvals_idx/query"))
+                .json(&json!({"filter": filter, "limit": 3, "offset": offset}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let plain_page: Value = client
+                .post(format!("{base_url}/orvals_plain/query"))
+                .json(&json!({"filter": filter, "limit": 3, "offset": offset}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(
+                ids_of(idx_page["data"].as_array().unwrap()),
+                ids_of(plain_page["data"].as_array().unwrap()),
+                "tiling window at offset {offset} for {filter}"
+            );
+            if idx_page["meta"]["has_more"] != json!(true) {
+                break;
+            }
+            offset += 3;
+        }
+    }
+}
+
+/// H-P3.1: `count_only` over exact arms counts the deduped union with zero
+/// document loads; a residual (And) arm still counts correctly through the
+/// materialized path.
+#[tokio::test]
+async fn test_or_union_count_only() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+    seed_or_union_twins(&client, &base_url).await;
+
+    // Exact arms — o11 matches both, so a naive per-arm count sum would
+    // report 6; the deduped union must say 5.
+    let filter = json!({"$or": [{"t": "a"}, {"n": {"$gte": 8}}]});
+    let idx: Value = client
+        .post(format!("{base_url}/orvals_idx/query"))
+        .json(&json!({"filter": filter, "count_only": true}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(idx["meta"]["scan_strategy"], "or_union");
+    assert_eq!(idx["meta"]["total_count"], 5);
+    assert_eq!(
+        idx["meta"]["docs_scanned"], 0,
+        "exact union counts keys only"
+    );
+
+    let plain: Value = client
+        .post(format!("{base_url}/orvals_plain/query"))
+        .json(&json!({"filter": filter, "count_only": true}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(plain["meta"]["total_count"], 5);
+    assert_eq!(plain["meta"]["scan_strategy"], "full_scan");
+
+    // Residual arm: {t:"a", u:"x"} — u is unindexed, so the arm
+    // over-approximates and the union post-filters with the original $or.
+    let filter = json!({"$or": [{"t": "a", "u": "x"}, {"n": 9}]});
+    let idx: Value = client
+        .post(format!("{base_url}/orvals_idx/query"))
+        .json(&json!({"filter": filter, "count_only": true}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // o01, o02 (t=a,u=x), o04 (n=9); o11 (t=a,u=y) must be filtered out.
+    assert_eq!(idx["meta"]["scan_strategy"], "or_union");
+    assert_eq!(idx["meta"]["total_count"], 3);
+    assert!(
+        idx["meta"]["docs_scanned"].as_u64().unwrap() > 0,
+        "residual arms load candidates to filter"
+    );
+}
+
+/// H-P3.1: an over-approximating And arm's stray candidates are removed by
+/// the original-$or post-filter — doc results match the full scan exactly.
+#[tokio::test]
+async fn test_or_union_residual_and_arm() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+    seed_or_union_twins(&client, &base_url).await;
+
+    let filter = json!({"$or": [{"t": "a", "u": "x"}, {"n": 9}]});
+    let idx: Value = client
+        .post(format!("{base_url}/orvals_idx/query"))
+        .json(&json!({"filter": filter, "limit": 100}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let plain: Value = client
+        .post(format!("{base_url}/orvals_plain/query"))
+        .json(&json!({"filter": filter, "limit": 100}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(idx["meta"]["scan_strategy"], "or_union");
+    assert_eq!(
+        ids_of(idx["data"].as_array().unwrap()),
+        ids_of(plain["data"].as_array().unwrap()),
+        "union results must match the full scan"
+    );
+    assert_eq!(
+        ids_of(idx["data"].as_array().unwrap()),
+        vec!["o01", "o02", "o04"],
+        "over-approximated candidate o11 must be post-filtered out"
+    );
+}
+
+/// H-P3.1: the union only engages when EVERY arm is index-servable — one
+/// unindexed or nested-$or arm keeps today's full-scan behavior.
+#[tokio::test]
+async fn test_or_union_requires_all_arms_indexed() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+    seed_or_union_twins(&client, &base_url).await;
+
+    for filter in [
+        json!({"$or": [{"t": "a"}, {"u": "x"}]}), // u unindexed
+        json!({"$or": [{"$or": [{"t": "a"}]}, {"n": 5}]}), // nested $or arm
+    ] {
+        let resp: Value = client
+            .post(format!("{base_url}/orvals_idx/query"))
+            .json(&json!({"filter": filter, "count_only": true}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp["meta"]["scan_strategy"], "full_scan",
+            "{filter} must fall back to a full scan"
+        );
+        // And the fallback still answers correctly.
+        let plain: Value = client
+            .post(format!("{base_url}/orvals_plain/query"))
+            .json(&json!({"filter": filter, "count_only": true}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(resp["meta"]["total_count"], plain["meta"]["total_count"]);
+    }
+}
+
+/// H-P3.1: sorted, cursor-paginated `$or` rides the materializing machinery —
+/// a paged walk equals the one-shot result and the full-scan twin.
+#[tokio::test]
+async fn test_or_union_with_sort_and_cursor_walk() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+    seed_or_union_twins(&client, &base_url).await;
+
+    let body = json!({
+        "filter": {"$or": [{"t": "a"}, {"t": "b"}]},
+        "sort": [{"n": "desc"}],
+        "limit": 2
+    });
+    let walked = cursor_walk(&client, &base_url, "orvals_idx", body.clone()).await;
+    assert_eq!(walked.len(), 6);
+    assert_eq!(
+        ids_of(&walked),
+        reference_ids(&client, &base_url, "orvals_idx", body.clone()).await,
+        "walk == one-shot on the indexed twin"
+    );
+    assert_eq!(
+        ids_of(&walked),
+        reference_ids(&client, &base_url, "orvals_plain", body).await,
+        "walk == full-scan reference"
+    );
+}
+
+/// H-P3.1 × bitmap: a fully-covered `$or` stays on the bitmap path (higher
+/// priority); partial bitmap coverage — which bails per S3-1 — now upgrades
+/// to the index union instead of a full scan when the arms are indexed.
+#[tokio::test]
+async fn test_or_union_bitmap_priority_and_partial_upgrade() {
+    let (base_url, _tmp) = start_test_server_with_bitmap("cat").await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "items"}))
+        .send()
+        .await
+        .unwrap();
+    let docs: Vec<Value> = (0..12)
+        .map(|i| {
+            json!({
+                "_id": format!("b{i:02}"),
+                "cat": if i % 3 == 0 { "x" } else { "y" },
+                "num": i
+            })
+        })
+        .collect();
+    client
+        .post(format!("{base_url}/items/docs/_bulk"))
+        .json(&json!({"documents": docs}))
+        .send()
+        .await
+        .unwrap();
+    for (name, field) in [("idx_cat", "cat"), ("idx_num", "num")] {
+        client
+            .post(format!("{base_url}/items/indexes"))
+            .json(&json!({"name": name, "field": field}))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    // Fully bitmap-covered $or: bitmap outranks the union.
+    let full: Value = client
+        .post(format!("{base_url}/items/query"))
+        .json(&json!({"filter": {"$or": [{"cat": "x"}, {"cat": "y"}]}, "count_only": true}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(full["meta"]["scan_strategy"], "bitmap");
+    assert_eq!(full["meta"]["total_count"], 12);
+
+    // Partially covered (num has no bitmap column): S3-1 bails the bitmap —
+    // the union now serves it instead of a full scan.
+    let partial: Value = client
+        .post(format!("{base_url}/items/query"))
+        .json(
+            &json!({"filter": {"$or": [{"cat": "x"}, {"num": {"$gte": 10}}]}, "count_only": true}),
+        )
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(partial["meta"]["scan_strategy"], "or_union");
+    // cat=x → b00,b03,b06,b09; num>=10 → b10,b11 (no overlap) = 6.
+    assert_eq!(partial["meta"]["total_count"], 6);
+    assert_eq!(partial["meta"]["docs_scanned"], 0);
+}

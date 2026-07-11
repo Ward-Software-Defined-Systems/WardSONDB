@@ -63,6 +63,7 @@ pub fn execute_query(
         ScanPlan::IndexSorted { .. } => execute_index_sorted(storage, collection, query, &plan),
         ScanPlan::CompoundRange { .. } => execute_compound_range(storage, collection, query, &plan),
         ScanPlan::BitmapScan { .. } => execute_bitmap_scan(storage, collection, query, &plan),
+        ScanPlan::OrUnion { .. } => execute_or_union(storage, collection, query, &plan),
     }
 }
 
@@ -467,7 +468,8 @@ fn execute_index_scan(
         ScanPlan::FullScan
         | ScanPlan::IndexSorted { .. }
         | ScanPlan::CompoundRange { .. }
-        | ScanPlan::BitmapScan { .. } => unreachable!(),
+        | ScanPlan::BitmapScan { .. }
+        | ScanPlan::OrUnion { .. } => unreachable!(),
     };
 
     // Bare page: the page is exactly candidate_ids[offset..offset+limit] in
@@ -852,6 +854,221 @@ fn execute_compound_range(
         total_count: Some(total_count),
         docs_scanned,
         index_used: Some(index_name.to_string()),
+        scan_strategy: Some(plan.scan.name().to_string()),
+        has_more,
+        next_cursor,
+    })
+}
+
+/// Candidate doc ids for one `$or` arm, plus the arm's index name. Arms are
+/// only ever the index-servable variants (`plan_or_arm` builds them).
+fn or_arm_ids<'a>(
+    storage: &Storage,
+    collection: &str,
+    arm: &'a ScanPlan,
+) -> Result<(&'a str, Vec<String>), AppError> {
+    match arm {
+        ScanPlan::IndexEq {
+            index_name,
+            field,
+            value,
+        } => {
+            let ids = storage
+                .index_manager
+                .lookup_eq(&storage.engine, collection, field, value)
+                .unwrap_or_default();
+            Ok((index_name, ids))
+        }
+        ScanPlan::IndexIn {
+            index_name,
+            field,
+            values,
+        } => {
+            let ids = storage
+                .index_manager
+                .lookup_in(&storage.engine, collection, field, values)
+                .unwrap_or_default();
+            Ok((index_name, ids))
+        }
+        ScanPlan::IndexRange {
+            index_name,
+            field,
+            lower,
+            upper,
+        } => {
+            let lower_ref = lower.as_ref().map(|(v, i)| (v, *i));
+            let upper_ref = upper.as_ref().map(|(v, i)| (v, *i));
+            let ids = storage
+                .index_manager
+                .lookup_range(&storage.engine, collection, field, lower_ref, upper_ref)
+                .unwrap_or_default();
+            Ok((index_name, ids))
+        }
+        ScanPlan::CompoundEq { index_name, prefix } => {
+            let partition = storage
+                .index_manager
+                .get_index_partition(collection, index_name)
+                .ok_or_else(|| {
+                    AppError::Internal(format!("Index partition not found: {index_name}"))
+                })?;
+            let mut ids = Vec::new();
+            for (key, _) in storage
+                .engine
+                .prefix_iterator(&partition, prefix)?
+                .flatten()
+            {
+                if let Some(id) = extract_doc_id_from_key(&key) {
+                    ids.push(id);
+                }
+            }
+            Ok((index_name, ids))
+        }
+        ScanPlan::CompoundRange {
+            index_name,
+            eq_prefix,
+            lower,
+            upper,
+        } => {
+            let bounds = range_scan_bounds(
+                eq_prefix,
+                lower.as_ref().map(|(b, i)| (b.as_slice(), *i)),
+                upper.as_ref().map(|(b, i)| (b.as_slice(), *i)),
+            );
+            let (start, end) = match bounds {
+                // This arm alone matches nothing; other arms still contribute.
+                RangeScanBounds::Empty => return Ok((index_name, Vec::new())),
+                RangeScanBounds::Span { start, end } => (start, end),
+            };
+            let partition = storage
+                .index_manager
+                .get_index_partition(collection, index_name)
+                .ok_or_else(|| {
+                    AppError::Internal(format!("Index partition not found: {index_name}"))
+                })?;
+            let mut ids = Vec::new();
+            for kv in storage
+                .engine
+                .range_iterator(&partition, &start, &end, None)?
+            {
+                let (key, _) = kv?;
+                if let Some(id) = extract_doc_id_from_key(&key) {
+                    ids.push(id);
+                }
+            }
+            Ok((index_name, ids))
+        }
+        ScanPlan::FullScan
+        | ScanPlan::IndexSorted { .. }
+        | ScanPlan::BitmapScan { .. }
+        | ScanPlan::OrUnion { .. } => unreachable!("or_union arms are index scans"),
+    }
+}
+
+/// Execute a `$or` union of per-arm index lookups. Ids are unioned across
+/// arms (deduped) and re-sorted to `_id` order — the docs-partition order a
+/// full scan yields — so pages, counts, and offset tiling are byte-identical
+/// to the full-scan path this replaces; only `docs_scanned`, `index_used`,
+/// and `scan_strategy` differ. When any arm over-approximates, the plan's
+/// post-filter is the original `$or` (see `ScanPlan::OrUnion`).
+fn execute_or_union(
+    storage: &Storage,
+    collection: &str,
+    query: &ParsedQuery,
+    plan: &QueryPlan,
+) -> Result<QueryResult, AppError> {
+    let ScanPlan::OrUnion { arms } = &plan.scan else {
+        unreachable!()
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    let mut ids: Vec<String> = Vec::new();
+    let mut index_names: Vec<&str> = Vec::new();
+    for arm in arms {
+        let (index_name, arm_ids) = or_arm_ids(storage, collection, arm)?;
+        if !index_names.contains(&index_name) {
+            index_names.push(index_name);
+        }
+        for id in arm_ids {
+            if seen.insert(id.clone()) {
+                ids.push(id);
+            }
+        }
+    }
+    // _id order == docs-partition key order == full-scan output order.
+    ids.sort_unstable();
+    let index_used = Some(index_names.join("+"));
+
+    // Exact arms: the union IS the match set — count without loading a doc.
+    if query.count_only && plan.post_filter.is_none() {
+        return Ok(QueryResult {
+            docs: vec![],
+            total_count: Some(ids.len() as u64),
+            docs_scanned: 0,
+            index_used,
+            scan_strategy: Some(plan.scan.name().to_string()),
+            has_more: false,
+            next_cursor: None,
+        });
+    }
+
+    // Bare page: window the _id-ordered union (same semantics as the other
+    // windowed index paths — total_count is the full union size).
+    if bare_page(query, &plan.post_filter) {
+        let total = ids.len() as u64;
+        let (docs, docs_scanned, has_more) = load_id_window(storage, collection, query, &ids)?;
+        return Ok(QueryResult {
+            docs,
+            total_count: Some(total),
+            docs_scanned,
+            index_used,
+            scan_strategy: Some(plan.scan.name().to_string()),
+            has_more,
+            next_cursor: None,
+        });
+    }
+
+    let docs_scanned = ids.len() as u64;
+
+    let docs_partition = storage.get_docs_partition(collection)?;
+    let mut loaded_docs = Vec::with_capacity(ids.len());
+    for id in &ids {
+        if let Ok(Some(bytes)) = storage.engine.get(&docs_partition, id.as_bytes())
+            && let Ok(doc) = serde_json::from_slice::<Value>(&bytes)
+        {
+            loaded_docs.push(doc);
+        }
+    }
+
+    let matching: Vec<Value> = if let Some(ref post_filter) = plan.post_filter {
+        loaded_docs
+            .into_iter()
+            .filter(|doc| post_filter.matches(doc))
+            .collect()
+    } else {
+        loaded_docs
+    };
+
+    let total_count = matching.len() as u64;
+
+    if query.count_only {
+        return Ok(QueryResult {
+            docs: vec![],
+            total_count: Some(total_count),
+            docs_scanned,
+            index_used,
+            scan_strategy: Some(plan.scan.name().to_string()),
+            has_more: false,
+            next_cursor: None,
+        });
+    }
+
+    let (docs, has_more, next_cursor) = paginate_materialized(matching, query, collection);
+
+    Ok(QueryResult {
+        docs,
+        total_count: Some(total_count),
+        docs_scanned,
+        index_used,
         scan_strategy: Some(plan.scan.name().to_string()),
         has_more,
         next_cursor,

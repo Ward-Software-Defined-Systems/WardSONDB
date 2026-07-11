@@ -466,6 +466,61 @@ fn bench_index_eq_page(c: &mut Criterion) {
     group.finish();
 }
 
+// Brackets H-P3.1: a two-arm $or over an indexed field, limit 10 of 100k
+// docs (~20k matches per arm). Pre-union this always full-scanned; the union
+// plans one index lookup per arm, dedups, and windows the page. The
+// unindexed twin measures the full-scan cost the union replaces.
+fn bench_or_union(c: &mut Criterion) {
+    let mut group = c.benchmark_group("or_union");
+    group.sample_size(10);
+
+    let filter = json!({"$or": [{"event_type": "firewall"}, {"event_type": "dns"}]});
+    let make_query = |filter: &Value| {
+        parse_query(
+            QueryRequest {
+                filter: Some(filter.clone()),
+                sort: None,
+                limit: Some(10),
+                offset: Some(0),
+                fields: None,
+                count_only: None,
+                cursor: None,
+            },
+            100_000,
+            "events",
+        )
+        .unwrap()
+    };
+
+    let (indexed, _tmp_a) = setup_storage_with_docs(100_000);
+    indexed
+        .create_index("events", "idx_event_type", &["event_type".into()])
+        .unwrap();
+    let probe = execute_query(&indexed, "events", &make_query(&filter)).unwrap();
+    assert_eq!(
+        probe.scan_strategy.as_deref(),
+        Some("or_union"),
+        "bench must run through the $or index union"
+    );
+
+    group.bench_function("two_eq_arms_indexed_100k", |b| {
+        b.iter(|| {
+            let query = make_query(&filter);
+            execute_query(&indexed, "events", &query).unwrap();
+        });
+    });
+
+    let (plain, _tmp_b) = setup_storage_with_docs(100_000);
+    group.bench_function("two_eq_arms_full_scan_100k", |b| {
+        b.iter(|| {
+            let query = make_query(&filter);
+            execute_query(&plain, "events", &query).unwrap();
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_single_insert,
@@ -477,5 +532,6 @@ criterion_group!(
     bench_index_sorted_desc_page,
     bench_regex_scan,
     bench_index_eq_page,
+    bench_or_union,
 );
 criterion_main!(benches);

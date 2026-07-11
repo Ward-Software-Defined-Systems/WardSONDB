@@ -67,6 +67,14 @@ Behavior changes an existing client could observe, most significant first.
 - **Sort spec shapes:** array form and single-key object form, with
   `asc`/`desc`/`1`/`-1` directions, accepted uniformly by `/query` and
   `$sort`.
+- **`$or` index-union planning (`scan_strategy: "or_union"`):** a `$or` whose
+  arms are each individually servable by an index runs one index lookup per
+  arm and unions the results instead of scanning the collection. Results are
+  identical to full-scan evaluation (same documents, order, pages, and
+  counts — arm overlap is deduplicated); one unindexable arm falls back to
+  the full scan as before. A partially bitmap-covered `$or` — which
+  previously fell back to a full scan — now uses the index union when its
+  arms are indexed.
 
 ### Fixed
 
@@ -97,3 +105,6 @@ Behavior changes an existing client could observe, most significant first.
   the listener binds.
 - Query/aggregate/distinct responses move result documents instead of
   re-serializing deep clones.
+- `$or` over indexed fields no longer full-scans: 398.2 ms → 17.4 ms on the
+  two-arm 100k-doc benchmark (~23×); count-only unions count deduped index
+  keys with zero document loads.

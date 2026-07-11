@@ -859,7 +859,7 @@ Get just the count of matching documents without returning them:
 }
 ```
 
-**Unfiltered counts are O(1):** with no `filter`, the count is served from the collection's document counter (maintained on every insert/delete path, seeded by a full count at startup) instead of scanning — `scan_strategy: "doc_counter"`, `docs_scanned: 0`, regardless of collection size. Filtered counts use the index fast paths where possible (see below) or a scan. Every `count_only` response reports how it counted in `scan_strategy` (`doc_counter`, `index_eq`, `index_in`, `index_range`, `compound_eq`, `compound_range`, `bitmap`, or `full_scan`).
+**Unfiltered counts are O(1):** with no `filter`, the count is served from the collection's document counter (maintained on every insert/delete path, seeded by a full count at startup) instead of scanning — `scan_strategy: "doc_counter"`, `docs_scanned: 0`, regardless of collection size. Filtered counts use the index fast paths where possible (see below) or a scan. Every `count_only` response reports how it counted in `scan_strategy` (`doc_counter`, `index_eq`, `index_in`, `index_range`, `compound_eq`, `compound_range`, `bitmap`, `or_union`, or `full_scan`).
 
 **Windowed pages:** when an index or bitmap scan needs no post-filter, sort, or cursor, only the requested `offset`/`limit` window of documents is loaded. On this path `total_count` is the index-entry (or bitmap) count and `docs_scanned` reports the window actually fetched; a document deleted between the index read and the load shortens the page rather than shifting it — the same snapshot-gap semantic the count fast paths have. Offset tiling with a constant filter still covers every document exactly once.
 
@@ -1369,6 +1369,8 @@ The response includes `meta.index_used` when an index is used:
 ```
 
 **Supported index operations:** `$eq` (implicit and explicit), `$in`, `$gt`, `$gte`, `$lt`, `$lte`.
+
+**`$or` index union (`scan_strategy: "or_union"`):** a `$or` whose arms are each individually servable by an index (single-field conditions on indexed fields, or `$and` arms coverable by a compound/single-field index) runs one index lookup per arm and unions the results instead of scanning the collection. Results are identical to the full-scan evaluation — same documents, same order, same pages — with `docs_scanned` reduced to the candidate matches and `index_used` listing the arm indexes (`+`-joined). One arm that no index can serve (an unindexed field, a nested `$or`, `$regex`/`$not`) disables the union and the query full-scans as before.
 
 **Compound filters:** In an `AND` filter, if one field is indexed, the index narrows the candidate set and the remaining conditions are applied as a post-filter.
 
