@@ -27,6 +27,20 @@ Behavior changes an existing client could observe, most significant first.
   `$or`-union materializing pages) now match the rest. `distinct` similarly
   reports documents visited (it stops once `limit` distinct values are
   found) instead of always the collection size.
+- **Bitmap-accelerated queries no longer cross-match values of different
+  types.** Value bitmaps are now keyed with type tags: an accelerated
+  equality scan on the string `"123"` previously also matched documents
+  holding the number `123` (and the string `"__null__"` matched `null`);
+  bitmap-aggregate `$group` keys now come back with their original types
+  instead of being re-guessed (a string `"123"` group returned the number
+  `123`). Persisted bitmap snapshots carry a format version — the first
+  start after upgrading rebuilds the accelerator from storage once.
+- **Bitmap accelerator restart and rebuild correctness.** A loaded snapshot
+  (up to one persist-interval stale) is now reconciled against the document
+  counters and rebuilt on any disagreement, instead of silently dropping
+  post-persist documents from results; live rebuilds queue concurrent
+  writes and drain them before serving instead of racing the position
+  counter they were resetting.
 - **Mid-scan storage errors now fail the request instead of silently
   truncating results.** Index lookups (including `$in`, which previously
   skipped errored values), and the key scans behind `DELETE` collection/index

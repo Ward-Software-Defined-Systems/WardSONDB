@@ -777,26 +777,10 @@ fn try_bitmap_aggregate(
     }))
 }
 
-/// Convert a bitmap string key back to a JSON Value.
-fn string_key_to_value(key: &str) -> Value {
-    match key {
-        "__null__" => Value::Null,
-        "__true__" => Value::Bool(true),
-        "__false__" => Value::Bool(false),
-        s => {
-            // Try number first
-            if let Ok(n) = s.parse::<i64>() {
-                Value::Number(n.into())
-            } else if let Ok(n) = s.parse::<f64>() {
-                serde_json::Number::from_f64(n)
-                    .map(Value::Number)
-                    .unwrap_or(Value::String(s.to_string()))
-            } else {
-                Value::String(s.to_string())
-            }
-        }
-    }
-}
+// Bitmap group keys decode through the exact inverse of the encoder — the
+// old local re-parse guessed types and returned a string "123" group as the
+// number 123 (S2-4), diverging from the doc-scan aggregate path.
+use crate::engine::bitmap::string_key_to_value;
 
 fn parse_sort_stage(
     spec: &Value,

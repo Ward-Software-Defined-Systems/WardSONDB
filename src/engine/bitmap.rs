@@ -12,15 +12,39 @@ use uuid::Uuid;
 
 use crate::query::filter::{FilterNode, FilterOp, resolve_json_path};
 
-/// Convert a JSON value to a deterministic string key for bitmap HashMap lookup.
+/// Bumped when the value-key encoding (or any persisted layout) changes:
+/// `load_from_disk` refuses other formats, which routes startup through a
+/// storage rebuild instead of serving keys the query side can't match.
+const BITMAP_SNAPSHOT_FORMAT: u64 = 2;
+
+/// Collision-free, type-tagged string key for a value. One prefix byte
+/// keeps every JSON type in a disjoint key space — under the old untagged
+/// scheme the string "123" shared a key with the number 123 (bitmap eq
+/// scans cross-matched them) and "__null__" with null, and the aggregate
+/// path could only guess types back. `string_key_to_value` is the exact
+/// inverse.
 pub fn value_to_string_key(value: &Value) -> String {
     match value {
-        Value::Null => "__null__".to_string(),
-        Value::Bool(true) => "__true__".to_string(),
-        Value::Bool(false) => "__false__".to_string(),
-        Value::Number(n) => format!("{}", n),
-        Value::String(s) => s.clone(),
-        other => serde_json::to_string(other).unwrap_or_default(),
+        Value::Null => "z".to_string(),
+        Value::Bool(true) => "t".to_string(),
+        Value::Bool(false) => "f".to_string(),
+        Value::Number(n) => format!("n{n}"),
+        Value::String(s) => format!("s{s}"),
+        other => format!("j{}", serde_json::to_string(other).unwrap_or_default()),
+    }
+}
+
+/// Exact inverse of `value_to_string_key` (numbers and containers decode
+/// through serde, which produced their text in the first place).
+pub fn string_key_to_value(key: &str) -> Value {
+    match key.as_bytes().first() {
+        Some(b'z') => Value::Null,
+        Some(b't') => Value::Bool(true),
+        Some(b'f') => Value::Bool(false),
+        Some(b'n') | Some(b'j') => serde_json::from_str(&key[1..]).unwrap_or(Value::Null),
+        Some(b's') => Value::String(key[1..].to_string()),
+        // Unreachable for keys this module produced.
+        _ => Value::Null,
     }
 }
 
@@ -1011,6 +1035,7 @@ impl ScanAccelerator {
         // From here on, no RwLock guards are held. All I/O runs lock-free.
 
         let meta = serde_json::json!({
+            "format": BITMAP_SNAPSHOT_FORMAT,
             "next_pos": next_pos,
             "count": pos_vec_snapshot.len(),
         });
@@ -1110,6 +1135,19 @@ impl ScanAccelerator {
             Ok(v) => v,
             Err(_) => return false,
         };
+        // Reject other formats (pre-format snapshots default to 1): their
+        // value keys don't match what the query side now produces, so
+        // serving them would silently return wrong results. The caller
+        // rebuilds from storage instead.
+        let format = meta.get("format").and_then(|v| v.as_u64()).unwrap_or(1);
+        if format != BITMAP_SNAPSHOT_FORMAT {
+            info!(
+                found = format,
+                expected = BITMAP_SNAPSHOT_FORMAT,
+                "Bitmap snapshot format outdated; rebuilding from storage"
+            );
+            return false;
+        }
         let next_pos = meta.get("next_pos").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
 
         // Load position map (JSON format — supports variable-length string IDs)
@@ -1501,6 +1539,57 @@ mod tests {
         assert_eq!(x.bitmap.len(), 1, "one position, one bit");
     }
 
+    /// S2-4: value keys are collision-free across types and decode back
+    /// exactly. The old untagged keys collapsed number 123 onto string
+    /// "123" (and null onto the string "__null__"), cross-matching bitmap
+    /// eq scans and re-typing aggregate group keys.
+    #[test]
+    fn value_keys_round_trip_and_stay_type_disjoint() {
+        let corpus = [
+            json!(null),
+            json!(true),
+            json!(false),
+            json!(123),
+            json!(-1.5),
+            json!("123"),
+            json!("__null__"),
+            json!("true"),
+            json!(""),
+            json!([1, 2]),
+            json!({"k": "v"}),
+        ];
+        let mut keys = std::collections::HashSet::new();
+        for v in &corpus {
+            let key = value_to_string_key(v);
+            assert!(keys.insert(key.clone()), "key collision for {v}: {key}");
+            assert_eq!(&string_key_to_value(&key), v, "round trip for {v}");
+        }
+    }
+
+    /// S2-4 (live half): a bitmap eq scan on the string "123" must not
+    /// match documents holding the number 123, and vice versa.
+    #[test]
+    fn bitmap_eq_does_not_cross_match_types() {
+        let a = accel(&["f"]);
+        a.on_insert("num", &json!({"f": 123}));
+        a.on_insert("str", &json!({"f": "123"}));
+        a.on_insert("nul", &json!({"f": null}));
+        a.on_insert("marker", &json!({"f": "__null__"}));
+
+        let s = a.bitmap_scan(&eq_filter("f", json!("123"))).unwrap();
+        assert_eq!(s.bitmap.len(), 1, "string eq matches only the string doc");
+        let n = a.bitmap_scan(&eq_filter("f", json!(123))).unwrap();
+        assert_eq!(n.bitmap.len(), 1, "number eq matches only the number doc");
+        let z = a.bitmap_scan(&eq_filter("f", json!(null))).unwrap();
+        assert_eq!(z.bitmap.len(), 1, "null eq matches only the null doc");
+        let m = a.bitmap_scan(&eq_filter("f", json!("__null__"))).unwrap();
+        assert_eq!(
+            m.bitmap.len(),
+            1,
+            "the old sentinel string is just a string"
+        );
+    }
+
     /// S2-2: a reloaded snapshot only passes reconciliation when its
     /// position count matches storage's document count — a doc written
     /// after the last persist makes the snapshot detectably stale.
@@ -1557,15 +1646,16 @@ mod tests {
             &json!({"kind": "a", "tier": "z"}),
         );
 
+        let key = |v: &str| value_to_string_key(&json!(v));
         let cols = a.columns.read();
         let kind = cols.get("kind").unwrap();
         assert_eq!(kind.cardinality.load(Ordering::Relaxed), 1);
-        assert_eq!(kind.value_bitmaps.read().get("a").unwrap().len(), 2);
+        assert_eq!(kind.value_bitmaps.read().get(&key("a")).unwrap().len(), 2);
         let tier = cols.get("tier").unwrap();
         let tiers = tier.value_bitmaps.read();
-        assert!(!tiers.contains_key("x"));
-        assert_eq!(tiers.get("z").unwrap().len(), 1);
-        assert_eq!(tiers.get("y").unwrap().len(), 1);
+        assert!(!tiers.contains_key(&key("x")));
+        assert_eq!(tiers.get(&key("z")).unwrap().len(), 1);
+        assert_eq!(tiers.get(&key("y")).unwrap().len(), 1);
     }
 
     /// set_max_cardinality must be visible to subsequent inserts (the hot
