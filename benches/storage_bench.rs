@@ -528,6 +528,61 @@ fn bench_or_union(c: &mut Criterion) {
     group.finish();
 }
 
+// Brackets the residual-filter page (H-P2's target shape): an indexed eq
+// narrows to ~20k candidates, and EVERY candidate is hydrated to apply the
+// unindexed residual ({network.action}) before the limit-10 slice. With
+// filter-during-scan streaming the hydration stops at limit+1 matches.
+fn bench_residual_filter_page(c: &mut Criterion) {
+    let mut group = c.benchmark_group("residual_filter_page");
+    group.sample_size(10);
+
+    let (storage, _tmp) = setup_storage_with_docs(100_000);
+    storage
+        .create_index("events", "idx_event_type", &["event_type".into()])
+        .unwrap();
+
+    let make_query = || {
+        parse_query(
+            QueryRequest {
+                filter: Some(json!({
+                    "$and": [
+                        {"event_type": "firewall"},
+                        {"network.action": "block"}
+                    ]
+                })),
+                sort: None,
+                limit: Some(10),
+                offset: Some(0),
+                fields: None,
+                count_only: None,
+                cursor: None,
+            },
+            100_000,
+            "events",
+        )
+        .unwrap()
+    };
+
+    // Doc-returning index scans deliberately report scan_strategy: None
+    // (R9 kept the None-vs-Some sites) — index_used is the strategy probe
+    // here, same as bench_index_eq_page.
+    let probe = execute_query(&storage, "events", &make_query()).unwrap();
+    assert_eq!(
+        probe.index_used.as_deref(),
+        Some("idx_event_type"),
+        "bench must run through the single-field index"
+    );
+
+    group.bench_function("eq_plus_residual_limit_10_100k", |b| {
+        b.iter(|| {
+            let query = make_query();
+            execute_query(&storage, "events", &query).unwrap();
+        });
+    });
+
+    group.finish();
+}
+
 // Fjall twins of the two guard benches (S2-18 parity slice: fjall previously
 // had ZERO bench coverage). Same shapes and sizes as the rocksdb versions so
 // the engines are directly comparable and both stay guarded through H-P2's
@@ -627,6 +682,7 @@ criterion_group!(
     bench_regex_scan,
     bench_index_eq_page,
     bench_or_union,
+    bench_residual_filter_page,
     bench_fjall_pages,
 );
 criterion_main!(benches);

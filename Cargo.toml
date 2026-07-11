@@ -65,6 +65,10 @@ harness = false
 name = "bitmap_bench"
 harness = false
 
+[[bench]]
+name = "http_bench"
+harness = false
+
 # Allocator — Linux only. glibc's ptmalloc2 holds freed memory in per-thread
 # arenas under Tokio's multi-threaded runtime, causing RSS to climb without
 # an actual leak. jemalloc returns memory to the OS aggressively. macOS's
