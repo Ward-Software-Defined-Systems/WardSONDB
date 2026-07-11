@@ -8829,3 +8829,343 @@ async fn test_or_union_bitmap_priority_and_partial_upgrade() {
     assert_eq!(partial["meta"]["total_count"], 6);
     assert_eq!(partial["meta"]["docs_scanned"], 0);
 }
+
+// ─── Backend-parity slice: fjall coverage (DT-1, DT-19) ───────────────────────
+//
+// The per-commit suite defaults to rocksdb; these run the cursor matrix and
+// the windowed-page machinery on fjall so BOTH engines stay guarded while
+// H-P2 rewrites BackendIterator. Same fixtures/assertions as their rocksdb
+// twins — only the engine differs.
+
+/// Engine-parameterized twin of `start_test_server_with_bitmap`.
+async fn start_test_server_with_engine_and_bitmap(
+    engine: &str,
+    bitmap_fields: &str,
+) -> (String, TempDir) {
+    use wardsondb::engine::storage::MemoryConfig;
+
+    let tmp = TempDir::new().unwrap();
+    let storage = Storage::open_with_config(tmp.path(), engine, MemoryConfig::default()).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+
+    let mut config = test_config(&tmp, port);
+    config.storage_engine = engine.to_string();
+    config.bitmap_fields = bitmap_fields.to_string();
+
+    if !bitmap_fields.is_empty() {
+        let fields: Vec<String> = bitmap_fields
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        storage.scan_accelerator.configure_fields(fields);
+        storage.scan_accelerator.set_ready(true);
+    }
+
+    let state = Arc::new(AppState {
+        storage,
+        config,
+        started_at: Instant::now(),
+        metrics: Arc::new(Metrics::new()),
+        api_keys: vec![],
+    });
+
+    let app = build_router(state);
+    let addr = format!("127.0.0.1:{port}");
+    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
+    let base_url = format!("http://{addr}");
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (base_url, tmp)
+}
+
+/// DT-1: the ASCENDING index-seek walk on fjall (the desc twin is B-15) —
+/// forward `range_iterator` seek + limit+1 probe end-to-end over HTTP.
+#[tokio::test]
+async fn test_fjall_cursor_walk_index_sorted_asc() {
+    let (base_url, _tmp) = start_test_server_with_engine("fjall").await;
+    let client = Client::new();
+    seed_index_sorted_collection(&client, &base_url).await;
+
+    let body = json!({
+        "filter": {"event_type": "fw"},
+        "sort": [{"received_at": "asc"}],
+        "limit": 4
+    });
+
+    let probe = client
+        .post(format!("{base_url}/events/query"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let probe_body: Value = probe.json().await.unwrap();
+    assert_eq!(probe_body["meta"]["scan_strategy"], "index_sorted");
+
+    let walked = cursor_walk(&client, &base_url, "events", body.clone()).await;
+    assert_eq!(walked.len(), 15);
+    assert_eq!(
+        ids_of(&walked),
+        reference_ids(&client, &base_url, "events", body).await
+    );
+}
+
+/// DT-1: the materializing cursor path on fjall — full scan + in-memory sort
+/// with duplicate sort values and docs missing the sort field.
+#[tokio::test]
+async fn test_fjall_cursor_walk_materializing() {
+    let (base_url, _tmp) = start_test_server_with_engine("fjall").await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "items"}))
+        .send()
+        .await
+        .unwrap();
+    let docs: Vec<Value> = (0..25)
+        .map(|i| {
+            if i % 5 == 4 {
+                json!({"n": i}) // missing sort field
+            } else {
+                json!({"score": i % 4, "n": i}) // duplicate-heavy sort values
+            }
+        })
+        .collect();
+    client
+        .post(format!("{base_url}/items/docs/_bulk"))
+        .json(&json!({"documents": docs}))
+        .send()
+        .await
+        .unwrap();
+
+    let body = json!({"sort": [{"score": "asc"}], "limit": 4});
+    let walked = cursor_walk(&client, &base_url, "items", body.clone()).await;
+    assert_eq!(walked.len(), 25);
+    assert_eq!(
+        ids_of(&walked),
+        reference_ids(&client, &base_url, "items", body).await
+    );
+}
+
+/// DT-1: the bitmap cursor walk on fjall (accelerator positions resolve
+/// against fjall-backed docs; materializing layer sorts + paginates).
+#[tokio::test]
+async fn test_fjall_cursor_walk_bitmap() {
+    let (base_url, _tmp) = start_test_server_with_engine_and_bitmap("fjall", "event_type").await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "events"}))
+        .send()
+        .await
+        .unwrap();
+    let docs: Vec<Value> = (0..30)
+        .map(|i| {
+            json!({
+                "event_type": if i % 3 == 0 { "dns" } else { "firewall" },
+                "value": (i * 7) % 10,
+                "n": i
+            })
+        })
+        .collect();
+    client
+        .post(format!("{base_url}/events/docs/_bulk"))
+        .json(&json!({"documents": docs}))
+        .send()
+        .await
+        .unwrap();
+
+    let body = json!({
+        "filter": {"event_type": "firewall"},
+        "sort": [{"value": "asc"}],
+        "limit": 4
+    });
+    let probe = client
+        .post(format!("{base_url}/events/query"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let probe_body: Value = probe.json().await.unwrap();
+    assert_eq!(probe_body["meta"]["scan_strategy"], "bitmap");
+
+    let walked = cursor_walk(&client, &base_url, "events", body.clone()).await;
+    assert_eq!(walked.len(), 20);
+    assert_eq!(
+        ids_of(&walked),
+        reference_ids(&client, &base_url, "events", body).await
+    );
+}
+
+/// DT-1: the compound-range cursor walk on fjall (eq prefix + range suffix
+/// through the shared bounds builder, sorted in memory by an uncovered field).
+#[tokio::test]
+async fn test_fjall_cursor_walk_compound_range() {
+    let (base_url, _tmp) = start_test_server_with_engine("fjall").await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "events"}))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base_url}/events/indexes"))
+        .json(&json!({"name": "idx_type_ts", "fields": ["event_type", "ts"]}))
+        .send()
+        .await
+        .unwrap();
+
+    let docs: Vec<Value> = (0..24)
+        .map(|i| {
+            json!({
+                "event_type": if i % 2 == 0 { "fw" } else { "dns" },
+                "ts": i,
+                "other": (i * 5) % 7,
+                "n": i
+            })
+        })
+        .collect();
+    client
+        .post(format!("{base_url}/events/docs/_bulk"))
+        .json(&json!({"documents": docs}))
+        .send()
+        .await
+        .unwrap();
+
+    let body = json!({
+        "filter": {"event_type": "fw", "ts": {"$gte": 4, "$lte": 18}},
+        "sort": [{"other": "asc"}],
+        "limit": 3
+    });
+
+    let probe = client
+        .post(format!("{base_url}/events/query"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    let probe_body: Value = probe.json().await.unwrap();
+    assert_eq!(probe_body["meta"]["scan_strategy"], "compound_range");
+
+    let walked = cursor_walk(&client, &base_url, "events", body.clone()).await;
+    assert_eq!(walked.len(), 8); // ts in {4,6,8,10,12,14,16,18}
+    assert_eq!(
+        ids_of(&walked),
+        reference_ids(&client, &base_url, "events", body).await
+    );
+}
+
+/// DT-19: the M2 windowed-page machinery on fjall — window-vs-residual
+/// equivalence with the docs_scanned == page-size proof, growing-offset
+/// tiling == one-shot, and the or_union window on the same collection.
+#[tokio::test]
+async fn test_fjall_window_tiling() {
+    let (base_url, _tmp) = start_test_server_with_engine("fjall").await;
+    let client = Client::new();
+    setup_window_collection(&base_url, &client).await;
+
+    // Window vs residual-forced page equivalence (the M2 proof on fjall).
+    for (offset, limit) in [(0u64, 3u64), (2, 5), (9, 5)] {
+        let fast: Value = client
+            .post(format!("{base_url}/events/query"))
+            .json(&json!({
+                "filter": {"event_type": "firewall"},
+                "limit": limit, "offset": offset
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let slow: Value = client
+            .post(format!("{base_url}/events/query"))
+            .json(&json!({
+                "filter": {"event_type": "firewall", "_id": {"$exists": true}},
+                "limit": limit, "offset": offset
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            fast["data"], slow["data"],
+            "page mismatch at offset {offset} limit {limit}"
+        );
+        assert_eq!(fast["meta"]["total_count"], 10);
+        let page_len = fast["data"].as_array().unwrap().len() as u64;
+        assert_eq!(
+            fast["meta"]["docs_scanned"].as_u64().unwrap(),
+            page_len,
+            "window must load only the page"
+        );
+        assert_eq!(slow["meta"]["docs_scanned"], 10);
+    }
+
+    // Growing-offset tiling == one-shot, for the index window and the
+    // or_union window (both ride load_id_window).
+    for filter in [
+        json!({"event_type": "firewall"}),
+        json!({"$or": [{"event_type": "firewall"}, {"event_type": "dns"}]}),
+    ] {
+        let one_shot: Value = client
+            .post(format!("{base_url}/events/query"))
+            .json(&json!({"filter": filter, "limit": 100}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let expected = seqs(&one_shot);
+
+        let mut tiled: Vec<i64> = Vec::new();
+        let mut offset = 0u64;
+        loop {
+            let page: Value = client
+                .post(format!("{base_url}/events/query"))
+                .json(&json!({"filter": filter, "limit": 3, "offset": offset}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            tiled.extend(seqs(&page));
+            if page["meta"]["has_more"] != json!(true) {
+                break;
+            }
+            offset += 3;
+        }
+        assert_eq!(tiled, expected, "tiling for {filter}");
+    }
+
+    // The $or filter above must actually ride the union on fjall.
+    let or_probe: Value = client
+        .post(format!("{base_url}/events/query"))
+        .json(&json!({
+            "filter": {"$or": [{"event_type": "firewall"}, {"event_type": "dns"}]},
+            "count_only": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(or_probe["meta"]["scan_strategy"], "or_union");
+    assert_eq!(or_probe["meta"]["total_count"], 20);
+}
