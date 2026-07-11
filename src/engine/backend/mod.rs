@@ -65,7 +65,6 @@ impl From<BackendError> for AppError {
 }
 
 pub type BackendResult<T> = Result<T, BackendError>;
-pub type KvPair = (Vec<u8>, Vec<u8>);
 
 /// Visitor over borrowed key/value slices for the `scan_*` methods. Return
 /// `ControlFlow::Break(())` to stop the scan early. The slices are only valid
@@ -151,47 +150,19 @@ impl WriteBatchWrapper {
     }
 }
 
-/// Streaming iterator over owned key-value pairs. Owning the bytes decouples
-/// the iterator from any read transaction / snapshot lifetime, which lets
-/// callers break early (critical for IndexSorted and count_only paths).
-pub struct BackendIterator {
-    inner: BackendIteratorInner,
-}
-
-enum BackendIteratorInner {
-    /// fjall iterators borrow from a read transaction, so we collect up front.
-    Fjall(std::vec::IntoIter<BackendResult<KvPair>>),
-    /// RocksDB iterators also buffer before returning: DBIterator borrows the
-    /// DB, but this type must be 'static. Callers that only need a page pass
-    /// `max_results` to the range methods to bound the buffering.
-    RocksDb(Box<dyn Iterator<Item = BackendResult<KvPair>> + Send>),
-}
-
-impl BackendIterator {
-    pub(crate) fn from_fjall(items: Vec<BackendResult<KvPair>>) -> Self {
-        BackendIterator {
-            inner: BackendIteratorInner::Fjall(items.into_iter()),
-        }
-    }
-
-    pub(crate) fn from_rocksdb(
-        iter: Box<dyn Iterator<Item = BackendResult<KvPair>> + Send>,
-    ) -> Self {
-        BackendIterator {
-            inner: BackendIteratorInner::RocksDb(iter),
-        }
-    }
-}
-
-impl Iterator for BackendIterator {
-    type Item = BackendResult<KvPair>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match &mut self.inner {
-            BackendIteratorInner::Fjall(it) => it.next(),
-            BackendIteratorInner::RocksDb(it) => it.next(),
-        }
-    }
+/// Collect every key in a partition, values never copied. Used by the DDL
+/// paths that stage whole-partition deletes; a mid-scan engine error aborts
+/// the caller instead of truncating the key set.
+pub(crate) fn collect_keys(
+    engine: &Engine,
+    partition: &PartitionId,
+) -> BackendResult<Vec<Vec<u8>>> {
+    let mut keys = Vec::new();
+    engine.scan_full(partition, &mut |k, _| {
+        keys.push(k.to_vec());
+        std::ops::ControlFlow::Continue(())
+    })?;
+    Ok(keys)
 }
 
 // ─── Trait ───────────────────────────────────────────────────────────
@@ -208,19 +179,12 @@ pub trait StorageBackend: Send + Sync {
         partition: &PartitionId,
         keys: &[&[u8]],
     ) -> BackendResult<Vec<Option<Vec<u8>>>>;
-    fn prefix_iterator(
-        &self,
-        partition: &PartitionId,
-        prefix: &[u8],
-    ) -> BackendResult<BackendIterator>;
-    fn full_iterator(&self, partition: &PartitionId) -> BackendResult<BackendIterator>;
     /// Visit every pair with the given prefix in ascending key order, without
     /// materializing anything.
     ///
     /// Contract for all four `scan_*` methods:
     /// - One consistent view per call (fjall: one `read_tx` snapshot; RocksDB:
-    ///   one iterator pin), held for the duration of the call — the same
-    ///   per-call semantics the buffering iterators have.
+    ///   one iterator pin), held for the duration of the call.
     /// - Keys/values are borrowed; entries the visitor skips are never copied.
     /// - The visitor MAY read re-entrantly through `get`/`get_many` or a
     ///   nested scan on the same engine (interleaved hydration — pinned by
@@ -229,7 +193,7 @@ pub trait StorageBackend: Send + Sync {
     ///   It MUST NOT commit write batches — mutation paths collect their
     ///   matches first and write after the scan returns.
     /// - A mid-iteration engine error returns `Err` like `count_prefix` does,
-    ///   instead of the buffering iterators' truncate-at-error behavior.
+    ///   never a silent truncation.
     fn scan_prefix(
         &self,
         partition: &PartitionId,
@@ -256,11 +220,9 @@ pub trait StorageBackend: Send + Sync {
     ) -> BackendResult<()>;
     /// Visit the whole partition in ascending key order.
     fn scan_full(&self, partition: &PartitionId, visit: &mut ScanVisitor<'_>) -> BackendResult<()>;
-    /// Count keys with the given prefix WITHOUT materializing keys or values
-    /// (the iterator methods buffer everything they visit). Exact, under the
-    /// same snapshot semantics as `prefix_iterator`; an empty prefix counts
-    /// the whole partition. Iteration errors surface as `Err` — unlike the
-    /// buffering iterators, which truncate on a mid-stream error.
+    /// Count keys with the given prefix without materializing keys or
+    /// values. Exact, under `scan_prefix`'s snapshot semantics; an empty
+    /// prefix counts the whole partition. Iteration errors surface as `Err`.
     fn count_prefix(&self, partition: &PartitionId, prefix: &[u8]) -> BackendResult<u64>;
     /// Count keys `start <= k < end` without materializing. `start >= end`
     /// counts zero (guarded — an inverted range must not reach the engine).
@@ -314,22 +276,6 @@ impl StorageBackend for Engine {
         match self {
             Engine::Fjall(b) => b.get_many(partition, keys),
             Engine::RocksDb(b) => b.get_many(partition, keys),
-        }
-    }
-    fn prefix_iterator(
-        &self,
-        partition: &PartitionId,
-        prefix: &[u8],
-    ) -> BackendResult<BackendIterator> {
-        match self {
-            Engine::Fjall(b) => b.prefix_iterator(partition, prefix),
-            Engine::RocksDb(b) => b.prefix_iterator(partition, prefix),
-        }
-    }
-    fn full_iterator(&self, partition: &PartitionId) -> BackendResult<BackendIterator> {
-        match self {
-            Engine::Fjall(b) => b.full_iterator(partition),
-            Engine::RocksDb(b) => b.full_iterator(partition),
         }
     }
     fn scan_prefix(
@@ -434,6 +380,8 @@ mod tests {
     use super::*;
     use std::ops::ControlFlow;
 
+    type KvPair = (Vec<u8>, Vec<u8>);
+
     fn test_engine_config() -> EngineConfig {
         EngineConfig {
             cache_size_bytes: 8 * 1024 * 1024,
@@ -488,35 +436,30 @@ mod tests {
         got
     }
 
+    /// The four scan shapes against explicit expectations over the seeded
+    /// fixture: prefix bounds, half-open range window, descending ==
+    /// reversed ascending, full order.
     #[test]
-    fn scan_visitors_match_pull_iterators() {
+    fn scan_shapes_visit_expected_windows() {
+        let pair = |group: char, i: usize| {
+            (
+                format!("{group}:0{i}").into_bytes(),
+                format!("v{group}{i}").into_bytes(),
+            )
+        };
         for_each_engine(|engine| {
             let p = seed(engine);
 
             let got = collect_visited(|v| engine.scan_prefix(&p, b"a:", v));
-            let want: Vec<KvPair> = engine
-                .prefix_iterator(&p, b"a:")
-                .unwrap()
-                .collect::<BackendResult<_>>()
-                .unwrap();
+            let want: Vec<KvPair> = (0..10).map(|i| pair('a', i)).collect();
             assert_eq!(got, want);
-            assert_eq!(got.len(), 10);
 
-            // Half-open window a:03..a:07 (the pull range iterator is gone;
-            // the expectation is explicit).
+            // Half-open window a:03..a:07.
             let got = collect_visited(|v| engine.scan_range(&p, b"a:03", b"a:07", v));
-            let want: Vec<KvPair> = (3..7)
-                .map(|i| {
-                    (
-                        format!("a:0{i}").into_bytes(),
-                        format!("va{i}").into_bytes(),
-                    )
-                })
-                .collect();
+            let want: Vec<KvPair> = (3..7).map(|i| pair('a', i)).collect();
             assert_eq!(got, want);
 
-            // Descending == the forward window reversed (the pull rev
-            // iterator is gone; this property IS its contract).
+            // Descending == the forward window reversed.
             let got = collect_visited(|v| engine.scan_range_rev(&p, b"a:03", b"a:07", v));
             let mut want = collect_visited(|v| engine.scan_range(&p, b"a:03", b"a:07", v));
             want.reverse();
@@ -527,13 +470,11 @@ mod tests {
             );
 
             let got = collect_visited(|v| engine.scan_full(&p, v));
-            let want: Vec<KvPair> = engine
-                .full_iterator(&p)
-                .unwrap()
-                .collect::<BackendResult<_>>()
-                .unwrap();
+            let want: Vec<KvPair> = (0..10)
+                .map(|i| pair('a', i))
+                .chain((0..10).map(|i| pair('b', i)))
+                .collect();
             assert_eq!(got, want);
-            assert_eq!(got.len(), 20);
         });
     }
 

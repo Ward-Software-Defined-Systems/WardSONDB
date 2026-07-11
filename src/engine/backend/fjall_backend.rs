@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use fjall::{Batch, Config, PartitionCreateOptions, PersistMode, TxKeyspace};
 
 use super::{
-    BackendError, BackendIterator, BackendResult, EngineConfig, KvPair, PartitionId, ScanVisitor,
-    StorageBackend, WriteBatchWrapper,
+    BackendError, BackendResult, EngineConfig, PartitionId, ScanVisitor, StorageBackend,
+    WriteBatchWrapper,
 };
 
 pub struct FjallBackend {
@@ -49,13 +49,6 @@ impl FjallBackend {
                 Err(BackendError::Internal(msg))
             }
         }
-    }
-}
-
-fn to_kv(r: Result<(fjall::Slice, fjall::Slice), fjall::Error>) -> BackendResult<KvPair> {
-    match r {
-        Ok((k, v)) => Ok((k.to_vec(), v.to_vec())),
-        Err(e) => Err(BackendError::Internal(e.to_string())),
     }
 }
 
@@ -100,32 +93,6 @@ impl StorageBackend for FjallBackend {
                 _ => None,
             })
             .collect())
-    }
-
-    fn prefix_iterator(
-        &self,
-        partition: &PartitionId,
-        prefix: &[u8],
-    ) -> BackendResult<BackendIterator> {
-        let PartitionId::Fjall(handle) = partition else {
-            return Err(BackendError::Internal(
-                "PartitionId/backend mismatch".into(),
-            ));
-        };
-        let rtx = self.db.read_tx();
-        let items: Vec<BackendResult<KvPair>> = rtx.prefix(handle, prefix).map(to_kv).collect();
-        Ok(BackendIterator::from_fjall(items))
-    }
-
-    fn full_iterator(&self, partition: &PartitionId) -> BackendResult<BackendIterator> {
-        let PartitionId::Fjall(handle) = partition else {
-            return Err(BackendError::Internal(
-                "PartitionId/backend mismatch".into(),
-            ));
-        };
-        let rtx = self.db.read_tx();
-        let items: Vec<BackendResult<KvPair>> = rtx.iter(handle).map(to_kv).collect();
-        Ok(BackendIterator::from_fjall(items))
     }
 
     fn scan_prefix(

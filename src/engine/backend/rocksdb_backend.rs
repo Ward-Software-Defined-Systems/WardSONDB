@@ -12,13 +12,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rust_rocksdb::{
-    BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, DBCompressionType, Direction,
-    IteratorMode, Options, WriteBatch, WriteBufferManager,
+    BlockBasedOptions, Cache, ColumnFamilyDescriptor, DB, DBCompressionType, IteratorMode, Options,
+    WriteBatch, WriteBufferManager,
 };
 
 use super::{
-    BackendError, BackendIterator, BackendResult, EngineConfig, KvPair, PartitionId, ScanVisitor,
-    StorageBackend, WriteBatchWrapper,
+    BackendError, BackendResult, EngineConfig, PartitionId, ScanVisitor, StorageBackend,
+    WriteBatchWrapper,
 };
 
 pub struct RocksDbBackend {
@@ -189,58 +189,6 @@ impl StorageBackend for RocksDbBackend {
                 _ => None,
             })
             .collect())
-    }
-
-    fn prefix_iterator(
-        &self,
-        partition: &PartitionId,
-        prefix: &[u8],
-    ) -> BackendResult<BackendIterator> {
-        let (db, cf_name) = unwrap_rocks(partition)?;
-        let cf = db
-            .cf_handle(cf_name)
-            .ok_or_else(|| BackendError::Internal(format!("CF not found: {cf_name}")))?;
-        let raw = db.iterator_cf(&cf, IteratorMode::From(prefix, Direction::Forward));
-        let prefix_owned = prefix.to_vec();
-        let mut materialized: Vec<BackendResult<KvPair>> = Vec::new();
-        for item in raw {
-            match item {
-                Ok((k, v)) => {
-                    if !k.starts_with(&prefix_owned) {
-                        break;
-                    }
-                    materialized.push(Ok((k.to_vec(), v.to_vec())));
-                }
-                Err(e) => {
-                    materialized.push(Err(rocks_err(e)));
-                    break;
-                }
-            }
-        }
-        Ok(BackendIterator::from_rocksdb(Box::new(
-            materialized.into_iter(),
-        )))
-    }
-
-    fn full_iterator(&self, partition: &PartitionId) -> BackendResult<BackendIterator> {
-        let (db, cf_name) = unwrap_rocks(partition)?;
-        let cf = db
-            .cf_handle(cf_name)
-            .ok_or_else(|| BackendError::Internal(format!("CF not found: {cf_name}")))?;
-        let raw = db.iterator_cf(&cf, IteratorMode::Start);
-        let mut materialized: Vec<BackendResult<KvPair>> = Vec::new();
-        for item in raw {
-            match item {
-                Ok((k, v)) => materialized.push(Ok((k.to_vec(), v.to_vec()))),
-                Err(e) => {
-                    materialized.push(Err(rocks_err(e)));
-                    break;
-                }
-            }
-        }
-        Ok(BackendIterator::from_rocksdb(Box::new(
-            materialized.into_iter(),
-        )))
     }
 
     fn scan_prefix(

@@ -174,19 +174,13 @@ impl Storage {
     }
 
     fn initialize_doc_counts(&self) -> Result<(), AppError> {
-        for kv in self.engine.prefix_iterator(&self.meta, b"collection:")? {
-            let (key_bytes, _) = kv?;
-            let key_str = std::str::from_utf8(&key_bytes)
-                .map_err(|e| AppError::Internal(format!("Invalid key: {e}")))?;
-            let col_name = key_str.strip_prefix("collection:").unwrap_or(key_str);
-
+        // Names first, partition opens + counts after the registry scan's
+        // snapshot is released. Counts are keys-only and exact — required:
+        // these counters are authoritative for count_only.
+        for col_name in self.collection_names()? {
             let docs_partition = self.create_partition(&format!("{col_name}#docs"))?;
-            // Keys-only exact count — full_iterator materializes every doc's
-            // key+value just to count them (O(dataset) transient RAM at
-            // startup). Exactness is required: these counters are
-            // authoritative for count_only.
             let count = self.engine.count_prefix(&docs_partition, b"")? as i64;
-            self.doc_counts.initialize(col_name, count);
+            self.doc_counts.initialize(&col_name, count);
         }
         Ok(())
     }

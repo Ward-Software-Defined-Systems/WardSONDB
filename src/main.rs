@@ -368,18 +368,11 @@ fn rebuild_all_accelerators(storage: &Storage) {
             }
         };
         use engine::backend::StorageBackend;
-        let iter = match storage.engine.full_iterator(&docs_partition) {
-            Ok(it) => it,
-            Err(e) => {
-                warn!(collection = col.name, error = ?e, "Skipping collection for rebuild");
-                continue;
-            }
-        };
         let mut batch: Vec<(String, serde_json::Value)> = Vec::with_capacity(BATCH_SIZE);
+        let mut over_budget = false;
 
-        for kv in iter {
-            if let Ok((_, value)) = kv
-                && let Ok(doc) = serde_json::from_slice::<serde_json::Value>(&value)
+        let scan = storage.engine.scan_full(&docs_partition, &mut |_, value| {
+            if let Ok(doc) = serde_json::from_slice::<serde_json::Value>(value)
                 && let Some(id) = doc.get("_id").and_then(|v| v.as_str())
             {
                 batch.push((id.to_string(), doc));
@@ -389,13 +382,21 @@ fn rebuild_all_accelerators(storage: &Storage) {
                 storage.scan_accelerator.rebuild_batch(&batch);
                 batch.clear();
                 if storage.scan_accelerator.is_over_budget() {
-                    info!(
-                        docs_indexed = total_docs,
-                        "Bitmap rebuild stopped early: memory budget exceeded"
-                    );
-                    break;
+                    over_budget = true;
+                    return std::ops::ControlFlow::Break(());
                 }
             }
+            std::ops::ControlFlow::Continue(())
+        });
+        if let Err(e) = scan {
+            warn!(collection = col.name, error = ?e, "Skipping collection for rebuild");
+            continue;
+        }
+        if over_budget {
+            info!(
+                docs_indexed = total_docs,
+                "Bitmap rebuild stopped early: memory budget exceeded"
+            );
         }
         if !batch.is_empty() {
             total_docs += batch.len();

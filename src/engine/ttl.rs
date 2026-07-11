@@ -63,13 +63,30 @@ impl Storage {
 
     pub fn get_all_ttl_configs(&self) -> Result<Vec<(String, TtlConfig)>, AppError> {
         let mut results = Vec::new();
-        for kv in self.engine.prefix_iterator(&self.meta, b"ttl:")? {
-            let (key_bytes, val_bytes) = kv?;
-            let key_str = std::str::from_utf8(&key_bytes)
-                .map_err(|e| AppError::Internal(format!("Invalid key: {e}")))?;
-            let collection = key_str.strip_prefix("ttl:").unwrap_or(key_str).to_string();
-            let config: TtlConfig = serde_json::from_slice(&val_bytes)?;
-            results.push((collection, config));
+        let mut item_err: Option<AppError> = None;
+        self.engine
+            .scan_prefix(&self.meta, b"ttl:", &mut |key, value| {
+                let key_str = match std::str::from_utf8(key) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        item_err = Some(AppError::Internal(format!("Invalid key: {e}")));
+                        return std::ops::ControlFlow::Break(());
+                    }
+                };
+                let collection = key_str.strip_prefix("ttl:").unwrap_or(key_str).to_string();
+                match serde_json::from_slice::<TtlConfig>(value) {
+                    Ok(config) => {
+                        results.push((collection, config));
+                        std::ops::ControlFlow::Continue(())
+                    }
+                    Err(e) => {
+                        item_err = Some(e.into());
+                        std::ops::ControlFlow::Break(())
+                    }
+                }
+            })?;
+        if let Some(e) = item_err {
+            return Err(e);
         }
         Ok(results)
     }

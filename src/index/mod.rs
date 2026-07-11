@@ -68,24 +68,38 @@ impl IndexManager {
 
     /// Load all index definitions from _meta on startup.
     pub fn load_indexes(&self, engine: &Engine, meta: &PartitionId) -> Result<(), AppError> {
-        let mut indexes = self.indexes.write();
-
-        for kv in engine.prefix_iterator(meta, b"index:")? {
-            let (key_bytes, value_bytes) = kv?;
-            let _key_str = std::str::from_utf8(&key_bytes)
-                .map_err(|e| AppError::Internal(format!("Invalid index meta key: {e}")))?;
-
-            let mut def: IndexDef = serde_json::from_slice(&value_bytes)
-                .map_err(|e| AppError::Internal(format!("Invalid index meta value: {e}")))?;
-
-            // Backward compat: old indexes stored `field` but not `fields`
-            if def.fields.is_empty() && !def.field.is_empty() {
-                def.fields = vec![def.field.clone()];
+        // Parse the defs during the registry scan (borrowed values, zero
+        // copies); open partitions and fill the map after it returns.
+        let mut defs: Vec<IndexDef> = Vec::new();
+        let mut item_err: Option<AppError> = None;
+        engine.scan_prefix(meta, b"index:", &mut |key, value| {
+            if let Err(e) = std::str::from_utf8(key) {
+                item_err = Some(AppError::Internal(format!("Invalid index meta key: {e}")));
+                return ControlFlow::Break(());
             }
+            match serde_json::from_slice::<IndexDef>(value) {
+                Ok(mut def) => {
+                    // Backward compat: old indexes stored `field` but not `fields`
+                    if def.fields.is_empty() && !def.field.is_empty() {
+                        def.fields = vec![def.field.clone()];
+                    }
+                    defs.push(def);
+                    ControlFlow::Continue(())
+                }
+                Err(e) => {
+                    item_err = Some(AppError::Internal(format!("Invalid index meta value: {e}")));
+                    ControlFlow::Break(())
+                }
+            }
+        })?;
+        if let Some(e) = item_err {
+            return Err(e);
+        }
 
+        let mut indexes = self.indexes.write();
+        for def in defs {
             let partition_name = format!("{}#idx#{}", def.collection, def.name);
             let partition = engine.create_or_open_partition(&partition_name)?;
-
             indexes.insert(
                 (def.collection.clone(), def.name.clone()),
                 IndexEntry { def, partition },
@@ -440,9 +454,8 @@ impl IndexManager {
             p
         };
 
-        // Keys-only count: the buffering prefix_iterator would copy every
-        // key+value just to drop them. `.ok()` keeps the fall-back-to-slow-
-        // path contract on engine errors.
+        // Keys-only count; `.ok()` keeps the fall-back-to-slow-path contract
+        // on engine errors (unlike the lookup_* methods, which propagate).
         engine.count_prefix(&partition, &prefix).ok()
     }
 

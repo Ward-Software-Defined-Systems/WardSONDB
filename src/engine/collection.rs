@@ -1,6 +1,8 @@
+use std::ops::ControlFlow;
+
 use serde::{Deserialize, Serialize};
 
-use crate::engine::backend::{PartitionId, StorageBackend};
+use crate::engine::backend::{PartitionId, StorageBackend, collect_keys};
 use crate::error::AppError;
 
 use super::storage::Storage;
@@ -60,17 +62,36 @@ impl Storage {
         })
     }
 
-    pub fn list_collections(&self) -> Result<Vec<CollectionInfo>, AppError> {
-        let mut collections = Vec::new();
-        for kv in self.engine.prefix_iterator(&self.meta, b"collection:")? {
-            let (key, _value) = kv?;
-            let key_str = std::str::from_utf8(&key)
-                .map_err(|e| AppError::Internal(format!("Invalid key: {e}")))?;
-            let col_name = key_str
-                .strip_prefix("collection:")
-                .unwrap_or(key_str)
-                .to_string();
+    /// Every registered collection name, from the `_meta` registry.
+    pub(crate) fn collection_names(&self) -> Result<Vec<String>, AppError> {
+        let mut names = Vec::new();
+        let mut key_err: Option<AppError> = None;
+        self.engine.scan_prefix(
+            &self.meta,
+            b"collection:",
+            &mut |key, _| match std::str::from_utf8(key) {
+                Ok(s) => {
+                    names.push(s.strip_prefix("collection:").unwrap_or(s).to_string());
+                    ControlFlow::Continue(())
+                }
+                Err(e) => {
+                    key_err = Some(AppError::Internal(format!("Invalid key: {e}")));
+                    ControlFlow::Break(())
+                }
+            },
+        )?;
+        if let Some(e) = key_err {
+            return Err(e);
+        }
+        Ok(names)
+    }
 
+    pub fn list_collections(&self) -> Result<Vec<CollectionInfo>, AppError> {
+        // Names first (borrowed-key scan), per-collection lock reads after
+        // the scan's snapshot is released.
+        let names = self.collection_names()?;
+        let mut collections = Vec::new();
+        for col_name in names {
             let doc_count = self.doc_counts.get(&col_name).max(0) as u64;
             let indexes = self
                 .index_manager
@@ -118,12 +139,11 @@ impl Storage {
 
         let docs_partition = self.get_docs_partition(name)?;
 
-        // Collect all doc keys (own them before starting the batch).
-        let keys: Vec<Vec<u8>> = self
-            .engine
-            .full_iterator(&docs_partition)?
-            .filter_map(|kv| kv.ok().map(|(k, _)| k))
-            .collect();
+        // Collect all doc keys (owned, before starting the batch) — keys
+        // only, values never copied. A mid-scan engine error now aborts the
+        // whole drop instead of silently dropping a truncated key set (which
+        // left orphan keys behind a "successful" drop).
+        let keys = collect_keys(&self.engine, &docs_partition)?;
 
         let index_defs = self.index_manager.get_indexes_for_collection(name);
 
@@ -136,11 +156,7 @@ impl Storage {
         for idx_def in &index_defs {
             if let Some(idx_partition) = self.index_manager.get_index_partition(name, &idx_def.name)
             {
-                let idx_keys: Vec<Vec<u8>> = self
-                    .engine
-                    .full_iterator(&idx_partition)?
-                    .filter_map(|kv| kv.ok().map(|(k, _)| k))
-                    .collect();
+                let idx_keys = collect_keys(&self.engine, &idx_partition)?;
                 for key in &idx_keys {
                     batch.remove(&idx_partition, key)?;
                 }

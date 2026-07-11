@@ -525,14 +525,12 @@ impl Storage {
         let partition_name = format!("{collection}#idx#{name}");
         let partition = self.create_partition(&partition_name)?;
 
-        // Backfill: scan all existing documents and index them
-        let docs_partition = self.get_docs_partition(collection)?;
+        // Backfill: stream all existing documents and stage their entries
+        // (a parse failure still fails the backfill).
         let mut entries: Vec<Vec<u8>> = Vec::new();
         let is_compound = fields.len() > 1;
 
-        for kv in self.engine.full_iterator(&docs_partition)? {
-            let (_, value_bytes) = kv?;
-            let doc: Value = serde_json::from_slice(&value_bytes)?;
+        self.for_each_document(collection, &mut |doc| {
             if let Some(doc_id) = doc.get("_id").and_then(|v| v.as_str()) {
                 if is_compound {
                     let values: Vec<&Value> = fields
@@ -550,7 +548,8 @@ impl Storage {
                     entries.push(key);
                 }
             }
-        }
+            ControlFlow::Continue(())
+        })?;
 
         let meta_bytes = serde_json::to_vec(&def)?;
         let mut batch = self.write_batch();
@@ -583,11 +582,9 @@ impl Storage {
             .get_index_partition(collection, name)
             .ok_or_else(|| AppError::IndexNotFound(format!("{collection}/{name}")))?;
 
-        let keys: Vec<Vec<u8>> = self
-            .engine
-            .full_iterator(&partition)?
-            .filter_map(|kv| kv.ok().map(|(k, _)| k))
-            .collect();
+        // Keys only, values never copied; a mid-scan engine error aborts the
+        // drop instead of committing a truncated removal.
+        let keys = crate::engine::backend::collect_keys(&self.engine, &partition)?;
 
         let mut batch = self.write_batch();
         for key in &keys {

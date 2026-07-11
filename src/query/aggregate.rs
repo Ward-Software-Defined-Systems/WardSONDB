@@ -515,10 +515,7 @@ fn try_index_only_aggregate(
     let mut current_value: Option<Vec<u8>> = None;
     let mut current_count: u64 = 0;
 
-    for kv in storage.engine.full_iterator(&partition)? {
-        let (key_bytes, _) = kv?;
-        let key = key_bytes.as_slice();
-
+    storage.engine.scan_full(&partition, &mut |key, _| {
         // Single-field index key: {value_bytes}\x00{doc_id}. Doc ids are
         // NUL-free (validate_custom_id) but NOT fixed-width — custom _ids can
         // be 1..512 bytes — so the separator is the LAST 0x00, never a fixed
@@ -527,7 +524,7 @@ fn try_index_only_aggregate(
         // strings), which is why we split on the last one, exactly like
         // extract_doc_id_from_key.
         let Some(sep) = key.iter().rposition(|&b| b == 0x00) else {
-            continue; // malformed key — no separator
+            return std::ops::ControlFlow::Continue(()); // malformed key — no separator
         };
         let value_part = &key[..sep];
 
@@ -539,11 +536,14 @@ fn try_index_only_aggregate(
                 if let Some(cv) = current_value.take() {
                     group_counts.push((cv, current_count));
                 }
+                // Only group CHANGES copy the value bytes; within a run the
+                // comparison stays on the borrowed key.
                 current_value = Some(value_part.to_vec());
                 current_count = 1;
             }
         }
-    }
+        std::ops::ControlFlow::Continue(())
+    })?;
     if let Some(cv) = current_value {
         group_counts.push((cv, current_count));
     }
