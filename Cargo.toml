@@ -22,7 +22,6 @@ base64 = "0.22"
 
 # Document handling
 uuid = { version = "1", features = ["v7"] }
-jsonschema = "0.29"
 
 # TLS
 rcgen = "0.13"
