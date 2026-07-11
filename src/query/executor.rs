@@ -13,7 +13,7 @@ use super::cursor::{Cursor, CursorValue, compare_doc_to_cursor, encode_cursor};
 use super::filter::resolve_json_path;
 use super::parser::ParsedQuery;
 use super::planner::{QueryPlan, ScanPlan, plan_query};
-use super::sort::{DocSortKey, SortField, compare_decorated, compare_docs, extract_sort_key};
+use super::sort::{DocSortKey, SortField, compare_decorated, extract_sort_key};
 
 use std::ops::ControlFlow;
 
@@ -70,61 +70,17 @@ pub fn execute_query(
     }
 }
 
-/// Final ordering, pagination, and projection for strategies that materialize
-/// the full match set. Sorts with the `_id`-tiebreak comparator whenever a
-/// sort or a cursor is present (a cursor with no sort needs the deterministic
-/// `_id` order — this is also what makes bitmap scans, whose natural order is
-/// insertion position, cursor-safe). Resolves the page window from the cursor
-/// position or the offset, computes an exact `has_more`, and builds
-/// `next_cursor` from the last page document BEFORE projection strips fields.
-fn paginate_materialized(
-    mut matching: Vec<Value>,
-    query: &ParsedQuery,
-    collection: &str,
-) -> (Vec<Value>, bool, Option<String>) {
-    use std::cmp::Ordering;
-
-    if query.cursor.is_some() || !query.sort.is_empty() {
-        matching.sort_by(|a, b| compare_docs(a, b, &query.sort));
-    }
-
-    let start = match &query.cursor {
-        // Sorted by the same total order the cursor encodes, so the page
-        // starts exactly where docs stop comparing at-or-before the cursor.
-        Some(cursor) => matching.partition_point(|doc| {
-            compare_doc_to_cursor(doc, cursor, &query.sort) != Ordering::Greater
-        }),
-        None => (query.offset as usize).min(matching.len()),
-    };
-    let end = start
-        .saturating_add(query.limit as usize)
-        .min(matching.len());
-    let has_more = matching.len() > end;
-
-    let next_cursor =
-        if has_more && end > start && (query.cursor.is_some() || !query.sort.is_empty()) {
-            encode_cursor(&matching[end - 1], &query.sort, collection)
-        } else {
-            None
-        };
-
-    matching.truncate(end);
-    let page = matching.split_off(start);
-
-    (apply_projection(page, &query.fields), has_more, next_cursor)
-}
-
 /// Hydrate an ordered id list: one batched read + parse. Ids whose doc
 /// vanished in the scan→get gap (or whose read failed) are skipped — the
 /// snapshot-gap tolerance every hydration path has always had (S2-8 owns any
 /// skip-vs-fail policy change). The returned length is what `docs_scanned`
 /// reports on the materializing paths: documents actually loaded and parsed.
-fn load_docs_by_ids(
+fn load_docs_by_ids<S: AsRef<str>>(
     storage: &Storage,
     docs_partition: &PartitionId,
-    ids: &[String],
+    ids: &[S],
 ) -> Result<Vec<Value>, AppError> {
-    let key_refs: Vec<&[u8]> = ids.iter().map(|id| id.as_bytes()).collect();
+    let key_refs: Vec<&[u8]> = ids.iter().map(|id| id.as_ref().as_bytes()).collect();
     let mut docs = Vec::with_capacity(ids.len());
     for bytes in storage
         .engine
@@ -459,6 +415,107 @@ fn execute_index_stream(
     })
 }
 
+/// Page an ordered id list through the streaming sinks (bitmap and $or-union
+/// paths, whose candidates are id lists rather than live index scans):
+/// unsorted residual pages hydrate per id and stop at the probe row;
+/// sorted/cursor pages and residual counts batch-hydrate (every id gets
+/// evaluated regardless) and feed the same sinks. Meta labels come from the
+/// caller.
+fn execute_id_stream<S: AsRef<str>>(
+    storage: &Storage,
+    collection: &str,
+    query: &ParsedQuery,
+    plan: &QueryPlan,
+    ids: &[S],
+    index_used: Option<String>,
+) -> Result<QueryResult, AppError> {
+    let docs_partition = storage.get_docs_partition(collection)?;
+
+    if query.count_only {
+        let docs = load_docs_by_ids(storage, &docs_partition, ids)?;
+        let docs_scanned = docs.len() as u64;
+        let matches = docs
+            .iter()
+            .filter(|d| plan.post_filter.as_ref().is_none_or(|f| f.matches(d)))
+            .count() as u64;
+        return Ok(QueryResult {
+            docs: vec![],
+            total_count: Some(matches),
+            docs_scanned,
+            index_used,
+            scan_strategy: Some(plan.scan.name().to_string()),
+            has_more: false,
+            next_cursor: None,
+        });
+    }
+
+    if query.cursor.is_some() || !query.sort.is_empty() {
+        let docs = load_docs_by_ids(storage, &docs_partition, ids)?;
+        let docs_scanned = docs.len() as u64;
+        let mut topk = TopK::new(query.offset as usize, query.limit as usize, &query.sort);
+        let mut pre_cursor = 0u64;
+        for doc in docs {
+            if let Some(ref pf) = plan.post_filter
+                && !pf.matches(&doc)
+            {
+                continue;
+            }
+            if let Some(cursor) = &query.cursor
+                && compare_doc_to_cursor(&doc, cursor, &query.sort) != std::cmp::Ordering::Greater
+            {
+                pre_cursor += 1;
+                continue;
+            }
+            topk.push(doc);
+        }
+        let (docs, total_count, has_more, next_cursor) =
+            finish_topk(topk, pre_cursor, query, collection);
+        return Ok(QueryResult {
+            docs,
+            total_count,
+            docs_scanned,
+            index_used,
+            scan_strategy: Some(plan.scan.name().to_string()),
+            has_more,
+            next_cursor,
+        });
+    }
+
+    // Unsorted residual page: per-id hydration, early exit at the probe row.
+    let mut sink = UnsortedPage::new(query.offset as usize, query.limit as usize);
+    let mut docs_scanned = 0u64;
+    for doc_id in ids {
+        let Ok(Some(bytes)) = storage
+            .engine
+            .get(&docs_partition, doc_id.as_ref().as_bytes())
+        else {
+            continue;
+        };
+        let Ok(doc) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        docs_scanned += 1;
+        if let Some(ref pf) = plan.post_filter
+            && !pf.matches(&doc)
+        {
+            continue;
+        }
+        if sink.push(doc).is_break() {
+            break;
+        }
+    }
+    let (page, has_more, total_count) = sink.finish(query.limit as usize);
+    Ok(QueryResult {
+        docs: apply_projection(page, &query.fields),
+        total_count,
+        docs_scanned,
+        index_used,
+        scan_strategy: Some(plan.scan.name().to_string()),
+        has_more,
+        next_cursor: None,
+    })
+}
+
 /// Bare-page fast path without candidate materialization (single-shape
 /// plans): the exact total comes from the keys-only backend count, offset
 /// entries are skipped at the KEY level, and only the window's ids are
@@ -776,7 +833,7 @@ fn execute_full_scan_id_seek(
 
 /// Load only the `offset..offset+limit` window of an ordered candidate id
 /// list — the bare-page fast path where no post-filter, sort, or cursor can
-/// change which ids form the page. Framing matches `paginate_materialized`
+/// change which ids form the page. Framing matches the streaming sinks
 /// exactly (`start = offset.min(len)`, `end = (start+limit).min(len)`,
 /// `has_more = len > end`). Ids whose doc vanished in the index-read→get gap
 /// shorten the page rather than shifting it — the same snapshot-gap semantic
@@ -1339,16 +1396,11 @@ fn or_arm_ids<'a>(
                 .ok_or_else(|| {
                     AppError::Internal(format!("Index partition not found: {index_name}"))
                 })?;
-            let mut ids = Vec::new();
-            for (key, _) in storage
-                .engine
-                .prefix_iterator(&partition, prefix)?
-                .flatten()
-            {
-                if let Some(id) = extract_doc_id_from_key(&key) {
-                    ids.push(id);
-                }
-            }
+            let ids = collect_ids(
+                &storage.engine,
+                &partition,
+                &[IndexScanShape::Prefix(prefix.clone())],
+            )?;
             Ok((index_name, ids))
         }
         ScanPlan::CompoundRange {
@@ -1373,16 +1425,11 @@ fn or_arm_ids<'a>(
                 .ok_or_else(|| {
                     AppError::Internal(format!("Index partition not found: {index_name}"))
                 })?;
-            let mut ids = Vec::new();
-            for kv in storage
-                .engine
-                .range_iterator(&partition, &start, &end, None)?
-            {
-                let (key, _) = kv?;
-                if let Some(id) = extract_doc_id_from_key(&key) {
-                    ids.push(id);
-                }
-            }
+            let ids = collect_ids(
+                &storage.engine,
+                &partition,
+                &[IndexScanShape::Range { start, end }],
+            )?;
             Ok((index_name, ids))
         }
         ScanPlan::FullScan
@@ -1455,52 +1502,7 @@ fn execute_or_union(
         });
     }
 
-    let docs_scanned = ids.len() as u64;
-
-    let docs_partition = storage.get_docs_partition(collection)?;
-    let mut loaded_docs = Vec::with_capacity(ids.len());
-    for id in &ids {
-        if let Ok(Some(bytes)) = storage.engine.get(&docs_partition, id.as_bytes())
-            && let Ok(doc) = serde_json::from_slice::<Value>(&bytes)
-        {
-            loaded_docs.push(doc);
-        }
-    }
-
-    let matching: Vec<Value> = if let Some(ref post_filter) = plan.post_filter {
-        loaded_docs
-            .into_iter()
-            .filter(|doc| post_filter.matches(doc))
-            .collect()
-    } else {
-        loaded_docs
-    };
-
-    let total_count = matching.len() as u64;
-
-    if query.count_only {
-        return Ok(QueryResult {
-            docs: vec![],
-            total_count: Some(total_count),
-            docs_scanned,
-            index_used,
-            scan_strategy: Some(plan.scan.name().to_string()),
-            has_more: false,
-            next_cursor: None,
-        });
-    }
-
-    let (docs, has_more, next_cursor) = paginate_materialized(matching, query, collection);
-
-    Ok(QueryResult {
-        docs,
-        total_count: Some(total_count),
-        docs_scanned,
-        index_used,
-        scan_strategy: Some(plan.scan.name().to_string()),
-        has_more,
-        next_cursor,
-    })
+    execute_id_stream(storage, collection, query, plan, &ids, index_used)
 }
 
 /// Execute a query using the bitmap scan accelerator.
@@ -1578,61 +1580,14 @@ fn execute_bitmap_scan(
     // Resolve every matching position to its id under ONE short guard —
     // the per-position lookup took the position read lock once per doc, and
     // holding any single guard across the get() IO loop is the b965de5
-    // deadlock pattern.
+    // deadlock pattern. The id list (not the docs) is the only thing
+    // materialized; hydration streams through the sinks.
     let ids = storage
         .scan_accelerator
         .positions
         .resolve_window(bitmap, 0, usize::MAX);
 
-    // Load documents by id
-    let docs_partition = storage.get_docs_partition(collection)?;
-    let mut loaded_docs = Vec::with_capacity(ids.len());
-    let mut docs_scanned = 0u64;
-
-    for doc_id in &ids {
-        if let Ok(Some(bytes)) = storage.engine.get(&docs_partition, doc_id.as_bytes())
-            && let Ok(doc) = serde_json::from_slice::<Value>(&bytes)
-        {
-            docs_scanned += 1;
-            loaded_docs.push(doc);
-        }
-    }
-
-    // Apply residual post-filter if any
-    let matching: Vec<Value> = if let Some(ref residual) = plan.post_filter {
-        loaded_docs
-            .into_iter()
-            .filter(|doc| residual.matches(doc))
-            .collect()
-    } else {
-        loaded_docs
-    };
-
-    let total_count = matching.len() as u64;
-
-    if query.count_only {
-        return Ok(QueryResult {
-            docs: vec![],
-            total_count: Some(total_count),
-            docs_scanned,
-            index_used: None,
-            scan_strategy: Some(plan.scan.name().to_string()),
-            has_more: false,
-            next_cursor: None,
-        });
-    }
-
-    let (docs, has_more, next_cursor) = paginate_materialized(matching, query, collection);
-
-    Ok(QueryResult {
-        docs,
-        total_count: Some(total_count),
-        docs_scanned,
-        index_used: None,
-        scan_strategy: Some(plan.scan.name().to_string()),
-        has_more,
-        next_cursor,
-    })
+    execute_id_stream(storage, collection, query, plan, &ids, None)
 }
 
 fn project_fields(doc: &Value, fields: &[String]) -> Value {

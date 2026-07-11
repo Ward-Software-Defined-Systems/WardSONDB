@@ -213,16 +213,6 @@ pub trait StorageBackend: Send + Sync {
         partition: &PartitionId,
         prefix: &[u8],
     ) -> BackendResult<BackendIterator>;
-    /// Iterate keys `k` with `start <= k < end` in ASCENDING byte order.
-    /// `max_results: Some(n)` reads and buffers at most n pairs (for
-    /// limit+1-style page probes); `None` is unbounded.
-    fn range_iterator(
-        &self,
-        partition: &PartitionId,
-        start: &[u8],
-        end: &[u8],
-        max_results: Option<usize>,
-    ) -> BackendResult<BackendIterator>;
     fn full_iterator(&self, partition: &PartitionId) -> BackendResult<BackendIterator>;
     /// Visit every pair with the given prefix in ascending key order, without
     /// materializing anything.
@@ -334,18 +324,6 @@ impl StorageBackend for Engine {
         match self {
             Engine::Fjall(b) => b.prefix_iterator(partition, prefix),
             Engine::RocksDb(b) => b.prefix_iterator(partition, prefix),
-        }
-    }
-    fn range_iterator(
-        &self,
-        partition: &PartitionId,
-        start: &[u8],
-        end: &[u8],
-        max_results: Option<usize>,
-    ) -> BackendResult<BackendIterator> {
-        match self {
-            Engine::Fjall(b) => b.range_iterator(partition, start, end, max_results),
-            Engine::RocksDb(b) => b.range_iterator(partition, start, end, max_results),
         }
     }
     fn full_iterator(&self, partition: &PartitionId) -> BackendResult<BackendIterator> {
@@ -524,14 +502,18 @@ mod tests {
             assert_eq!(got, want);
             assert_eq!(got.len(), 10);
 
+            // Half-open window a:03..a:07 (the pull range iterator is gone;
+            // the expectation is explicit).
             let got = collect_visited(|v| engine.scan_range(&p, b"a:03", b"a:07", v));
-            let want: Vec<KvPair> = engine
-                .range_iterator(&p, b"a:03", b"a:07", None)
-                .unwrap()
-                .collect::<BackendResult<_>>()
-                .unwrap();
+            let want: Vec<KvPair> = (3..7)
+                .map(|i| {
+                    (
+                        format!("a:0{i}").into_bytes(),
+                        format!("va{i}").into_bytes(),
+                    )
+                })
+                .collect();
             assert_eq!(got, want);
-            assert_eq!(got.len(), 4, "half-open window a:03..a:07");
 
             // Descending == the forward window reversed (the pull rev
             // iterator is gone; this property IS its contract).
