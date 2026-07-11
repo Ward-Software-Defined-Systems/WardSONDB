@@ -9486,3 +9486,110 @@ async fn test_fjall_full_scan_streamed_pages() {
     );
     assert_eq!(body["meta"]["total_count"], 30);
 }
+
+/// Mutation match phases stream (matches-only resident) while the write
+/// stays one atomic batch: after delete_by_query, the docs AND their index
+/// entries are gone together — an indexed count over the deleted value
+/// finds zero entries without scanning.
+#[tokio::test]
+async fn test_delete_by_query_survivors_and_index_atomicity() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "dbq_stream"}))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base_url}/dbq_stream/indexes"))
+        .json(&json!({"name": "idx_kind", "fields": ["kind"]}))
+        .send()
+        .await
+        .unwrap();
+    let docs: Vec<Value> = (0..30)
+        .map(|i| json!({"kind": if i < 20 { "a" } else { "b" }, "n": i}))
+        .collect();
+    client
+        .post(format!("{base_url}/dbq_stream/docs/_bulk"))
+        .json(&json!({"documents": docs}))
+        .send()
+        .await
+        .unwrap();
+
+    // Match-heavy delete: 20 of 30 docs match.
+    let resp: Value = client
+        .post(format!("{base_url}/dbq_stream/docs/_delete_by_query"))
+        .json(&json!({"filter": {"kind": "a"}}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["data"]["deleted"], 20);
+
+    // The index agrees instantly: zero entries for the deleted value,
+    // counted keys-only (docs_scanned 0) — doc and index removal committed
+    // as one batch.
+    let count: Value = client
+        .post(format!("{base_url}/dbq_stream/query"))
+        .json(&json!({"filter": {"kind": "a"}, "count_only": true}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(count["meta"]["total_count"], 0);
+    assert_eq!(count["meta"]["scan_strategy"], "index_eq");
+    assert_eq!(count["meta"]["docs_scanned"], 0);
+
+    // Survivors intact.
+    let survivors: Value = client
+        .post(format!("{base_url}/dbq_stream/query"))
+        .json(&json!({"filter": {"kind": "b"}, "count_only": true}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(survivors["meta"]["total_count"], 10);
+
+    // Match-light delete: nothing matches, nothing changes.
+    let resp: Value = client
+        .post(format!("{base_url}/dbq_stream/docs/_delete_by_query"))
+        .json(&json!({"filter": {"kind": "zzz"}}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["data"]["deleted"], 0);
+
+    // Delete the rest; the unfiltered O(1) count sees an empty collection.
+    let resp: Value = client
+        .post(format!("{base_url}/dbq_stream/docs/_delete_by_query"))
+        .json(&json!({"filter": {"kind": "b"}}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["data"]["deleted"], 10);
+    let count: Value = client
+        .post(format!("{base_url}/dbq_stream/query"))
+        .json(&json!({"count_only": true}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(count["meta"]["total_count"], 0);
+    assert_eq!(count["meta"]["scan_strategy"], "doc_counter");
+}

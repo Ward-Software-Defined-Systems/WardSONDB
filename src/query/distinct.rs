@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::ops::ControlFlow;
 
 use serde_json::Value;
 
@@ -30,32 +31,33 @@ pub fn execute_distinct(
         return Ok(result);
     }
 
-    // Fall back to full scan
-    let all_docs = storage.scan_all_documents(collection)?;
-    let docs_scanned = all_docs.len() as u64;
-
+    // Fall back to a streamed full scan; stops as soon as `limit` distinct
+    // values are in hand, so docs_scanned reports the documents actually
+    // visited (previously always the whole collection).
     let mut unique_keys: HashSet<String> = HashSet::new();
     let mut values: Vec<Value> = Vec::new();
     let mut truncated = false;
+    let mut docs_scanned = 0u64;
 
-    for doc in &all_docs {
+    storage.for_each_document(collection, &mut |doc| {
+        docs_scanned += 1;
         if let Some(f) = filter
-            && !f.matches(doc)
+            && !f.matches(&doc)
         {
-            continue;
+            return ControlFlow::Continue(());
         }
-
-        if let Some(val) = resolve_json_path(doc, field) {
+        if let Some(val) = resolve_json_path(&doc, field) {
             let key = serde_json::to_string(val).unwrap_or_default();
             if unique_keys.insert(key) {
                 values.push(val.clone());
                 if values.len() >= limit {
                     truncated = true;
-                    break;
+                    return ControlFlow::Break(());
                 }
             }
         }
-    }
+        ControlFlow::Continue(())
+    })?;
 
     let count = values.len();
     Ok(DistinctResult {
@@ -88,24 +90,27 @@ fn try_index_only_distinct(
     let mut values: Vec<Value> = Vec::new();
     let mut truncated = false;
 
-    for kv in storage.engine.full_iterator(&partition)? {
-        let (key_bytes, _) = kv?;
+    // Streamed: repeated values cost nothing (borrowed-key contains check —
+    // only first-seen values are copied), and the scan breaks at `limit`
+    // instead of buffering the whole index.
+    storage.engine.scan_full(&partition, &mut |key, _| {
         // Key format: {value_bytes}\x00{doc_id}
-        let key = key_bytes.as_slice();
         if let Some(sep_pos) = key.iter().rposition(|&b| b == 0x00) {
             let value_part = &key[..sep_pos];
-            if unique_keys.insert(value_part.to_vec()) {
+            if !unique_keys.contains(value_part) {
+                unique_keys.insert(value_part.to_vec());
                 // Decode the value from sortable bytes
                 if let Some(val) = crate::index::secondary::decode_sortable_bytes(value_part) {
                     values.push(val);
                     if values.len() >= limit {
                         truncated = true;
-                        break;
+                        return ControlFlow::Break(());
                     }
                 }
             }
         }
-    }
+        ControlFlow::Continue(())
+    })?;
 
     let count = values.len();
     Ok(Some(DistinctResult {

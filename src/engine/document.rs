@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::ops::ControlFlow;
 
 use chrono::Utc;
 use serde_json::Value;
@@ -324,30 +325,58 @@ impl Storage {
         Ok((inserted, errors))
     }
 
-    pub fn scan_all_documents(&self, collection: &str) -> Result<Vec<Value>, AppError> {
+    /// Stream every document in the collection through `visit`, parsing
+    /// during the scan (nothing else stays resident). A document that fails
+    /// to parse fails the whole scan — the mutation-path policy (S2-8 owns
+    /// any skip-vs-fail change).
+    pub(crate) fn for_each_document(
+        &self,
+        collection: &str,
+        visit: &mut dyn FnMut(Value) -> ControlFlow<()>,
+    ) -> Result<(), AppError> {
         self.ensure_collection_exists(collection)?;
-
         let docs_partition = self.get_docs_partition(collection)?;
-        let mut docs = Vec::new();
-        for kv in self.engine.full_iterator(&docs_partition)? {
-            let (_, value) = kv?;
-            let doc: Value = serde_json::from_slice(&value)?;
-            docs.push(doc);
+        let mut parse_err: Option<AppError> = None;
+        self.engine.scan_full(
+            &docs_partition,
+            &mut |_, v| match serde_json::from_slice::<Value>(v) {
+                Ok(doc) => visit(doc),
+                Err(e) => {
+                    parse_err = Some(e.into());
+                    ControlFlow::Break(())
+                }
+            },
+        )?;
+        if let Some(e) = parse_err {
+            return Err(e);
         }
+        Ok(())
+    }
+
+    pub fn scan_all_documents(&self, collection: &str) -> Result<Vec<Value>, AppError> {
+        let mut docs = Vec::new();
+        self.for_each_document(collection, &mut |doc| {
+            docs.push(doc);
+            ControlFlow::Continue(())
+        })?;
         Ok(docs)
     }
 
     /// Delete all documents matching a filter. Returns the count of deleted documents.
     pub fn delete_by_query(&self, collection: &str, filter: &FilterNode) -> Result<u64, AppError> {
         self.check_not_poisoned()?;
-        self.ensure_collection_exists(collection)?;
 
-        // Scan and filter to find matching docs
-        let all_docs = self.scan_all_documents(collection)?;
-        let matching: Vec<Value> = all_docs
-            .into_iter()
-            .filter(|doc| filter.matches(doc))
-            .collect();
+        // Stream the match phase: only matching docs stay resident (each is
+        // needed for index-entry removal and the accelerator hooks). The
+        // scan's read snapshot is released before the write below — the
+        // delete is still ONE atomic batch.
+        let mut matching: Vec<Value> = Vec::new();
+        self.for_each_document(collection, &mut |doc| {
+            if filter.matches(&doc) {
+                matching.push(doc);
+            }
+            ControlFlow::Continue(())
+        })?;
 
         let count = matching.len() as u64;
         if count == 0 {
@@ -386,16 +415,18 @@ impl Storage {
         update: &Value,
     ) -> Result<u64, AppError> {
         self.check_not_poisoned()?;
-        self.ensure_collection_exists(collection)?;
 
         let set_fields = parse_set_updates(update)?;
 
-        // Scan and filter to find matching docs
-        let all_docs = self.scan_all_documents(collection)?;
-        let matching: Vec<Value> = all_docs
-            .into_iter()
-            .filter(|doc| filter.matches(doc))
-            .collect();
+        // Stream the match phase (matches-only resident; single atomic
+        // batch below, after the scan's snapshot is released).
+        let mut matching: Vec<Value> = Vec::new();
+        self.for_each_document(collection, &mut |doc| {
+            if filter.matches(&doc) {
+                matching.push(doc);
+            }
+            ControlFlow::Continue(())
+        })?;
 
         let count = matching.len() as u64;
         if count == 0 {
