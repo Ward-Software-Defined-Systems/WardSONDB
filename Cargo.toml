@@ -23,8 +23,10 @@ base64 = "0.22"
 # Document handling
 uuid = { version = "1", features = ["v7"] }
 
-# TLS
+# TLS — rustls is a direct dep so main.rs can install the CryptoProvider
+# explicitly (provider auto-selection breaks under dev-dep feature unification)
 rcgen = "0.13"
+rustls = "0.23"
 
 # Crypto
 subtle = "2"
@@ -51,6 +53,11 @@ chrono = { version = "0.4", features = ["serde"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+# rustls-tls enables rustls/ring alongside axum-server's aws-lc-rs; that
+# dual-provider unification is harmless ONLY because main.rs installs the
+# server's CryptoProvider explicitly (reqwest passes its own). The
+# -no-provider variants are NOT a substitute: they require a process-level
+# default that test binaries never install ("No provider set" panics).
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio-test = "0.4"
 tempfile = "3"

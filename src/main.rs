@@ -248,6 +248,16 @@ async fn main() {
     }
 
     if config.tls {
+        // rustls only auto-selects its CryptoProvider when exactly one provider
+        // feature is enabled process-wide. Dev-dependency feature unification
+        // (cargo test / bench / --all-targets builds) can compile rustls with a
+        // second provider, which panics here at TLS init. Install ours
+        // explicitly so the binary never depends on which cargo invocation
+        // produced it.
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .expect("rustls CryptoProvider installed twice");
+
         let (cert_path, key_path) = resolve_tls_paths(&config);
         let scheme = "https";
         info!(addr = %addr, scheme = scheme, cert = %cert_path, "Starting WardSONDB with TLS");
