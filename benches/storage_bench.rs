@@ -2,7 +2,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
-use wardsondb::engine::storage::Storage;
+use wardsondb::engine::storage::{MemoryConfig, Storage};
 use wardsondb::query::executor::execute_query;
 use wardsondb::query::parser::{QueryRequest, parse_query};
 
@@ -29,8 +29,15 @@ fn create_siem_event(i: u64) -> Value {
 }
 
 fn setup_storage_with_docs(n: u64) -> (Storage, TempDir) {
+    setup_storage_with_docs_on("rocksdb", n)
+}
+
+/// Engine-parameterized twin of `setup_storage_with_docs` — the fjall
+/// benches (S2-18 parity slice) mirror their rocksdb guards exactly, so the
+/// numbers are directly comparable.
+fn setup_storage_with_docs_on(engine: &str, n: u64) -> (Storage, TempDir) {
     let tmp = TempDir::new().unwrap();
-    let storage = Storage::open(tmp.path()).unwrap();
+    let storage = Storage::open_with_config(tmp.path(), engine, MemoryConfig::default()).unwrap();
     storage.create_collection("events").unwrap();
 
     // Insert in batches of 500
@@ -521,6 +528,93 @@ fn bench_or_union(c: &mut Criterion) {
     group.finish();
 }
 
+// Fjall twins of the two guard benches (S2-18 parity slice: fjall previously
+// had ZERO bench coverage). Same shapes and sizes as the rocksdb versions so
+// the engines are directly comparable and both stay guarded through H-P2's
+// BackendIterator rewrite.
+fn bench_fjall_pages(c: &mut Criterion) {
+    let mut group = c.benchmark_group("fjall_index_sorted_desc_page");
+    group.sample_size(10);
+
+    let (storage, _tmp) = setup_storage_with_docs_on("fjall", 100_000);
+    storage
+        .create_index(
+            "events",
+            "idx_type_time",
+            &["event_type".into(), "received_at".into()],
+        )
+        .unwrap();
+
+    let make_sorted_query = || {
+        parse_query(
+            QueryRequest {
+                filter: Some(json!({"event_type": "firewall"})),
+                sort: Some(json!([{"received_at": "desc"}])),
+                limit: Some(20),
+                offset: Some(0),
+                fields: None,
+                count_only: None,
+                cursor: None,
+            },
+            100_000,
+            "events",
+        )
+        .unwrap()
+    };
+    let probe = execute_query(&storage, "events", &make_sorted_query()).unwrap();
+    assert_eq!(
+        probe.scan_strategy.as_deref(),
+        Some("index_sorted"),
+        "bench must exercise the IndexSorted path"
+    );
+    group.bench_function("desc_limit_20", |b| {
+        b.iter(|| {
+            let query = make_sorted_query();
+            execute_query(&storage, "events", &query).unwrap();
+        });
+    });
+    group.finish();
+    drop(storage);
+
+    let mut group = c.benchmark_group("fjall_index_eq_page");
+    group.sample_size(10);
+
+    let (storage, _tmp) = setup_storage_with_docs_on("fjall", 250_000);
+    storage
+        .create_index("events", "idx_event_type", &["event_type".into()])
+        .unwrap();
+
+    let make_eq_query = || {
+        parse_query(
+            QueryRequest {
+                filter: Some(json!({"event_type": "firewall"})),
+                sort: None,
+                limit: Some(10),
+                offset: Some(0),
+                fields: None,
+                count_only: None,
+                cursor: None,
+            },
+            100_000,
+            "events",
+        )
+        .unwrap()
+    };
+    let probe = execute_query(&storage, "events", &make_eq_query()).unwrap();
+    assert_eq!(
+        probe.index_used.as_deref(),
+        Some("idx_event_type"),
+        "bench must run through the single-field index"
+    );
+    group.bench_function("limit_10_of_50k", |b| {
+        b.iter(|| {
+            let query = make_eq_query();
+            execute_query(&storage, "events", &query).unwrap();
+        });
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_single_insert,
@@ -533,5 +627,6 @@ criterion_group!(
     bench_regex_scan,
     bench_index_eq_page,
     bench_or_union,
+    bench_fjall_pages,
 );
 criterion_main!(benches);
