@@ -128,6 +128,16 @@ Behavior changes an existing client could observe, most significant first.
 - Storage write-batch staging failures (missing column family, engine
   mismatch) return a 500 `BackendError` instead of panicking the process.
 
+### Security
+
+- **Dependency updates resolving all 16 open security advisories** (9 high /
+  3 moderate / 4 low): `openssl` 0.10.75 → 0.10.81 (8 advisories; dev-only
+  dependency), `rustls-webpki` 0.103.9 → 0.103.13 (4; `--tls` mode),
+  `aws-lc-sys` 0.38.0 → 0.42.0 (2; `--tls` mode), `lz4_flex` 0.11.5 → 0.11.6
+  (1; fjall block decompression), `rand` 0.8.5 → 0.8.7 (1; dev-only). No
+  WardSONDB API or behavior changes; the storage-engine crates (fjall,
+  RocksDB) are unchanged.
+
 ### Performance
 
 - `$regex` filters compile once at parse time: the regex-scan benchmark
