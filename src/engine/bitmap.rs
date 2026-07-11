@@ -449,6 +449,14 @@ impl ScanAccelerator {
             None => return,
         };
 
+        // Positions BEFORE columns — the one lock order every path uses
+        // (insert/update/persist all touch positions first), so no
+        // columns→positions hold can form an ABBA cycle against the
+        // persist snapshot. A reader between the two steps sees column bits
+        // for a position with no id, which `resolve_window` skips — the
+        // benign direction.
+        self.positions.remove(doc_id);
+
         let columns = self.columns.read();
         for (field_path, column) in columns.iter() {
             if let Some(value) = resolve_json_path(doc, field_path) {
@@ -472,7 +480,6 @@ impl ScanAccelerator {
                 column.exists_bitmap.write().remove(pos);
             }
         }
-        self.positions.remove(doc_id);
     }
 
     /// Called after a document update transaction commits.
@@ -861,15 +868,23 @@ impl ScanAccelerator {
         // Peak transient allocation at 2M docs × ~11 fields: ~300-400 MB
         // (dominated by the positions Vec + HashMap clones). Budget for this
         // if pushing past 10M docs on small hosts.
-        let (pos_vec_snapshot, next_pos) = {
-            let guard = self.positions.pos_to_id.read();
+        // Both position guards held TOGETHER (S2-3): the id↔position pair is
+        // cloned at one instant and can never disagree with itself on disk.
+        // Acquisition order matches `assign`/`remove`/`clear`/`memory_bytes`
+        // (id_to_pos first, then pos_to_id) — one global order, no ABBA.
+        // Column bits are cloned after the pair drops: a position added in
+        // the gap lacks bits in the snapshot (benign — resolve skips it);
+        // the reverse direction can't happen because every hook takes
+        // positions before columns.
+        let (id_map_snapshot, pos_vec_snapshot, next_pos) = {
+            let id_guard = self.positions.id_to_pos.read();
+            let pos_guard = self.positions.pos_to_id.read();
             (
-                guard.clone(),
+                id_guard.clone(),
+                pos_guard.clone(),
                 self.positions.next_pos.load(Ordering::Relaxed),
             )
         };
-
-        let id_map_snapshot: HashMap<Arc<str>, u32> = self.positions.id_to_pos.read().clone();
 
         let columns_snapshot: Vec<ColumnSnapshot> = {
             let cols = self.columns.read();
