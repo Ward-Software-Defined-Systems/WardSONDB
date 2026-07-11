@@ -1,8 +1,9 @@
 use serde_json::Value;
 
-use crate::engine::backend::{PartitionId, StorageBackend};
+use crate::engine::backend::{Engine, PartitionId, StorageBackend};
 use crate::engine::storage::Storage;
 use crate::error::AppError;
+use crate::index::IndexScanShape;
 use crate::index::secondary::{
     RangeScanBounds, extract_doc_id_from_key, make_compound_index_key, prefix_successor,
     range_scan_bounds, value_to_sortable_bytes,
@@ -260,6 +261,224 @@ impl<'q> TopK<'q> {
     }
 }
 
+/// Shared tail for decorated top-K paths: page window, exact `has_more`,
+/// cursor emission from the last page row, projection. `pre_cursor` counts
+/// matches at-or-before the cursor position (kept out of the heap but part
+/// of the exact total, mirroring the materializing sort's framing).
+fn finish_topk(
+    topk: TopK<'_>,
+    pre_cursor: u64,
+    query: &ParsedQuery,
+    collection: &str,
+) -> (Vec<Value>, Option<u64>, bool, Option<String>) {
+    let offset = query.offset as usize;
+    let limit = query.limit as usize;
+    let (rows, kept) = topk.finish();
+    let total_count = Some(pre_cursor + kept);
+    let start = offset.min(rows.len());
+    let end = start.saturating_add(limit).min(rows.len());
+    // Exact: the top-K saw every match (cursor pages have offset == 0, so
+    // the window start is never beyond the kept rows).
+    let has_more = kept > offset.saturating_add(limit) as u64;
+    // Every caller has a sort or a cursor (the old emission gate), so the
+    // gate reduces to a non-empty page with more rows behind it.
+    let next_cursor = if has_more && end > start {
+        encode_cursor(&rows[end - 1].1, &query.sort, collection)
+    } else {
+        None
+    };
+    let page: Vec<Value> = rows
+        .into_iter()
+        .skip(start)
+        .take(end - start)
+        .map(|(_, doc)| doc)
+        .collect();
+    (
+        apply_projection(page, &query.fields),
+        total_count,
+        has_more,
+        next_cursor,
+    )
+}
+
+/// Hydrate one index entry's doc from its borrowed key: id suffix → get →
+/// parse. Missing docs (snapshot gap) and corrupt docs skip-and-continue —
+/// the id-loop policy every index path has always had (S2-8 owns changing
+/// it). Increments `docs_scanned` only for docs actually loaded+parsed.
+fn hydrate_index_entry(
+    storage: &Storage,
+    docs_partition: &PartitionId,
+    key: &[u8],
+    docs_scanned: &mut u64,
+) -> Option<Value> {
+    let doc_id = extract_doc_id_from_key(key)?;
+    let bytes = storage
+        .engine
+        .get(docs_partition, doc_id.as_bytes())
+        .ok()??;
+    let doc = serde_json::from_slice::<Value>(&bytes).ok()?;
+    *docs_scanned += 1;
+    Some(doc)
+}
+
+/// Collect every candidate id for the given scan shapes, in candidate order.
+fn collect_ids(
+    engine: &Engine,
+    partition: &PartitionId,
+    shapes: &[IndexScanShape],
+) -> Result<Vec<String>, AppError> {
+    let mut ids = Vec::new();
+    for shape in shapes {
+        shape.scan(engine, partition, &mut |k, _| {
+            if let Some(id) = extract_doc_id_from_key(k) {
+                ids.push(id);
+            }
+            ControlFlow::Continue(())
+        })?;
+    }
+    Ok(ids)
+}
+
+/// Stream index entries shape-by-shape in candidate order, hydrating each
+/// entry's doc and paging matches without ever materializing the candidate
+/// set: residual counts evaluate everything and keep nothing; sorted (or
+/// cursor-resumed) pages ride the decorated top-K; unsorted residual pages
+/// early-exit at the limit+1 probe. Bare pages don't come here — they take
+/// the windowed id path.
+#[allow(clippy::too_many_arguments)]
+fn execute_index_stream(
+    storage: &Storage,
+    collection: &str,
+    query: &ParsedQuery,
+    plan: &QueryPlan,
+    index_name: &str,
+    partition: &PartitionId,
+    shapes: &[IndexScanShape],
+    label_docs: bool,
+) -> Result<QueryResult, AppError> {
+    let docs_partition = storage.get_docs_partition(collection)?;
+    let mut docs_scanned = 0u64;
+    let doc_strategy = label_docs.then(|| plan.scan.name().to_string());
+
+    if query.count_only {
+        // Materialized count (residual present): evaluate every candidate,
+        // keep nothing resident.
+        let mut matches = 0u64;
+        for shape in shapes {
+            shape.scan(&storage.engine, partition, &mut |k, _| {
+                let Some(doc) = hydrate_index_entry(storage, &docs_partition, k, &mut docs_scanned)
+                else {
+                    return ControlFlow::Continue(());
+                };
+                if plan.post_filter.as_ref().is_none_or(|f| f.matches(&doc)) {
+                    matches += 1;
+                }
+                ControlFlow::Continue(())
+            })?;
+        }
+        return Ok(QueryResult {
+            docs: vec![],
+            total_count: Some(matches),
+            docs_scanned,
+            index_used: Some(index_name.to_string()),
+            scan_strategy: Some(plan.scan.name().to_string()),
+            has_more: false,
+            next_cursor: None,
+        });
+    }
+
+    if query.cursor.is_some() || !query.sort.is_empty() {
+        // Decorated top-K; a cursor with an empty sort orders by _id,
+        // exactly like the materializing sort did.
+        let mut topk = TopK::new(query.offset as usize, query.limit as usize, &query.sort);
+        let mut pre_cursor = 0u64;
+        for shape in shapes {
+            shape.scan(&storage.engine, partition, &mut |k, _| {
+                let Some(doc) = hydrate_index_entry(storage, &docs_partition, k, &mut docs_scanned)
+                else {
+                    return ControlFlow::Continue(());
+                };
+                if let Some(ref pf) = plan.post_filter
+                    && !pf.matches(&doc)
+                {
+                    return ControlFlow::Continue(());
+                }
+                if let Some(cursor) = &query.cursor
+                    && compare_doc_to_cursor(&doc, cursor, &query.sort)
+                        != std::cmp::Ordering::Greater
+                {
+                    pre_cursor += 1;
+                    return ControlFlow::Continue(());
+                }
+                topk.push(doc);
+                ControlFlow::Continue(())
+            })?;
+        }
+        let (docs, total_count, has_more, next_cursor) =
+            finish_topk(topk, pre_cursor, query, collection);
+        return Ok(QueryResult {
+            docs,
+            total_count,
+            docs_scanned,
+            index_used: Some(index_name.to_string()),
+            scan_strategy: doc_strategy,
+            has_more,
+            next_cursor,
+        });
+    }
+
+    // Unsorted residual page: early exit at the probe row, shape by shape.
+    let mut sink = UnsortedPage::new(query.offset as usize, query.limit as usize);
+    for shape in shapes {
+        shape.scan(&storage.engine, partition, &mut |k, _| {
+            let Some(doc) = hydrate_index_entry(storage, &docs_partition, k, &mut docs_scanned)
+            else {
+                return ControlFlow::Continue(());
+            };
+            if let Some(ref pf) = plan.post_filter
+                && !pf.matches(&doc)
+            {
+                return ControlFlow::Continue(());
+            }
+            sink.push(doc)
+        })?;
+        if sink.broke_early {
+            break;
+        }
+    }
+    let (page, has_more, total_count) = sink.finish(query.limit as usize);
+    Ok(QueryResult {
+        docs: apply_projection(page, &query.fields),
+        total_count,
+        docs_scanned,
+        index_used: Some(index_name.to_string()),
+        scan_strategy: doc_strategy,
+        has_more,
+        // Index no-sort pages never emitted cursors (their order isn't _id).
+        next_cursor: None,
+    })
+}
+
+/// The no-usable-index result (the planner resolved one moments ago, so at
+/// worst this is a race with a concurrent index drop): zero candidates,
+/// mirroring the old empty-id-list output on every sub-path.
+fn empty_index_result(
+    index_name: &str,
+    query: &ParsedQuery,
+    plan: &QueryPlan,
+    label_docs: bool,
+) -> Result<QueryResult, AppError> {
+    Ok(QueryResult {
+        docs: vec![],
+        total_count: Some(0),
+        docs_scanned: 0,
+        index_used: Some(index_name.to_string()),
+        scan_strategy: (query.count_only || label_docs).then(|| plan.scan.name().to_string()),
+        has_more: false,
+        next_cursor: None,
+    })
+}
+
 fn execute_full_scan(
     storage: &Storage,
     collection: &str,
@@ -413,30 +632,8 @@ fn execute_full_scan(
         return Err(e);
     }
 
-    let offset = query.offset as usize;
-    let limit = query.limit as usize;
-    let (rows, kept_matches) = topk.finish();
-    let total_count = Some(pre_cursor + kept_matches);
-    let start = offset.min(rows.len());
-    let end = start.saturating_add(limit).min(rows.len());
-    // Exact: TopK saw every match (cursor pages have offset == 0, so the
-    // window start is never beyond the kept rows).
-    let has_more = kept_matches > offset.saturating_add(limit) as u64;
-    // This branch always has a sort spec (empty-sort cursors take the id
-    // seek; empty-sort pages take the unsorted branch), so the old
-    // "sorted-or-cursor" cursor-emission gate is simply has_more here.
-    let next_cursor = if has_more && end > start {
-        encode_cursor(&rows[end - 1].1, &query.sort, collection)
-    } else {
-        None
-    };
-    let page: Vec<Value> = rows
-        .into_iter()
-        .skip(start)
-        .take(end - start)
-        .map(|(_, doc)| doc)
-        .collect();
-    let docs = apply_projection(page, &query.fields);
+    let (docs, total_count, has_more, next_cursor) =
+        finish_topk(topk, pre_cursor, query, collection);
     Ok(QueryResult {
         docs,
         total_count,
@@ -564,7 +761,7 @@ fn execute_index_scan(
     query: &ParsedQuery,
     plan: &QueryPlan,
 ) -> Result<QueryResult, AppError> {
-    let (index_name, candidate_ids) = match &plan.scan {
+    let (index_name, partition, shapes) = match &plan.scan {
         ScanPlan::IndexEq {
             index_name,
             field,
@@ -589,11 +786,14 @@ fn execute_index_scan(
                 });
             }
 
-            let ids = storage
-                .index_manager
-                .lookup_eq(&storage.engine, collection, field, value)
-                .unwrap_or_default();
-            (index_name.clone(), ids)
+            match storage.index_manager.eq_scan(collection, field, value) {
+                Some((partition, prefix)) => (
+                    index_name.clone(),
+                    partition,
+                    vec![IndexScanShape::Prefix(prefix)],
+                ),
+                None => return empty_index_result(index_name, query, plan, false),
+            }
         }
         ScanPlan::IndexIn {
             index_name,
@@ -637,11 +837,14 @@ fn execute_index_scan(
                 }
             }
 
-            let ids = storage
-                .index_manager
-                .lookup_in(&storage.engine, collection, field, values)
-                .unwrap_or_default();
-            (index_name.clone(), ids)
+            match storage.index_manager.in_scan(collection, field, values) {
+                Some((partition, prefixes)) => (
+                    index_name.clone(),
+                    partition,
+                    prefixes.into_iter().map(IndexScanShape::Prefix).collect(),
+                ),
+                None => return empty_index_result(index_name, query, plan, false),
+            }
         }
         ScanPlan::IndexRange {
             index_name,
@@ -674,11 +877,21 @@ fn execute_index_scan(
 
             let lower_ref = lower.as_ref().map(|(v, i)| (v, *i));
             let upper_ref = upper.as_ref().map(|(v, i)| (v, *i));
-            let ids = storage
+            match storage
                 .index_manager
-                .lookup_range(&storage.engine, collection, field, lower_ref, upper_ref)
-                .unwrap_or_default();
-            (index_name.clone(), ids)
+                .range_scan(collection, field, lower_ref, upper_ref)
+            {
+                Some((partition, RangeScanBounds::Span { start, end })) => (
+                    index_name.clone(),
+                    partition,
+                    vec![IndexScanShape::Range { start, end }],
+                ),
+                // Type-bracketed empty bounds or no index: zero matches on
+                // every sub-path, same as the old empty id list.
+                Some((_, RangeScanBounds::Empty)) | None => {
+                    return empty_index_result(index_name, query, plan, false);
+                }
+            }
         }
         ScanPlan::CompoundEq { index_name, prefix } => {
             // Compound equality: prefix scan on compound index
@@ -709,17 +922,11 @@ fn execute_index_scan(
                 .ok_or_else(|| {
                     AppError::Internal(format!("Index partition not found: {index_name}"))
                 })?;
-            let mut ids = Vec::new();
-            for (key, _) in storage
-                .engine
-                .prefix_iterator(&partition, prefix)?
-                .flatten()
-            {
-                if let Some(id) = extract_doc_id_from_key(&key) {
-                    ids.push(id);
-                }
-            }
-            (index_name.clone(), ids)
+            (
+                index_name.clone(),
+                partition,
+                vec![IndexScanShape::Prefix(prefix.clone())],
+            )
         }
         ScanPlan::FullScan
         | ScanPlan::IndexSorted { .. }
@@ -729,9 +936,10 @@ fn execute_index_scan(
     };
 
     // Bare page: the page is exactly candidate_ids[offset..offset+limit] in
-    // index order — load only that window instead of every candidate (an eq
-    // filter matching 50k docs with limit 10 was doing 50k gets + parses).
+    // index order — collect the ids and load only that window instead of
+    // every candidate.
     if bare_page(query, &plan.post_filter) {
+        let candidate_ids = collect_ids(&storage.engine, &partition, &shapes)?;
         let total = candidate_ids.len() as u64;
         let (docs, docs_scanned, has_more) =
             load_id_window(storage, collection, query, &candidate_ids)?;
@@ -746,50 +954,16 @@ fn execute_index_scan(
         });
     }
 
-    // Batched hydration; docs_scanned counts docs actually loaded+parsed —
-    // ids whose doc vanished in the scan→get gap contribute nothing to the
-    // page and no longer inflate the count.
-    let docs_partition = storage.get_docs_partition(collection)?;
-    let loaded_docs = load_docs_by_ids(storage, &docs_partition, &candidate_ids)?;
-    let docs_scanned = loaded_docs.len() as u64;
-
-    // Apply post-filter (residual conditions not covered by the index)
-    let matching: Vec<Value> = if let Some(ref post_filter) = plan.post_filter {
-        loaded_docs
-            .into_iter()
-            .filter(|doc| post_filter.matches(doc))
-            .collect()
-    } else {
-        loaded_docs
-    };
-
-    let total_count = matching.len() as u64;
-
-    if query.count_only {
-        // The materialized count (post-filter present, or a fast path that
-        // didn't apply) — label it with the strategy that produced it.
-        return Ok(QueryResult {
-            docs: vec![],
-            total_count: Some(total_count),
-            docs_scanned,
-            index_used: Some(index_name),
-            scan_strategy: Some(plan.scan.name().to_string()),
-            has_more: false,
-            next_cursor: None,
-        });
-    }
-
-    let (docs, has_more, next_cursor) = paginate_materialized(matching, query, collection);
-
-    Ok(QueryResult {
-        docs,
-        total_count: Some(total_count),
-        docs_scanned,
-        index_used: Some(index_name),
-        scan_strategy: None,
-        has_more,
-        next_cursor,
-    })
+    execute_index_stream(
+        storage,
+        collection,
+        query,
+        plan,
+        &index_name,
+        &partition,
+        &shapes,
+        false,
+    )
 }
 
 /// Rebuild the exact index key for a cursor position under this plan's
@@ -872,64 +1046,57 @@ fn execute_index_sorted(
         None => (prefix.to_vec(), prefix_end),
     };
 
-    // Bound the backend read to the page probe when nothing gets post-
-    // filtered away. An index entry whose doc vanished between iterator
-    // creation and the `get` consumes a slot and could understate has_more,
-    // but doc + index entries are deleted in one atomic batch, so the window
-    // is only the snapshot gap. offset is unclamped user input — saturate
-    // (usize::MAX degrades to an unbounded read, which is the correct
-    // semantic for an offset past the end).
-    let max_results = plan
-        .post_filter
-        .is_none()
-        .then_some(offset.saturating_add(limit).saturating_add(1));
-
-    let iter = if reverse {
-        storage
-            .engine
-            .range_iterator_rev(&partition, &lo, &hi, max_results)?
-    } else {
-        storage
-            .engine
-            .range_iterator(&partition, &lo, &hi, max_results)?
-    };
-
     // Collect UNPROJECTED docs up to limit+1: the extra probe row makes
-    // has_more exact, and the cursor must see sort-field values that a
-    // projection might strip.
+    // has_more exact (the scan breaks on it — the streaming equivalent of
+    // the old bounded page-probe read), and the cursor must see sort-field
+    // values that a projection might strip. An index entry whose doc
+    // vanished between the scan and the `get` consumes a slot and could
+    // understate has_more, but doc + index entries are deleted in one atomic
+    // batch, so the window is only the snapshot gap.
     let mut results: Vec<Value> = Vec::new();
     let mut skipped = 0usize;
     let mut docs_scanned = 0u64;
+    // With no post-filter every entry is a match, so offset rows are skipped
+    // at the KEY level — previously they were hydrated and then discarded.
+    // With a post-filter, skipping must count post-filter MATCHES, so the
+    // match-level skip below applies instead.
+    let mut entry_skip = if plan.post_filter.is_none() {
+        offset
+    } else {
+        0
+    };
 
-    for kv in iter {
-        let (key, _) = kv?;
-        let Some(doc_id) = extract_doc_id_from_key(&key) else {
-            continue;
-        };
-        let doc = match storage.engine.get(&docs_partition, doc_id.as_bytes()) {
-            Ok(Some(bytes)) => match serde_json::from_slice::<Value>(&bytes) {
-                Ok(doc) => doc,
-                Err(_) => continue,
-            },
-            _ => continue,
-        };
-        docs_scanned += 1;
-
-        if let Some(ref pf) = plan.post_filter
-            && !pf.matches(&doc)
-        {
-            continue;
+    let mut visit = |k: &[u8], _v: &[u8]| -> ControlFlow<()> {
+        if entry_skip > 0 {
+            entry_skip -= 1;
+            return ControlFlow::Continue(());
         }
-
-        if skipped < offset {
-            skipped += 1;
-            continue;
+        let Some(doc) = hydrate_index_entry(storage, &docs_partition, k, &mut docs_scanned) else {
+            return ControlFlow::Continue(());
+        };
+        if let Some(ref pf) = plan.post_filter {
+            if !pf.matches(&doc) {
+                return ControlFlow::Continue(());
+            }
+            if skipped < offset {
+                skipped += 1;
+                return ControlFlow::Continue(());
+            }
         }
-
         results.push(doc);
         if results.len() > limit {
-            break;
+            return ControlFlow::Break(());
         }
+        ControlFlow::Continue(())
+    };
+    if reverse {
+        storage
+            .engine
+            .scan_range_rev(&partition, &lo, &hi, &mut visit)?;
+    } else {
+        storage
+            .engine
+            .scan_range(&partition, &lo, &hi, &mut visit)?;
     }
 
     let has_more = results.len() > limit;
@@ -1030,22 +1197,16 @@ fn execute_compound_range(
         });
     }
 
-    // Collect candidate doc IDs from the range scan
-    let mut candidate_ids = Vec::new();
-    for kv in
-        storage
-            .engine
-            .range_iterator(&partition, start_key.as_slice(), end_key.as_slice(), None)?
-    {
-        let (key, _) = kv?;
-        if let Some(id) = extract_doc_id_from_key(&key) {
-            candidate_ids.push(id);
-        }
-    }
+    let shapes = vec![IndexScanShape::Range {
+        start: start_key,
+        end: end_key,
+    }];
 
     // Bare page: window the range-ordered candidates (same rationale and
-    // semantics as the index-scan fast path above).
+    // semantics as the index-scan fast path above; compound_range labels its
+    // doc pages, unlike the single-field paths).
     if bare_page(query, &plan.post_filter) {
+        let candidate_ids = collect_ids(&storage.engine, &partition, &shapes)?;
         let total = candidate_ids.len() as u64;
         let (docs, docs_scanned, has_more) =
             load_id_window(storage, collection, query, &candidate_ids)?;
@@ -1060,47 +1221,9 @@ fn execute_compound_range(
         });
     }
 
-    // Batched hydration; docs_scanned = docs actually loaded+parsed (same
-    // definition as the index-scan path above).
-    let docs_partition = storage.get_docs_partition(collection)?;
-    let loaded_docs = load_docs_by_ids(storage, &docs_partition, &candidate_ids)?;
-    let docs_scanned = loaded_docs.len() as u64;
-
-    // Apply post-filter
-    let matching: Vec<Value> = if let Some(ref post_filter) = plan.post_filter {
-        loaded_docs
-            .into_iter()
-            .filter(|doc| post_filter.matches(doc))
-            .collect()
-    } else {
-        loaded_docs
-    };
-
-    let total_count = matching.len() as u64;
-
-    if query.count_only {
-        return Ok(QueryResult {
-            docs: vec![],
-            total_count: Some(total_count),
-            docs_scanned,
-            index_used: Some(index_name.to_string()),
-            scan_strategy: Some(plan.scan.name().to_string()),
-            has_more: false,
-            next_cursor: None,
-        });
-    }
-
-    let (docs, has_more, next_cursor) = paginate_materialized(matching, query, collection);
-
-    Ok(QueryResult {
-        docs,
-        total_count: Some(total_count),
-        docs_scanned,
-        index_used: Some(index_name.to_string()),
-        scan_strategy: Some(plan.scan.name().to_string()),
-        has_more,
-        next_cursor,
-    })
+    execute_index_stream(
+        storage, collection, query, plan, index_name, &partition, &shapes, true,
+    )
 }
 
 /// Candidate doc ids for one `$or` arm, plus the arm's index name. Arms are
@@ -1118,7 +1241,7 @@ fn or_arm_ids<'a>(
         } => {
             let ids = storage
                 .index_manager
-                .lookup_eq(&storage.engine, collection, field, value)
+                .lookup_eq(&storage.engine, collection, field, value)?
                 .unwrap_or_default();
             Ok((index_name, ids))
         }
@@ -1129,7 +1252,7 @@ fn or_arm_ids<'a>(
         } => {
             let ids = storage
                 .index_manager
-                .lookup_in(&storage.engine, collection, field, values)
+                .lookup_in(&storage.engine, collection, field, values)?
                 .unwrap_or_default();
             Ok((index_name, ids))
         }
@@ -1143,7 +1266,7 @@ fn or_arm_ids<'a>(
             let upper_ref = upper.as_ref().map(|(v, i)| (v, *i));
             let ids = storage
                 .index_manager
-                .lookup_range(&storage.engine, collection, field, lower_ref, upper_ref)
+                .lookup_range(&storage.engine, collection, field, lower_ref, upper_ref)?
                 .unwrap_or_default();
             Ok((index_name, ids))
         }

@@ -7414,14 +7414,31 @@ async fn test_index_eq_window_page_equivalence() {
             fast["data"], slow["data"],
             "page mismatch at offset {offset} limit {limit}"
         );
-        assert_eq!(fast["meta"]["total_count"], slow["meta"]["total_count"]);
         assert_eq!(fast["meta"]["total_count"], 10);
         assert_eq!(fast["meta"]["index_used"], "idx_event_type");
         // Proof the fast path engaged: it loads only the window…
         let page_len = fast["data"].as_array().unwrap().len() as u64;
         assert_eq!(fast["meta"]["docs_scanned"].as_u64().unwrap(), page_len);
-        // …while the residual-forced path loads every candidate.
-        assert_eq!(slow["meta"]["docs_scanned"], 10);
+        // …while the residual-forced path STREAMS: it hydrates candidates
+        // only until the page + probe row filled (offset matches skipped +
+        // limit+1 kept), and reports an exact total only when the stream ran
+        // to exhaustion — omitted exactly when has_more is true.
+        let streamed = (offset + limit + 1).min(10);
+        assert_eq!(
+            slow["meta"]["docs_scanned"].as_u64().unwrap(),
+            streamed,
+            "residual side hydrates to the probe row at offset {offset} limit {limit}"
+        );
+        if offset + limit < 10 {
+            assert!(
+                slow["meta"]["total_count"].is_null(),
+                "early-exited residual page must omit total_count"
+            );
+            assert_eq!(slow["meta"]["has_more"], true);
+        } else {
+            assert_eq!(slow["meta"]["total_count"], 10);
+            assert_ne!(slow["meta"]["has_more"], true);
+        }
     }
 }
 
@@ -9112,7 +9129,17 @@ async fn test_fjall_window_tiling() {
             page_len,
             "window must load only the page"
         );
-        assert_eq!(slow["meta"]["docs_scanned"], 10);
+        // Residual side streams: hydrates to the probe row, total exact
+        // only on exhaustion (same pins as the rocksdb twin).
+        assert_eq!(
+            slow["meta"]["docs_scanned"].as_u64().unwrap(),
+            (offset + limit + 1).min(10)
+        );
+        if offset + limit < 10 {
+            assert!(slow["meta"]["total_count"].is_null());
+        } else {
+            assert_eq!(slow["meta"]["total_count"], 10);
+        }
     }
 
     // Growing-offset tiling == one-shot, for the index window and the

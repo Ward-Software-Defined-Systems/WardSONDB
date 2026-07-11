@@ -256,46 +256,6 @@ impl StorageBackend for RocksDbBackend {
         )))
     }
 
-    fn range_iterator_rev(
-        &self,
-        partition: &PartitionId,
-        start: &[u8],
-        end: &[u8],
-        max_results: Option<usize>,
-    ) -> BackendResult<BackendIterator> {
-        let (db, cf_name) = unwrap_rocks(partition)?;
-        let cf = db
-            .cf_handle(cf_name)
-            .ok_or_else(|| BackendError::Internal(format!("CF not found: {cf_name}")))?;
-        // From(end, Reverse) positions at the largest key <= end; `end` is
-        // exclusive, so a key equal to it is skipped by the bound check.
-        let raw = db.iterator_cf(&cf, IteratorMode::From(end, Direction::Reverse));
-        let start_owned = start.to_vec();
-        let end_owned = end.to_vec();
-        let cap = max_results.unwrap_or(usize::MAX);
-        let mut materialized: Vec<BackendResult<KvPair>> = Vec::new();
-        for item in raw {
-            match item {
-                Ok((k, v)) => {
-                    if k.as_ref() >= end_owned.as_slice() {
-                        continue; // only the seek key itself can land here
-                    }
-                    if k.as_ref() < start_owned.as_slice() || materialized.len() >= cap {
-                        break;
-                    }
-                    materialized.push(Ok((k.to_vec(), v.to_vec())));
-                }
-                Err(e) => {
-                    materialized.push(Err(rocks_err(e)));
-                    break;
-                }
-            }
-        }
-        Ok(BackendIterator::from_rocksdb(Box::new(
-            materialized.into_iter(),
-        )))
-    }
-
     fn full_iterator(&self, partition: &PartitionId) -> BackendResult<BackendIterator> {
         let (db, cf_name) = unwrap_rocks(partition)?;
         let cf = db

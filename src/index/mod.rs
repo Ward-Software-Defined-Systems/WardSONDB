@@ -2,6 +2,7 @@ pub mod primary;
 pub mod secondary;
 
 use std::collections::HashMap;
+use std::ops::ControlFlow;
 
 use parking_lot::RwLock;
 
@@ -10,6 +11,31 @@ use serde_json::Value;
 use crate::engine::backend::{Engine, PartitionId, StorageBackend, WriteBatchWrapper};
 use crate::error::AppError;
 use crate::query::filter::resolve_json_path;
+
+/// One backend scan over an index partition, yielding entries in candidate
+/// order. The executor drives these for streaming index reads; the
+/// `lookup_*` id collectors below ride the same shapes.
+pub enum IndexScanShape {
+    Prefix(Vec<u8>),
+    Range { start: Vec<u8>, end: Vec<u8> },
+}
+
+impl IndexScanShape {
+    pub fn scan(
+        &self,
+        engine: &Engine,
+        partition: &PartitionId,
+        visit: &mut crate::engine::backend::ScanVisitor<'_>,
+    ) -> Result<(), AppError> {
+        match self {
+            IndexScanShape::Prefix(p) => engine.scan_prefix(partition, p, visit)?,
+            IndexScanShape::Range { start, end } => {
+                engine.scan_range(partition, start, end, visit)?
+            }
+        }
+        Ok(())
+    }
+}
 
 use self::secondary::{
     IndexDef, RangeScanBounds, extract_doc_id_from_key, make_compound_index_key, make_index_key,
@@ -290,35 +316,90 @@ impl IndexManager {
         Ok(())
     }
 
-    /// Equality lookup: get all doc IDs where field == value.
+    /// Resolve the (partition, encoded prefix) for an equality scan on
+    /// `field`'s index. None = no usable index.
+    pub fn eq_scan(
+        &self,
+        collection: &str,
+        field: &str,
+        value: &Value,
+    ) -> Option<(PartitionId, Vec<u8>)> {
+        let (def, partition) = self.get_index_for_field(collection, field)?;
+        let separator = if def.is_compound() { 0x01 } else { 0x00 };
+        let mut prefix = value_to_sortable_bytes(value);
+        prefix.push(separator);
+        Some((partition, prefix))
+    }
+
+    /// Resolve the (partition, bounds) for a range scan on `field`'s index.
+    /// `RangeScanBounds::Empty` means the predicate can never match
+    /// (type-bracketed open ends, null/array/object operands).
+    pub fn range_scan(
+        &self,
+        collection: &str,
+        field: &str,
+        lower: Option<(&Value, bool)>,
+        upper: Option<(&Value, bool)>,
+    ) -> Option<(PartitionId, RangeScanBounds)> {
+        let (_def, partition) = self.get_index_for_field(collection, field)?;
+        let lower_bytes = lower.map(|(v, inclusive)| (value_to_sortable_bytes(v), inclusive));
+        let upper_bytes = upper.map(|(v, inclusive)| (value_to_sortable_bytes(v), inclusive));
+        let bounds = range_scan_bounds(
+            &[],
+            lower_bytes.as_ref().map(|(b, i)| (b.as_slice(), *i)),
+            upper_bytes.as_ref().map(|(b, i)| (b.as_slice(), *i)),
+        );
+        Some((partition, bounds))
+    }
+
+    /// Per-value prefixes for `$in`, deduped by encoded value (a doc holds
+    /// exactly one entry per index, so only equal-encoding duplicates could
+    /// double-report ids), in first-occurrence order.
+    pub fn in_scan(
+        &self,
+        collection: &str,
+        field: &str,
+        values: &[Value],
+    ) -> Option<(PartitionId, Vec<Vec<u8>>)> {
+        let (def, partition) = self.get_index_for_field(collection, field)?;
+        let separator = if def.is_compound() { 0x01 } else { 0x00 };
+        let mut prefixes: Vec<Vec<u8>> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for value in values {
+            let mut prefix = value_to_sortable_bytes(value);
+            prefix.push(separator);
+            if seen.insert(prefix.clone()) {
+                prefixes.push(prefix);
+            }
+        }
+        Some((partition, prefixes))
+    }
+
+    /// Equality lookup: all doc ids where field == value, in index order.
+    /// `Ok(None)` = no usable index. Mid-scan engine errors propagate — the
+    /// old buffering path silently truncated the id list at the first error.
     pub fn lookup_eq(
         &self,
         engine: &Engine,
         collection: &str,
         field: &str,
         value: &Value,
-    ) -> Option<Vec<String>> {
-        let (def, partition) = self.get_index_for_field(collection, field)?;
-
-        let separator = if def.is_compound() { 0x01 } else { 0x00 };
-        let prefix = {
-            let mut p = value_to_sortable_bytes(value);
-            p.push(separator);
-            p
+    ) -> Result<Option<Vec<String>>, AppError> {
+        let Some((partition, prefix)) = self.eq_scan(collection, field, value) else {
+            return Ok(None);
         };
-
-        let iter = engine.prefix_iterator(&partition, &prefix).ok()?;
         let mut doc_ids = Vec::new();
-        for item in iter.flatten() {
-            let (key, _) = item;
-            if let Some(id) = extract_doc_id_from_key(&key) {
+        engine.scan_prefix(&partition, &prefix, &mut |k, _| {
+            if let Some(id) = extract_doc_id_from_key(k) {
                 doc_ids.push(id);
             }
-        }
-        Some(doc_ids)
+            ControlFlow::Continue(())
+        })?;
+        Ok(Some(doc_ids))
     }
 
-    /// Range lookup: get all doc IDs where field is in the given range.
+    /// Range lookup: all doc ids in the (type-bracketed) range, index order.
+    /// Same `Ok(None)` / error semantics as `lookup_eq`.
     pub fn lookup_range(
         &self,
         engine: &Engine,
@@ -326,30 +407,21 @@ impl IndexManager {
         field: &str,
         lower: Option<(&Value, bool)>,
         upper: Option<(&Value, bool)>,
-    ) -> Option<Vec<String>> {
-        let (_def, partition) = self.get_index_for_field(collection, field)?;
-
-        let lower_bytes = lower.map(|(v, inclusive)| (value_to_sortable_bytes(v), inclusive));
-        let upper_bytes = upper.map(|(v, inclusive)| (value_to_sortable_bytes(v), inclusive));
-        let (start, end) = match range_scan_bounds(
-            &[],
-            lower_bytes.as_ref().map(|(b, i)| (b.as_slice(), *i)),
-            upper_bytes.as_ref().map(|(b, i)| (b.as_slice(), *i)),
-        ) {
-            RangeScanBounds::Empty => return Some(Vec::new()),
-            RangeScanBounds::Span { start, end } => (start, end),
+    ) -> Result<Option<Vec<String>>, AppError> {
+        let Some((partition, bounds)) = self.range_scan(collection, field, lower, upper) else {
+            return Ok(None);
         };
-
+        let RangeScanBounds::Span { start, end } = bounds else {
+            return Ok(Some(Vec::new()));
+        };
         let mut doc_ids = Vec::new();
-        let iter = engine.range_iterator(&partition, &start, &end, None).ok()?;
-        for item in iter.flatten() {
-            let (key, _) = item;
-            if let Some(id) = extract_doc_id_from_key(&key) {
+        engine.scan_range(&partition, &start, &end, &mut |k, _| {
+            if let Some(id) = extract_doc_id_from_key(k) {
                 doc_ids.push(id);
             }
-        }
-
-        Some(doc_ids)
+            ControlFlow::Continue(())
+        })?;
+        Ok(Some(doc_ids))
     }
 
     /// Count index entries for an equality match (optimized count_only).
@@ -400,41 +472,28 @@ impl IndexManager {
         engine.count_range(&partition, &start, &end).ok()
     }
 
-    /// $in: union of equality lookups over ONE resolved index handle (the
-    /// per-value lookup_eq re-took the index lock and re-cloned the handle).
-    /// Values dedup by encoded prefix — a doc contributes exactly one entry
-    /// per index, so duplicate ids can only come from duplicate
-    /// (equal-encoding) values; skipping those preserves the first-occurrence
-    /// output order without cloning every id into a seen-set.
+    /// $in: union of equality scans over ONE resolved index handle, deduped
+    /// by encoded value (see `in_scan`), first-occurrence order. Engine
+    /// errors now fail the `$in` instead of silently skipping the value.
     pub fn lookup_in(
         &self,
         engine: &Engine,
         collection: &str,
         field: &str,
         values: &[Value],
-    ) -> Option<Vec<String>> {
-        let (def, partition) = self.get_index_for_field(collection, field)?;
-        let separator = if def.is_compound() { 0x01 } else { 0x00 };
-
+    ) -> Result<Option<Vec<String>>, AppError> {
+        let Some((partition, prefixes)) = self.in_scan(collection, field, values) else {
+            return Ok(None);
+        };
         let mut all_ids = Vec::new();
-        let mut seen_prefixes = std::collections::HashSet::new();
-        for value in values {
-            let mut prefix = value_to_sortable_bytes(value);
-            prefix.push(separator);
-            if !seen_prefixes.insert(prefix.clone()) {
-                continue;
-            }
-            // Per-value error tolerance, as before: a failed lookup skips
-            // that value rather than failing the whole $in.
-            let Ok(iter) = engine.prefix_iterator(&partition, &prefix) else {
-                continue;
-            };
-            for (key, _) in iter.flatten() {
-                if let Some(id) = extract_doc_id_from_key(&key) {
+        for prefix in &prefixes {
+            engine.scan_prefix(&partition, prefix, &mut |k, _| {
+                if let Some(id) = extract_doc_id_from_key(k) {
                     all_ids.push(id);
                 }
-            }
+                ControlFlow::Continue(())
+            })?;
         }
-        Some(all_ids)
+        Ok(Some(all_ids))
     }
 }

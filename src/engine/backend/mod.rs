@@ -223,17 +223,6 @@ pub trait StorageBackend: Send + Sync {
         end: &[u8],
         max_results: Option<usize>,
     ) -> BackendResult<BackendIterator>;
-    /// Iterate the same half-open key set `start <= k < end` in DESCENDING
-    /// byte order, i.e. starting from the largest key strictly below `end`.
-    /// Used for sorted descending scans with early termination and for
-    /// descending cursor seeks. `max_results` as on `range_iterator`.
-    fn range_iterator_rev(
-        &self,
-        partition: &PartitionId,
-        start: &[u8],
-        end: &[u8],
-        max_results: Option<usize>,
-    ) -> BackendResult<BackendIterator>;
     fn full_iterator(&self, partition: &PartitionId) -> BackendResult<BackendIterator>;
     /// Visit every pair with the given prefix in ascending key order, without
     /// materializing anything.
@@ -268,9 +257,6 @@ pub trait StorageBackend: Send + Sync {
     ) -> BackendResult<()>;
     /// Visit the same half-open key set `start <= k < end` DESCENDING,
     /// starting from the largest key strictly below `end`.
-    // Consumer-less until the descending executor scans migrate onto it
-    // (this session); the allow leaves with that migration.
-    #[allow(dead_code)]
     fn scan_range_rev(
         &self,
         partition: &PartitionId,
@@ -360,18 +346,6 @@ impl StorageBackend for Engine {
         match self {
             Engine::Fjall(b) => b.range_iterator(partition, start, end, max_results),
             Engine::RocksDb(b) => b.range_iterator(partition, start, end, max_results),
-        }
-    }
-    fn range_iterator_rev(
-        &self,
-        partition: &PartitionId,
-        start: &[u8],
-        end: &[u8],
-        max_results: Option<usize>,
-    ) -> BackendResult<BackendIterator> {
-        match self {
-            Engine::Fjall(b) => b.range_iterator_rev(partition, start, end, max_results),
-            Engine::RocksDb(b) => b.range_iterator_rev(partition, start, end, max_results),
         }
     }
     fn full_iterator(&self, partition: &PartitionId) -> BackendResult<BackendIterator> {
@@ -559,12 +533,11 @@ mod tests {
             assert_eq!(got, want);
             assert_eq!(got.len(), 4, "half-open window a:03..a:07");
 
+            // Descending == the forward window reversed (the pull rev
+            // iterator is gone; this property IS its contract).
             let got = collect_visited(|v| engine.scan_range_rev(&p, b"a:03", b"a:07", v));
-            let want: Vec<KvPair> = engine
-                .range_iterator_rev(&p, b"a:03", b"a:07", None)
-                .unwrap()
-                .collect::<BackendResult<_>>()
-                .unwrap();
+            let mut want = collect_visited(|v| engine.scan_range(&p, b"a:03", b"a:07", v));
+            want.reverse();
             assert_eq!(got, want);
             assert_eq!(
                 got.first().map(|(k, _)| k.as_slice()),
