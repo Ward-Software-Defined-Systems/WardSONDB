@@ -122,12 +122,33 @@ async fn main() {
                 .scan_accelerator
                 .set_max_memory_bytes(resolve_bitmap_memory_limit(config.bitmap_memory_mb));
 
-            // Try loading from disk first, then rebuild from storage
+            // Try loading from disk first — but a snapshot is only served if
+            // it agrees with storage on the document count. It is at most
+            // one persist-interval stale, and serving a stale one silently
+            // drops every doc written after the last persist from bitmap
+            // results (S2-2). On any disagreement, rebuild from storage.
             let loaded = storage.scan_accelerator.load_from_disk(data_dir, "_all");
-            if !loaded {
+            let consistent = loaded && {
+                let expected: u64 = storage
+                    .list_collections()
+                    .map(|cols| cols.iter().map(|c| c.doc_count).sum())
+                    .unwrap_or(0);
+                let ok = storage.scan_accelerator.snapshot_matches(expected);
+                if !ok {
+                    warn!(
+                        snapshot_docs = storage.scan_accelerator.positions.len(),
+                        storage_docs = expected,
+                        "Bitmap snapshot disagrees with storage; rebuilding"
+                    );
+                }
+                ok
+            };
+            if consistent {
+                storage.scan_accelerator.set_ready(true);
+            } else {
+                // Sets ready itself once the rebuild (+ delta drain) is done.
                 rebuild_all_accelerators(&storage);
             }
-            storage.scan_accelerator.set_ready(true);
             info!(fields = ?bitmap_fields, "Scan accelerator configured");
         }
         // With no explicit fields, the profiler samples inserts and logs a

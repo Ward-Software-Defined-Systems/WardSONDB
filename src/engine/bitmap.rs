@@ -1083,6 +1083,16 @@ impl ScanAccelerator {
         Ok(())
     }
 
+    /// S2-2 restart reconciliation: a persisted snapshot is at most one
+    /// persist-interval stale, so docs written after the last persist are
+    /// silently absent from it — serving it unreconciled means
+    /// false-negative query results until an unrelated >25%-hole rebuild.
+    /// The live document count is the cheap invariant to check on load; on
+    /// mismatch the caller must rebuild from storage instead of serving.
+    pub fn snapshot_matches(&self, expected_docs: u64) -> bool {
+        u64::from(self.positions.len()) == expected_docs
+    }
+
     /// Try to load bitmaps from disk. Returns true on success.
     pub fn load_from_disk(&self, data_dir: &Path, collection: &str) -> bool {
         let bitmap_dir = data_dir.join("bitmap").join(collection);
@@ -1489,6 +1499,31 @@ mod tests {
         assert_eq!(a.positions.len(), 1);
         let x = a.bitmap_scan(&eq_filter("f", json!("x"))).unwrap();
         assert_eq!(x.bitmap.len(), 1, "one position, one bit");
+    }
+
+    /// S2-2: a reloaded snapshot only passes reconciliation when its
+    /// position count matches storage's document count — a doc written
+    /// after the last persist makes the snapshot detectably stale.
+    #[test]
+    fn stale_snapshot_fails_reconciliation_on_load() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let a = accel(&["f"]);
+        a.on_insert("a", &json!({"f": "x"}));
+        a.on_insert("b", &json!({"f": "y"}));
+        a.persist_to_disk(tmp.path(), "_all").unwrap();
+        // Written after the persist — the snapshot no longer covers storage.
+        a.on_insert("c", &json!({"f": "x"}));
+
+        let restarted = accel(&["f"]);
+        assert!(restarted.load_from_disk(tmp.path(), "_all"));
+        assert!(
+            restarted.snapshot_matches(2),
+            "snapshot agrees with its own era"
+        );
+        assert!(
+            !restarted.snapshot_matches(3),
+            "snapshot must fail reconciliation against post-persist storage"
+        );
     }
 
     /// The invariant that lets on_delete keep the exists write lock inside
