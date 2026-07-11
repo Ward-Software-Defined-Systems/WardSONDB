@@ -17,7 +17,7 @@ use rust_rocksdb::{
 };
 
 use super::{
-    BackendError, BackendResult, EngineConfig, PartitionId, RocksOp, ScanVisitor, StorageBackend,
+    BackendError, BackendResult, EngineConfig, PartitionId, ScanVisitor, StorageBackend,
     WriteBatchWrapper,
 };
 
@@ -338,42 +338,17 @@ impl StorageBackend for RocksDbBackend {
 
     fn write_batch(&self) -> WriteBatchWrapper {
         WriteBatchWrapper::RocksDb {
-            staged: Vec::new(),
+            batch: WriteBatch::default(),
             db: self.db.clone(),
         }
     }
 
     fn commit_batch(&self, batch: WriteBatchWrapper) -> BackendResult<()> {
-        let WriteBatchWrapper::RocksDb { staged, db } = batch else {
+        let WriteBatchWrapper::RocksDb { batch, db } = batch else {
             return Err(BackendError::Internal(
                 "WriteBatchWrapper/backend mismatch".into(),
             ));
         };
-        // Resolve each distinct CF once for the whole batch (staging exists
-        // for exactly this — see WriteBatchWrapper), then build and write
-        // the real WriteBatch: still one atomic commit.
-        let mut cfs: std::collections::HashMap<
-            std::sync::Arc<str>,
-            std::sync::Arc<rust_rocksdb::BoundColumnFamily<'_>>,
-        > = std::collections::HashMap::new();
-        let mut batch = WriteBatch::default();
-        for (cf_name, op) in &staged {
-            let cf = match cfs.entry(cf_name.clone()) {
-                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                std::collections::hash_map::Entry::Vacant(v) => {
-                    let handle = db.cf_handle(cf_name).ok_or_else(|| {
-                        BackendError::Internal(format!(
-                            "column family '{cf_name}' missing at batch commit"
-                        ))
-                    })?;
-                    v.insert(handle)
-                }
-            };
-            match op {
-                RocksOp::Put(key, value) => batch.put_cf(cf, key, value),
-                RocksOp::Del(key) => batch.delete_cf(cf, key),
-            }
-        }
         match db.write(&batch) {
             Ok(()) => Ok(()),
             Err(e) => {
