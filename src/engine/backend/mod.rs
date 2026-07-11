@@ -67,6 +67,11 @@ impl From<BackendError> for AppError {
 pub type BackendResult<T> = Result<T, BackendError>;
 pub type KvPair = (Vec<u8>, Vec<u8>);
 
+/// Visitor over borrowed key/value slices for the `scan_*` methods. Return
+/// `ControlFlow::Break(())` to stop the scan early. The slices are only valid
+/// for the duration of the call — copy what you keep.
+pub type ScanVisitor<'a> = dyn FnMut(&[u8], &[u8]) -> std::ops::ControlFlow<()> + 'a;
+
 /// Opaque handle to a partition (fjall partition / RocksDB column family).
 ///
 /// Clone is cheap — both variants wrap an Arc-like internal handle.
@@ -194,6 +199,15 @@ impl Iterator for BackendIterator {
 pub trait StorageBackend: Send + Sync {
     fn create_or_open_partition(&self, name: &str) -> BackendResult<PartitionId>;
     fn get(&self, partition: &PartitionId, key: &[u8]) -> BackendResult<Option<Vec<u8>>>;
+    /// Point-get many keys, one `Option` per key in input order. A per-key
+    /// read failure maps to `None` — the same tolerance the doc-hydration
+    /// loops have always had (`if let Ok(Some(bytes)) = get(...)`); S2-8 owns
+    /// any future skip-vs-fail policy change.
+    fn get_many(
+        &self,
+        partition: &PartitionId,
+        keys: &[&[u8]],
+    ) -> BackendResult<Vec<Option<Vec<u8>>>>;
     fn prefix_iterator(
         &self,
         partition: &PartitionId,
@@ -221,6 +235,51 @@ pub trait StorageBackend: Send + Sync {
         max_results: Option<usize>,
     ) -> BackendResult<BackendIterator>;
     fn full_iterator(&self, partition: &PartitionId) -> BackendResult<BackendIterator>;
+    /// Visit every pair with the given prefix in ascending key order, without
+    /// materializing anything.
+    ///
+    /// Contract for all four `scan_*` methods:
+    /// - One consistent view per call (fjall: one `read_tx` snapshot; RocksDB:
+    ///   one iterator pin), held for the duration of the call — the same
+    ///   per-call semantics the buffering iterators have.
+    /// - Keys/values are borrowed; entries the visitor skips are never copied.
+    /// - The visitor MAY read re-entrantly through `get`/`get_many` or a
+    ///   nested scan on the same engine (interleaved hydration — pinned by
+    ///   `scan_visitor_reentrant_reads` below; fjall's `read_tx` is a
+    ///   lock-free snapshot capture and its point reads bypass tx machinery).
+    ///   It MUST NOT commit write batches — mutation paths collect their
+    ///   matches first and write after the scan returns.
+    /// - A mid-iteration engine error returns `Err` like `count_prefix` does,
+    ///   instead of the buffering iterators' truncate-at-error behavior.
+    fn scan_prefix(
+        &self,
+        partition: &PartitionId,
+        prefix: &[u8],
+        visit: &mut ScanVisitor<'_>,
+    ) -> BackendResult<()>;
+    /// Visit keys `start <= k < end` ascending. `start >= end` visits nothing
+    /// (guarded — fjall's RangeBounds panics on an inverted range).
+    fn scan_range(
+        &self,
+        partition: &PartitionId,
+        start: &[u8],
+        end: &[u8],
+        visit: &mut ScanVisitor<'_>,
+    ) -> BackendResult<()>;
+    /// Visit the same half-open key set `start <= k < end` DESCENDING,
+    /// starting from the largest key strictly below `end`.
+    // Consumer-less until the descending executor scans migrate onto it
+    // (this session); the allow leaves with that migration.
+    #[allow(dead_code)]
+    fn scan_range_rev(
+        &self,
+        partition: &PartitionId,
+        start: &[u8],
+        end: &[u8],
+        visit: &mut ScanVisitor<'_>,
+    ) -> BackendResult<()>;
+    /// Visit the whole partition in ascending key order.
+    fn scan_full(&self, partition: &PartitionId, visit: &mut ScanVisitor<'_>) -> BackendResult<()>;
     /// Count keys with the given prefix WITHOUT materializing keys or values
     /// (the iterator methods buffer everything they visit). Exact, under the
     /// same snapshot semantics as `prefix_iterator`; an empty prefix counts
@@ -271,6 +330,16 @@ impl StorageBackend for Engine {
             Engine::RocksDb(b) => b.get(partition, key),
         }
     }
+    fn get_many(
+        &self,
+        partition: &PartitionId,
+        keys: &[&[u8]],
+    ) -> BackendResult<Vec<Option<Vec<u8>>>> {
+        match self {
+            Engine::Fjall(b) => b.get_many(partition, keys),
+            Engine::RocksDb(b) => b.get_many(partition, keys),
+        }
+    }
     fn prefix_iterator(
         &self,
         partition: &PartitionId,
@@ -309,6 +378,47 @@ impl StorageBackend for Engine {
         match self {
             Engine::Fjall(b) => b.full_iterator(partition),
             Engine::RocksDb(b) => b.full_iterator(partition),
+        }
+    }
+    fn scan_prefix(
+        &self,
+        partition: &PartitionId,
+        prefix: &[u8],
+        visit: &mut ScanVisitor<'_>,
+    ) -> BackendResult<()> {
+        match self {
+            Engine::Fjall(b) => b.scan_prefix(partition, prefix, visit),
+            Engine::RocksDb(b) => b.scan_prefix(partition, prefix, visit),
+        }
+    }
+    fn scan_range(
+        &self,
+        partition: &PartitionId,
+        start: &[u8],
+        end: &[u8],
+        visit: &mut ScanVisitor<'_>,
+    ) -> BackendResult<()> {
+        match self {
+            Engine::Fjall(b) => b.scan_range(partition, start, end, visit),
+            Engine::RocksDb(b) => b.scan_range(partition, start, end, visit),
+        }
+    }
+    fn scan_range_rev(
+        &self,
+        partition: &PartitionId,
+        start: &[u8],
+        end: &[u8],
+        visit: &mut ScanVisitor<'_>,
+    ) -> BackendResult<()> {
+        match self {
+            Engine::Fjall(b) => b.scan_range_rev(partition, start, end, visit),
+            Engine::RocksDb(b) => b.scan_range_rev(partition, start, end, visit),
+        }
+    }
+    fn scan_full(&self, partition: &PartitionId, visit: &mut ScanVisitor<'_>) -> BackendResult<()> {
+        match self {
+            Engine::Fjall(b) => b.scan_full(partition, visit),
+            Engine::RocksDb(b) => b.scan_full(partition, visit),
         }
     }
     fn count_prefix(&self, partition: &PartitionId, prefix: &[u8]) -> BackendResult<u64> {
@@ -364,5 +474,198 @@ impl StorageBackend for Engine {
             Engine::Fjall(b) => b.engine_name(),
             Engine::RocksDb(b) => b.engine_name(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ops::ControlFlow;
+
+    fn test_engine_config() -> EngineConfig {
+        EngineConfig {
+            cache_size_bytes: 8 * 1024 * 1024,
+            write_buffer_bytes: 8 * 1024 * 1024,
+            memtable_bytes: 1024 * 1024,
+            flush_workers: 1,
+            compaction_workers: 1,
+        }
+    }
+
+    fn for_each_engine(f: impl Fn(&Engine)) {
+        for name in ["rocksdb", "fjall"] {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let engine = Engine::open(name, tmp.path(), &test_engine_config()).unwrap();
+            f(&engine);
+        }
+    }
+
+    /// 20 pairs: `a:00`..`a:09` -> `va0`..`va9`, `b:00`..`b:09` -> `vb0`..`vb9`.
+    fn seed(engine: &Engine) -> PartitionId {
+        let p = engine.create_or_open_partition("scan_test").unwrap();
+        let mut batch = engine.write_batch();
+        for i in 0..10 {
+            batch
+                .insert(
+                    &p,
+                    format!("a:{i:02}").as_bytes(),
+                    format!("va{i}").as_bytes(),
+                )
+                .unwrap();
+            batch
+                .insert(
+                    &p,
+                    format!("b:{i:02}").as_bytes(),
+                    format!("vb{i}").as_bytes(),
+                )
+                .unwrap();
+        }
+        engine.commit_batch(batch).unwrap();
+        p
+    }
+
+    fn collect_visited(
+        scan: impl FnOnce(&mut ScanVisitor<'_>) -> BackendResult<()>,
+    ) -> Vec<KvPair> {
+        let mut got: Vec<KvPair> = Vec::new();
+        scan(&mut |k, v| {
+            got.push((k.to_vec(), v.to_vec()));
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        got
+    }
+
+    #[test]
+    fn scan_visitors_match_pull_iterators() {
+        for_each_engine(|engine| {
+            let p = seed(engine);
+
+            let got = collect_visited(|v| engine.scan_prefix(&p, b"a:", v));
+            let want: Vec<KvPair> = engine
+                .prefix_iterator(&p, b"a:")
+                .unwrap()
+                .collect::<BackendResult<_>>()
+                .unwrap();
+            assert_eq!(got, want);
+            assert_eq!(got.len(), 10);
+
+            let got = collect_visited(|v| engine.scan_range(&p, b"a:03", b"a:07", v));
+            let want: Vec<KvPair> = engine
+                .range_iterator(&p, b"a:03", b"a:07", None)
+                .unwrap()
+                .collect::<BackendResult<_>>()
+                .unwrap();
+            assert_eq!(got, want);
+            assert_eq!(got.len(), 4, "half-open window a:03..a:07");
+
+            let got = collect_visited(|v| engine.scan_range_rev(&p, b"a:03", b"a:07", v));
+            let want: Vec<KvPair> = engine
+                .range_iterator_rev(&p, b"a:03", b"a:07", None)
+                .unwrap()
+                .collect::<BackendResult<_>>()
+                .unwrap();
+            assert_eq!(got, want);
+            assert_eq!(
+                got.first().map(|(k, _)| k.as_slice()),
+                Some(b"a:06".as_ref())
+            );
+
+            let got = collect_visited(|v| engine.scan_full(&p, v));
+            let want: Vec<KvPair> = engine
+                .full_iterator(&p)
+                .unwrap()
+                .collect::<BackendResult<_>>()
+                .unwrap();
+            assert_eq!(got, want);
+            assert_eq!(got.len(), 20);
+        });
+    }
+
+    #[test]
+    fn scan_break_stops_early() {
+        for_each_engine(|engine| {
+            let p = seed(engine);
+            let mut seen = 0;
+            engine
+                .scan_full(&p, &mut |_, _| {
+                    seen += 1;
+                    if seen == 3 {
+                        ControlFlow::Break(())
+                    } else {
+                        ControlFlow::Continue(())
+                    }
+                })
+                .unwrap();
+            assert_eq!(seen, 3);
+        });
+    }
+
+    #[test]
+    fn scan_range_inverted_visits_nothing() {
+        for_each_engine(|engine| {
+            let p = seed(engine);
+            let mut seen = 0;
+            let mut count = |_: &[u8], _: &[u8]| {
+                seen += 1;
+                ControlFlow::Continue(())
+            };
+            engine.scan_range(&p, b"a:07", b"a:03", &mut count).unwrap();
+            engine
+                .scan_range_rev(&p, b"a:07", b"a:03", &mut count)
+                .unwrap();
+            engine.scan_range(&p, b"a:05", b"a:05", &mut count).unwrap();
+            assert_eq!(seen, 0);
+        });
+    }
+
+    /// The load-bearing H-P2 probe: visitors hydrate re-entrantly while the
+    /// scan's snapshot is live. fjall 2.11.2's `read_tx()` is a lock-free
+    /// snapshot capture and `TxPartitionHandle::get` bypasses tx machinery,
+    /// so this cannot deadlock — if a future fjall changes that, this test
+    /// hangs/fails instead of production.
+    #[test]
+    fn scan_visitor_reentrant_reads() {
+        for_each_engine(|engine| {
+            let p = seed(engine);
+            let mut checked = 0;
+            engine
+                .scan_prefix(&p, b"a:", &mut |k, v| {
+                    let got = engine.get(&p, k).unwrap().unwrap();
+                    assert_eq!(got, v);
+                    let many = engine.get_many(&p, &[k]).unwrap();
+                    assert_eq!(many[0].as_deref(), Some(v));
+                    let mut inner = 0;
+                    engine
+                        .scan_prefix(&p, b"b:", &mut |_, _| {
+                            inner += 1;
+                            ControlFlow::Break(())
+                        })
+                        .unwrap();
+                    assert_eq!(inner, 1);
+                    checked += 1;
+                    ControlFlow::Continue(())
+                })
+                .unwrap();
+            assert_eq!(checked, 10);
+        });
+    }
+
+    #[test]
+    fn get_many_hits_misses_preserve_order() {
+        for_each_engine(|engine| {
+            let p = seed(engine);
+            let keys: Vec<&[u8]> = vec![b"a:00", b"missing", b"a:05", b"also-missing", b"b:09"];
+            let got = engine.get_many(&p, &keys).unwrap();
+            assert_eq!(got.len(), 5);
+            assert_eq!(got[0].as_deref(), Some(b"va0".as_ref()));
+            assert!(got[1].is_none());
+            assert_eq!(got[2].as_deref(), Some(b"va5".as_ref()));
+            assert!(got[3].is_none());
+            assert_eq!(got[4].as_deref(), Some(b"vb9".as_ref()));
+
+            let empty = engine.get_many(&p, &[]).unwrap();
+            assert!(empty.is_empty());
+        });
     }
 }

@@ -1,12 +1,13 @@
 //! Fjall backend implementation.
 
+use std::ops::ControlFlow;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use fjall::{Batch, Config, PartitionCreateOptions, PersistMode, TxKeyspace};
 
 use super::{
-    BackendError, BackendIterator, BackendResult, EngineConfig, KvPair, PartitionId,
+    BackendError, BackendIterator, BackendResult, EngineConfig, KvPair, PartitionId, ScanVisitor,
     StorageBackend, WriteBatchWrapper,
 };
 
@@ -78,6 +79,27 @@ impl StorageBackend for FjallBackend {
             Ok(None) => Ok(None),
             Err(e) => Err(BackendError::Internal(e.to_string())),
         }
+    }
+
+    fn get_many(
+        &self,
+        partition: &PartitionId,
+        keys: &[&[u8]],
+    ) -> BackendResult<Vec<Option<Vec<u8>>>> {
+        let PartitionId::Fjall(handle) = partition else {
+            return Err(BackendError::Internal(
+                "PartitionId/backend mismatch".into(),
+            ));
+        };
+        // fjall has no native multi-get; per-key gets match the read
+        // semantics the hydration loops have always had.
+        Ok(keys
+            .iter()
+            .map(|key| match handle.get(key) {
+                Ok(Some(v)) => Some(v.to_vec()),
+                _ => None,
+            })
+            .collect())
     }
 
     fn prefix_iterator(
@@ -152,54 +174,122 @@ impl StorageBackend for FjallBackend {
         Ok(BackendIterator::from_fjall(items))
     }
 
-    fn count_prefix(&self, partition: &PartitionId, prefix: &[u8]) -> BackendResult<u64> {
+    fn scan_prefix(
+        &self,
+        partition: &PartitionId,
+        prefix: &[u8],
+        visit: &mut ScanVisitor<'_>,
+    ) -> BackendResult<()> {
         let PartitionId::Fjall(handle) = partition else {
             return Err(BackendError::Internal(
                 "PartitionId/backend mismatch".into(),
             ));
         };
-        // Slices are refcounted views — counting drops them without the
-        // to_vec copies the iterator methods pay. Snapshot-exact (MVCC tx).
         let rtx = self.db.read_tx();
-        let mut count = 0u64;
         for item in rtx.prefix(handle, prefix) {
-            item.map_err(|e| BackendError::Internal(e.to_string()))?;
-            count += 1;
+            let (k, v) = item.map_err(|e| BackendError::Internal(e.to_string()))?;
+            if visit(&k, &v).is_break() {
+                break;
+            }
         }
+        Ok(())
+    }
+
+    fn scan_range(
+        &self,
+        partition: &PartitionId,
+        start: &[u8],
+        end: &[u8],
+        visit: &mut ScanVisitor<'_>,
+    ) -> BackendResult<()> {
+        if start >= end {
+            // fjall's RangeBounds would panic on an inverted range.
+            return Ok(());
+        }
+        let PartitionId::Fjall(handle) = partition else {
+            return Err(BackendError::Internal(
+                "PartitionId/backend mismatch".into(),
+            ));
+        };
+        let rtx = self.db.read_tx();
+        for item in rtx.range(handle, start.to_vec()..end.to_vec()) {
+            let (k, v) = item.map_err(|e| BackendError::Internal(e.to_string()))?;
+            if visit(&k, &v).is_break() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn scan_range_rev(
+        &self,
+        partition: &PartitionId,
+        start: &[u8],
+        end: &[u8],
+        visit: &mut ScanVisitor<'_>,
+    ) -> BackendResult<()> {
+        if start >= end {
+            // fjall's RangeBounds would panic on an inverted range.
+            return Ok(());
+        }
+        let PartitionId::Fjall(handle) = partition else {
+            return Err(BackendError::Internal(
+                "PartitionId/backend mismatch".into(),
+            ));
+        };
+        let rtx = self.db.read_tx();
+        for item in rtx.range(handle, start.to_vec()..end.to_vec()).rev() {
+            let (k, v) = item.map_err(|e| BackendError::Internal(e.to_string()))?;
+            if visit(&k, &v).is_break() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn scan_full(&self, partition: &PartitionId, visit: &mut ScanVisitor<'_>) -> BackendResult<()> {
+        let PartitionId::Fjall(handle) = partition else {
+            return Err(BackendError::Internal(
+                "PartitionId/backend mismatch".into(),
+            ));
+        };
+        let rtx = self.db.read_tx();
+        for item in rtx.iter(handle) {
+            let (k, v) = item.map_err(|e| BackendError::Internal(e.to_string()))?;
+            if visit(&k, &v).is_break() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn count_prefix(&self, partition: &PartitionId, prefix: &[u8]) -> BackendResult<u64> {
+        // Counting is a visitor scan that keeps nothing — slices stay
+        // refcounted views, no to_vec copies. Snapshot-exact (MVCC tx).
+        let mut count = 0u64;
+        self.scan_prefix(partition, prefix, &mut |_, _| {
+            count += 1;
+            ControlFlow::Continue(())
+        })?;
         Ok(count)
     }
 
     fn count_range(&self, partition: &PartitionId, start: &[u8], end: &[u8]) -> BackendResult<u64> {
-        if start >= end {
-            // fjall's RangeBounds would panic on an inverted range.
-            return Ok(0);
-        }
-        let PartitionId::Fjall(handle) = partition else {
-            return Err(BackendError::Internal(
-                "PartitionId/backend mismatch".into(),
-            ));
-        };
-        let rtx = self.db.read_tx();
         let mut count = 0u64;
-        for item in rtx.range(handle, start.to_vec()..end.to_vec()) {
-            item.map_err(|e| BackendError::Internal(e.to_string()))?;
+        self.scan_range(partition, start, end, &mut |_, _| {
             count += 1;
-        }
+            ControlFlow::Continue(())
+        })?;
         Ok(count)
     }
 
     fn first_key(&self, partition: &PartitionId) -> BackendResult<Option<Vec<u8>>> {
-        let PartitionId::Fjall(handle) = partition else {
-            return Err(BackendError::Internal(
-                "PartitionId/backend mismatch".into(),
-            ));
-        };
-        let rtx = self.db.read_tx();
-        match rtx.iter(handle).next() {
-            Some(Ok((k, _))) => Ok(Some(k.to_vec())),
-            Some(Err(e)) => Err(BackendError::Internal(e.to_string())),
-            None => Ok(None),
-        }
+        let mut first = None;
+        self.scan_full(partition, &mut |k, _| {
+            first = Some(k.to_vec());
+            ControlFlow::Break(())
+        })?;
+        Ok(first)
     }
 
     fn last_key(&self, partition: &PartitionId) -> BackendResult<Option<Vec<u8>>> {

@@ -6,6 +6,7 @@
 //! budget), plus `cache_index_and_filter_blocks` so index/filter blocks are
 //! charged against the cache instead of living outside it.
 
+use std::ops::ControlFlow;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,7 +17,7 @@ use rust_rocksdb::{
 };
 
 use super::{
-    BackendError, BackendIterator, BackendResult, EngineConfig, KvPair, PartitionId,
+    BackendError, BackendIterator, BackendResult, EngineConfig, KvPair, PartitionId, ScanVisitor,
     StorageBackend, WriteBatchWrapper,
 };
 
@@ -169,6 +170,27 @@ impl StorageBackend for RocksDbBackend {
         db.get_cf(&cf, key).map_err(rocks_err)
     }
 
+    fn get_many(
+        &self,
+        partition: &PartitionId,
+        keys: &[&[u8]],
+    ) -> BackendResult<Vec<Option<Vec<u8>>>> {
+        let (db, cf_name) = unwrap_rocks(partition)?;
+        let cf = db
+            .cf_handle(cf_name)
+            .ok_or_else(|| BackendError::Internal(format!("CF not found: {cf_name}")))?;
+        // sorted_input=false: callers pass ids in scan order (index order),
+        // which is not key order in general.
+        Ok(db
+            .batched_multi_get_cf(&cf, keys, false)
+            .into_iter()
+            .map(|r| match r {
+                Ok(Some(v)) => Some(v.as_ref().to_vec()),
+                _ => None,
+            })
+            .collect())
+    }
+
     fn prefix_iterator(
         &self,
         partition: &PartitionId,
@@ -295,30 +317,40 @@ impl StorageBackend for RocksDbBackend {
         )))
     }
 
-    fn count_prefix(&self, partition: &PartitionId, prefix: &[u8]) -> BackendResult<u64> {
+    fn scan_prefix(
+        &self,
+        partition: &PartitionId,
+        prefix: &[u8],
+        visit: &mut ScanVisitor<'_>,
+    ) -> BackendResult<()> {
         let (db, cf_name) = unwrap_rocks(partition)?;
         let cf = db
             .cf_handle(cf_name)
             .ok_or_else(|| BackendError::Internal(format!("CF not found: {cf_name}")))?;
-        // Raw iterator: keys are only borrowed to test the prefix, values are
-        // never copied. status() after the loop surfaces iteration errors.
         let mut iter = db.raw_iterator_cf(&cf);
         iter.seek(prefix);
-        let mut count = 0u64;
         while let Some(k) = iter.key() {
             if !k.starts_with(prefix) {
                 break;
             }
-            count += 1;
+            let Some(v) = iter.value() else { break };
+            if visit(k, v).is_break() {
+                break;
+            }
             iter.next();
         }
-        iter.status().map_err(rocks_err)?;
-        Ok(count)
+        iter.status().map_err(rocks_err)
     }
 
-    fn count_range(&self, partition: &PartitionId, start: &[u8], end: &[u8]) -> BackendResult<u64> {
+    fn scan_range(
+        &self,
+        partition: &PartitionId,
+        start: &[u8],
+        end: &[u8],
+        visit: &mut ScanVisitor<'_>,
+    ) -> BackendResult<()> {
         if start >= end {
-            return Ok(0);
+            return Ok(());
         }
         let (db, cf_name) = unwrap_rocks(partition)?;
         let cf = db
@@ -326,29 +358,95 @@ impl StorageBackend for RocksDbBackend {
             .ok_or_else(|| BackendError::Internal(format!("CF not found: {cf_name}")))?;
         let mut iter = db.raw_iterator_cf(&cf);
         iter.seek(start);
-        let mut count = 0u64;
         while let Some(k) = iter.key() {
             if k >= end {
                 break;
             }
-            count += 1;
+            let Some(v) = iter.value() else { break };
+            if visit(k, v).is_break() {
+                break;
+            }
             iter.next();
         }
-        iter.status().map_err(rocks_err)?;
-        Ok(count)
+        iter.status().map_err(rocks_err)
     }
 
-    fn first_key(&self, partition: &PartitionId) -> BackendResult<Option<Vec<u8>>> {
+    fn scan_range_rev(
+        &self,
+        partition: &PartitionId,
+        start: &[u8],
+        end: &[u8],
+        visit: &mut ScanVisitor<'_>,
+    ) -> BackendResult<()> {
+        if start >= end {
+            return Ok(());
+        }
         let (db, cf_name) = unwrap_rocks(partition)?;
         let cf = db
             .cf_handle(cf_name)
             .ok_or_else(|| BackendError::Internal(format!("CF not found: {cf_name}")))?;
-        let mut iter = db.iterator_cf(&cf, IteratorMode::Start);
-        match iter.next() {
-            Some(Ok((k, _))) => Ok(Some(k.to_vec())),
-            Some(Err(e)) => Err(rocks_err(e)),
-            None => Ok(None),
+        let mut iter = db.raw_iterator_cf(&cf);
+        // Largest key <= end; `end` itself is exclusive.
+        iter.seek_for_prev(end);
+        if iter.key() == Some(end) {
+            iter.prev();
         }
+        while let Some(k) = iter.key() {
+            if k < start {
+                break;
+            }
+            let Some(v) = iter.value() else { break };
+            if visit(k, v).is_break() {
+                break;
+            }
+            iter.prev();
+        }
+        iter.status().map_err(rocks_err)
+    }
+
+    fn scan_full(&self, partition: &PartitionId, visit: &mut ScanVisitor<'_>) -> BackendResult<()> {
+        let (db, cf_name) = unwrap_rocks(partition)?;
+        let cf = db
+            .cf_handle(cf_name)
+            .ok_or_else(|| BackendError::Internal(format!("CF not found: {cf_name}")))?;
+        let mut iter = db.raw_iterator_cf(&cf);
+        iter.seek_to_first();
+        while let Some(k) = iter.key() {
+            let Some(v) = iter.value() else { break };
+            if visit(k, v).is_break() {
+                break;
+            }
+            iter.next();
+        }
+        iter.status().map_err(rocks_err)
+    }
+
+    fn count_prefix(&self, partition: &PartitionId, prefix: &[u8]) -> BackendResult<u64> {
+        // Counting is a visitor scan that keeps nothing.
+        let mut count = 0u64;
+        self.scan_prefix(partition, prefix, &mut |_, _| {
+            count += 1;
+            ControlFlow::Continue(())
+        })?;
+        Ok(count)
+    }
+
+    fn count_range(&self, partition: &PartitionId, start: &[u8], end: &[u8]) -> BackendResult<u64> {
+        let mut count = 0u64;
+        self.scan_range(partition, start, end, &mut |_, _| {
+            count += 1;
+            ControlFlow::Continue(())
+        })?;
+        Ok(count)
+    }
+
+    fn first_key(&self, partition: &PartitionId) -> BackendResult<Option<Vec<u8>>> {
+        let mut first = None;
+        self.scan_full(partition, &mut |k, _| {
+            first = Some(k.to_vec());
+            ControlFlow::Break(())
+        })?;
+        Ok(first)
     }
 
     fn last_key(&self, partition: &PartitionId) -> BackendResult<Option<Vec<u8>>> {

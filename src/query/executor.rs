@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use crate::engine::backend::StorageBackend;
+use crate::engine::backend::{PartitionId, StorageBackend};
 use crate::engine::storage::Storage;
 use crate::error::AppError;
 use crate::index::secondary::{
@@ -108,13 +108,41 @@ fn paginate_materialized(
     matching.truncate(end);
     let page = matching.split_off(start);
 
-    let docs = if let Some(ref fields) = query.fields {
-        page.iter().map(|doc| project_fields(doc, fields)).collect()
-    } else {
-        page
-    };
+    (apply_projection(page, &query.fields), has_more, next_cursor)
+}
 
-    (docs, has_more, next_cursor)
+/// Hydrate an ordered id list: one batched read + parse. Ids whose doc
+/// vanished in the scan→get gap (or whose read failed) are skipped — the
+/// snapshot-gap tolerance every hydration path has always had (S2-8 owns any
+/// skip-vs-fail policy change). The returned length is what `docs_scanned`
+/// reports on the materializing paths: documents actually loaded and parsed.
+fn load_docs_by_ids(
+    storage: &Storage,
+    docs_partition: &PartitionId,
+    ids: &[String],
+) -> Result<Vec<Value>, AppError> {
+    let key_refs: Vec<&[u8]> = ids.iter().map(|id| id.as_bytes()).collect();
+    let mut docs = Vec::with_capacity(ids.len());
+    for bytes in storage
+        .engine
+        .get_many(docs_partition, &key_refs)?
+        .into_iter()
+        .flatten()
+    {
+        if let Ok(doc) = serde_json::from_slice::<Value>(&bytes) {
+            docs.push(doc);
+        }
+    }
+    Ok(docs)
+}
+
+/// Shared projection tail: with `fields` present, project every doc (always
+/// keeping `_id`); otherwise pass the docs through untouched.
+fn apply_projection(docs: Vec<Value>, fields: &Option<Vec<String>>) -> Vec<Value> {
+    match fields {
+        Some(fields) => docs.iter().map(|doc| project_fields(doc, fields)).collect(),
+        None => docs,
+    }
 }
 
 fn execute_full_scan(
@@ -277,23 +305,15 @@ fn load_id_window(
     let end = start.saturating_add(query.limit as usize).min(total);
 
     let docs_partition = storage.get_docs_partition(collection)?;
-    let mut docs = Vec::with_capacity(end - start);
-    for id in &candidate_ids[start..end] {
-        if let Ok(Some(bytes)) = storage.engine.get(&docs_partition, id.as_bytes())
-            && let Ok(doc) = serde_json::from_slice::<Value>(&bytes)
-        {
-            docs.push(doc);
-        }
-    }
+    let docs = load_docs_by_ids(storage, &docs_partition, &candidate_ids[start..end])?;
     let docs_scanned = (end - start) as u64;
     let has_more = total > end;
 
-    let docs = if let Some(ref fields) = query.fields {
-        docs.iter().map(|doc| project_fields(doc, fields)).collect()
-    } else {
-        docs
-    };
-    Ok((docs, docs_scanned, has_more))
+    Ok((
+        apply_projection(docs, &query.fields),
+        docs_scanned,
+        has_more,
+    ))
 }
 
 /// True when nothing after the scan can change which candidates form the
@@ -490,18 +510,12 @@ fn execute_index_scan(
         });
     }
 
-    let docs_scanned = candidate_ids.len() as u64;
-
-    // Load documents by ID
+    // Batched hydration; docs_scanned counts docs actually loaded+parsed —
+    // ids whose doc vanished in the scan→get gap contribute nothing to the
+    // page and no longer inflate the count.
     let docs_partition = storage.get_docs_partition(collection)?;
-    let mut loaded_docs = Vec::with_capacity(candidate_ids.len());
-    for id in &candidate_ids {
-        if let Ok(Some(bytes)) = storage.engine.get(&docs_partition, id.as_bytes())
-            && let Ok(doc) = serde_json::from_slice::<Value>(&bytes)
-        {
-            loaded_docs.push(doc);
-        }
-    }
+    let loaded_docs = load_docs_by_ids(storage, &docs_partition, &candidate_ids)?;
+    let docs_scanned = loaded_docs.len() as u64;
 
     // Apply post-filter (residual conditions not covered by the index)
     let matching: Vec<Value> = if let Some(ref post_filter) = plan.post_filter {
@@ -810,18 +824,11 @@ fn execute_compound_range(
         });
     }
 
-    let docs_scanned = candidate_ids.len() as u64;
-
-    // Load documents by ID
+    // Batched hydration; docs_scanned = docs actually loaded+parsed (same
+    // definition as the index-scan path above).
     let docs_partition = storage.get_docs_partition(collection)?;
-    let mut loaded_docs = Vec::with_capacity(candidate_ids.len());
-    for id in &candidate_ids {
-        if let Ok(Some(bytes)) = storage.engine.get(&docs_partition, id.as_bytes())
-            && let Ok(doc) = serde_json::from_slice::<Value>(&bytes)
-        {
-            loaded_docs.push(doc);
-        }
-    }
+    let loaded_docs = load_docs_by_ids(storage, &docs_partition, &candidate_ids)?;
+    let docs_scanned = loaded_docs.len() as u64;
 
     // Apply post-filter
     let matching: Vec<Value> = if let Some(ref post_filter) = plan.post_filter {
