@@ -61,6 +61,12 @@ impl FilterNode {
 }
 
 pub fn resolve_json_path<'a>(doc: &'a Value, path: &str) -> Option<&'a Value> {
+    // Flat field names dominate real filters and need no split machinery.
+    // (Sorts already resolve once per doc via DocSortKey decoration; this is
+    // the per-predicate filter path.)
+    if !path.contains('.') {
+        return doc.get(path);
+    }
     let mut current = doc;
     for (i, segment) in path.split('.').enumerate() {
         if i >= MAX_DOT_DEPTH {
