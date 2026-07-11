@@ -24,7 +24,15 @@ Behavior changes an existing client could observe, most significant first.
   the page filled; unfiltered full-scan pages skip `offset` entries without
   parsing them and report only the page window; the three paths that
   previously reported the raw candidate count (indexed, compound-range, and
-  `$or`-union materializing pages) now match the rest.
+  `$or`-union materializing pages) now match the rest. `distinct` similarly
+  reports documents visited (it stops once `limit` distinct values are
+  found) instead of always the collection size.
+- **Mid-scan storage errors now fail the request instead of silently
+  truncating results.** Index lookups (including `$in`, which previously
+  skipped errored values), and the key scans behind `DELETE` collection/index
+  operations, surface engine iteration errors as 500s; a collection drop can
+  no longer commit a truncated key removal. Unreachable in healthy
+  deployments — this only changes what a failing disk looks like.
 - **Numeric `-1` sort direction on `/query` now sorts descending.** It was
   silently accepted and sorted ASCENDING. Clients calibrated to the buggy
   order will see reversed results with no error.
