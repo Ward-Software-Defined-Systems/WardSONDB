@@ -12,7 +12,9 @@ use super::cursor::{Cursor, CursorValue, compare_doc_to_cursor, encode_cursor};
 use super::filter::resolve_json_path;
 use super::parser::ParsedQuery;
 use super::planner::{QueryPlan, ScanPlan, plan_query};
-use super::sort::compare_docs;
+use super::sort::{DocSortKey, SortField, compare_decorated, compare_docs, extract_sort_key};
+
+use std::ops::ControlFlow;
 
 #[derive(Debug)]
 pub struct QueryResult {
@@ -145,6 +147,119 @@ fn apply_projection(docs: Vec<Value>, fields: &Option<Vec<String>>) -> Vec<Value
     }
 }
 
+/// Streaming page collector for unsorted match streams: skips `offset`
+/// matches without keeping them, keeps limit+1 (the probe row makes
+/// `has_more` exact), then asks the scan to break. `total_count` is exact
+/// only when the scan ran to exhaustion — omitted exactly when `has_more`
+/// is true.
+struct UnsortedPage {
+    to_skip: usize,
+    keep: usize,
+    matches: u64,
+    page: Vec<Value>,
+    broke_early: bool,
+}
+
+impl UnsortedPage {
+    fn new(offset: usize, limit: usize) -> Self {
+        UnsortedPage {
+            to_skip: offset,
+            // Saturating: aggregate feeds limit = u64::MAX, which must stream
+            // to exhaustion (exact counts), never overflow.
+            keep: limit.saturating_add(1),
+            matches: 0,
+            page: Vec::new(),
+            broke_early: false,
+        }
+    }
+
+    fn push(&mut self, doc: Value) -> ControlFlow<()> {
+        self.matches += 1;
+        if self.to_skip > 0 {
+            self.to_skip -= 1;
+            return ControlFlow::Continue(());
+        }
+        self.page.push(doc);
+        if self.page.len() >= self.keep {
+            self.broke_early = true;
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// (page truncated to limit, has_more, exhaustion-exact total)
+    fn finish(mut self, limit: usize) -> (Vec<Value>, bool, Option<u64>) {
+        let has_more = self.page.len() > limit;
+        self.page.truncate(limit);
+        (
+            self.page,
+            has_more,
+            (!self.broke_early).then_some(self.matches),
+        )
+    }
+}
+
+/// Bounded selection for sorted match streams: keeps the offset+limit+1
+/// smallest rows in comparator order without materializing every match.
+/// Never breaks the scan — every match is seen, so `total_count` stays exact
+/// like the materializing sort this replaces. Memory: min(2·k, matches)
+/// rows, never worse than full materialization.
+struct TopK<'q> {
+    k: usize,
+    sort: &'q [SortField],
+    buf: Vec<(DocSortKey, Value)>,
+    /// The k-th smallest key once k rows are known: strictly-greater rows
+    /// are rejected on arrival instead of buffered. Equal-to-cutoff rows are
+    /// buffered so ties keep the stable sort's arrival order.
+    cutoff: Option<DocSortKey>,
+    matches: u64,
+}
+
+impl<'q> TopK<'q> {
+    fn new(offset: usize, limit: usize, sort: &'q [SortField]) -> Self {
+        TopK {
+            k: offset.saturating_add(limit).saturating_add(1),
+            sort,
+            buf: Vec::new(),
+            cutoff: None,
+            matches: 0,
+        }
+    }
+
+    fn push(&mut self, doc: Value) {
+        self.matches += 1;
+        let key = extract_sort_key(&doc, self.sort);
+        if let Some(cutoff) = &self.cutoff
+            && compare_decorated(&key, cutoff, self.sort) == std::cmp::Ordering::Greater
+        {
+            return;
+        }
+        self.buf.push((key, doc));
+        if self.buf.len() >= self.k.saturating_mul(2) {
+            self.compact();
+        }
+    }
+
+    fn compact(&mut self) {
+        // sort_by is stable, so equal keys keep arrival order — identical
+        // tie behavior to the full sort this replaces.
+        self.buf
+            .sort_by(|a, b| compare_decorated(&a.0, &b.0, self.sort));
+        self.buf.truncate(self.k);
+        if self.buf.len() == self.k {
+            self.cutoff = Some(self.buf[self.k - 1].0.clone());
+        }
+    }
+
+    /// Rows in comparator order (at most 2·k of the smallest) + the exact
+    /// count of every match pushed.
+    fn finish(mut self) -> (Vec<(DocSortKey, Value)>, u64) {
+        self.buf
+            .sort_by(|a, b| compare_decorated(&a.0, &b.0, self.sort));
+        (self.buf, self.matches)
+    }
+}
+
 fn execute_full_scan(
     storage: &Storage,
     collection: &str,
@@ -161,25 +276,42 @@ fn execute_full_scan(
         return execute_full_scan_id_seek(storage, collection, query, plan, cursor);
     }
 
-    let all_docs = storage.scan_all_documents(collection)?;
-    let docs_scanned = all_docs.len() as u64;
-
+    // The 404 contract for queries comes from the _meta registry, which the
+    // replaced scan_all_documents call used to consult.
+    storage.ensure_collection_exists(collection)?;
+    let docs_partition = storage.get_docs_partition(collection)?;
     let filter = plan.original_filter.as_ref();
-    let matching: Vec<Value> = if let Some(filter) = filter {
-        all_docs
-            .into_iter()
-            .filter(|doc| filter.matches(doc))
-            .collect()
-    } else {
-        all_docs
-    };
 
-    let total_count = matching.len() as u64;
+    // Corrupt-doc policy parity with the scan_all_documents path this
+    // replaces: a document that fails to parse fails the whole query (the
+    // id-hydration loops skip instead — S2-8 owns unifying that).
+    let mut parse_err: Option<AppError> = None;
 
     if query.count_only {
+        // Full evaluation is inherent to an exact filtered count; streaming
+        // only removes the whole-collection buffer.
+        let mut docs_scanned = 0u64;
+        let mut matches = 0u64;
+        storage.engine.scan_full(&docs_partition, &mut |_, v| {
+            let doc: Value = match serde_json::from_slice(v) {
+                Ok(doc) => doc,
+                Err(e) => {
+                    parse_err = Some(e.into());
+                    return ControlFlow::Break(());
+                }
+            };
+            docs_scanned += 1;
+            if filter.is_none_or(|f| f.matches(&doc)) {
+                matches += 1;
+            }
+            ControlFlow::Continue(())
+        })?;
+        if let Some(e) = parse_err {
+            return Err(e);
+        }
         return Ok(QueryResult {
             docs: vec![],
-            total_count: Some(total_count),
+            total_count: Some(matches),
             docs_scanned,
             index_used: None,
             scan_strategy: Some(plan.scan.name().to_string()),
@@ -188,21 +320,126 @@ fn execute_full_scan(
         });
     }
 
-    let (docs, has_more, mut next_cursor) = paginate_materialized(matching, query, collection);
-
-    // Bootstrap cursor for no-sort walks: a full scan streams in _id order
-    // (the docs partition key), so the position is sound without a sort spec.
-    // Only _id is needed here, which projection always preserves. Index and
-    // bitmap scans must NOT do this — their no-sort order isn't _id.
-    if next_cursor.is_none() && has_more && query.sort.is_empty() {
-        next_cursor = docs
-            .last()
-            .and_then(|doc| encode_cursor(doc, &[], collection));
+    if query.sort.is_empty() {
+        // Unsorted page: filter during the scan, skip offset matches without
+        // keeping them, stop at the limit+1 probe row. Unfiltered scans skip
+        // offset entries WITHOUT parsing (every entry matches) and take
+        // total_count from DocCounters (authoritative, O(1)); filtered scans
+        // report an exact total only when the scan ran out (UnsortedPage).
+        let mut sink = UnsortedPage::new(query.offset as usize, query.limit as usize);
+        let mut docs_scanned = 0u64;
+        storage.engine.scan_full(&docs_partition, &mut |_, v| {
+            if filter.is_none() && sink.to_skip > 0 {
+                sink.to_skip -= 1;
+                sink.matches += 1;
+                return ControlFlow::Continue(());
+            }
+            let doc: Value = match serde_json::from_slice(v) {
+                Ok(doc) => doc,
+                Err(e) => {
+                    parse_err = Some(e.into());
+                    return ControlFlow::Break(());
+                }
+            };
+            docs_scanned += 1;
+            match filter {
+                Some(f) if !f.matches(&doc) => ControlFlow::Continue(()),
+                _ => sink.push(doc),
+            }
+        })?;
+        if let Some(e) = parse_err {
+            return Err(e);
+        }
+        let (page, has_more, streamed_total) = sink.finish(query.limit as usize);
+        let total_count = if filter.is_none() {
+            Some(storage.doc_counts.get(collection).max(0) as u64)
+        } else {
+            streamed_total
+        };
+        // Bootstrap cursor for no-sort walks: a full scan streams in _id
+        // order (the docs partition key), so the last page doc's id resumes
+        // the walk. Index and bitmap scans must NOT do this — their no-sort
+        // order isn't _id.
+        let next_cursor = if has_more {
+            page.last()
+                .and_then(|doc| encode_cursor(doc, &[], collection))
+        } else {
+            None
+        };
+        let docs = apply_projection(page, &query.fields);
+        return Ok(QueryResult {
+            docs,
+            total_count,
+            docs_scanned,
+            index_used: None,
+            scan_strategy: None,
+            has_more,
+            next_cursor,
+        });
     }
 
+    // Sorted page: decorate-and-select. Every match is still seen (exact
+    // total_count, exact has_more), but only the offset+limit+1 smallest
+    // rows stay resident instead of the whole match set.
+    let mut topk = TopK::new(query.offset as usize, query.limit as usize, &query.sort);
+    let mut pre_cursor = 0u64;
+    let mut docs_scanned = 0u64;
+    storage.engine.scan_full(&docs_partition, &mut |_, v| {
+        let doc: Value = match serde_json::from_slice(v) {
+            Ok(doc) => doc,
+            Err(e) => {
+                parse_err = Some(e.into());
+                return ControlFlow::Break(());
+            }
+        };
+        docs_scanned += 1;
+        if let Some(f) = filter
+            && !f.matches(&doc)
+        {
+            return ControlFlow::Continue(());
+        }
+        // Cursor pages keep total_count parity with the materializing sort:
+        // matches at-or-before the cursor are counted but never kept.
+        if let Some(cursor) = &query.cursor
+            && compare_doc_to_cursor(&doc, cursor, &query.sort) != std::cmp::Ordering::Greater
+        {
+            pre_cursor += 1;
+            return ControlFlow::Continue(());
+        }
+        topk.push(doc);
+        ControlFlow::Continue(())
+    })?;
+    if let Some(e) = parse_err {
+        return Err(e);
+    }
+
+    let offset = query.offset as usize;
+    let limit = query.limit as usize;
+    let (rows, kept_matches) = topk.finish();
+    let total_count = Some(pre_cursor + kept_matches);
+    let start = offset.min(rows.len());
+    let end = start.saturating_add(limit).min(rows.len());
+    // Exact: TopK saw every match (cursor pages have offset == 0, so the
+    // window start is never beyond the kept rows).
+    let has_more = kept_matches > offset.saturating_add(limit) as u64;
+    // This branch always has a sort spec (empty-sort cursors take the id
+    // seek; empty-sort pages take the unsorted branch), so the old
+    // "sorted-or-cursor" cursor-emission gate is simply has_more here.
+    let next_cursor = if has_more && end > start {
+        encode_cursor(&rows[end - 1].1, &query.sort, collection)
+    } else {
+        None
+    };
+    let page: Vec<Value> = rows
+        .into_iter()
+        .skip(start)
+        .take(end - start)
+        .map(|(_, doc)| doc)
+        .collect();
+    let docs = apply_projection(page, &query.fields);
     Ok(QueryResult {
         docs,
-        total_count: Some(total_count),
+        total_count,
         docs_scanned,
         index_used: None,
         scan_strategy: None,
@@ -232,29 +469,28 @@ fn execute_full_scan_id_seek(
     // 0xFF byte sorts above every doc key.
     let hi = [0xFFu8];
 
-    let max_results = plan.original_filter.is_none().then_some(limit + 1);
-
     let mut results: Vec<Value> = Vec::new();
     let mut docs_scanned = 0u64;
-    for kv in storage
+    storage
         .engine
-        .range_iterator(&docs_partition, &lo, &hi, max_results)?
-    {
-        let (_, value_bytes) = kv?;
-        let Ok(doc) = serde_json::from_slice::<Value>(&value_bytes) else {
-            continue;
-        };
-        docs_scanned += 1;
-        if let Some(filter) = &plan.original_filter
-            && !filter.matches(&doc)
-        {
-            continue;
-        }
-        results.push(doc);
-        if results.len() > limit {
-            break;
-        }
-    }
+        .scan_range(&docs_partition, &lo, &hi, &mut |_, v| {
+            // Parse failures skip-and-continue — this path's long-standing
+            // policy (unlike the main full scan's fail), preserved verbatim.
+            let Ok(doc) = serde_json::from_slice::<Value>(v) else {
+                return ControlFlow::Continue(());
+            };
+            docs_scanned += 1;
+            if let Some(filter) = &plan.original_filter
+                && !filter.matches(&doc)
+            {
+                return ControlFlow::Continue(());
+            }
+            results.push(doc);
+            if results.len() > limit {
+                return ControlFlow::Break(());
+            }
+            ControlFlow::Continue(())
+        })?;
 
     let has_more = results.len() > limit;
     results.truncate(limit);

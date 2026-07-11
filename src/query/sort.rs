@@ -141,3 +141,111 @@ pub(crate) fn compare_json_values(a: Option<&Value>, b: Option<&Value>) -> std::
         (Some(a), Some(b)) => compare_values_total(a, b),
     }
 }
+
+/// Sort key extracted once per document (decorate-sort-undecorate): one owned
+/// value per sort field plus the `_id` tiebreak. Streaming sorts compare
+/// these instead of re-resolving field paths on every comparison.
+#[derive(Clone)]
+pub struct DocSortKey {
+    vals: Vec<Option<Value>>,
+    id: Option<String>,
+}
+
+pub fn extract_sort_key(doc: &Value, sort_fields: &[SortField]) -> DocSortKey {
+    DocSortKey {
+        vals: sort_fields
+            .iter()
+            .map(|sf| resolve_json_path(doc, &sf.field).cloned())
+            .collect(),
+        id: doc.get("_id").and_then(Value::as_str).map(str::to_string),
+    }
+}
+
+/// `compare_docs`' exact order over pre-extracted keys: same per-field
+/// direction flips, same Missing<present rule, same `_id` tiebreak
+/// direction. Pinned lockstep against `compare_docs` by
+/// `decorated_matches_compare_docs`.
+pub fn compare_decorated(
+    a: &DocSortKey,
+    b: &DocSortKey,
+    sort_fields: &[SortField],
+) -> std::cmp::Ordering {
+    for (i, sf) in sort_fields.iter().enumerate() {
+        let ordering = compare_json_values(a.vals[i].as_ref(), b.vals[i].as_ref());
+        let ordering = if sf.ascending {
+            ordering
+        } else {
+            ordering.reverse()
+        };
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+    }
+    let ordering = a.id.as_deref().cmp(&b.id.as_deref());
+    if tiebreak_ascending(sort_fields) {
+        ordering
+    } else {
+        ordering.reverse()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Lockstep pin: the decorated comparator IS compare_docs, for every
+    /// pair over a corpus covering all value buckets, missing fields,
+    /// duplicate values, and a missing `_id`.
+    #[test]
+    fn decorated_matches_compare_docs() {
+        let docs = vec![
+            json!({"_id": "a", "v": null, "w": 1}),
+            json!({"_id": "b", "v": true}),
+            json!({"_id": "c", "v": 5, "w": "x"}),
+            json!({"_id": "d", "v": 5.5}),
+            json!({"_id": "e", "v": -0.0}),
+            json!({"_id": "f", "v": 0.0}),
+            json!({"_id": "g", "v": "abc"}),
+            json!({"_id": "h", "v": ""}),
+            json!({"_id": "i", "v": [1, 2]}),
+            json!({"_id": "j", "v": {"k": 1}}),
+            json!({"_id": "k", "w": 2}),
+            json!({"v": 3}),
+            json!({"_id": "m", "v": 5}),
+        ];
+        let specs: Vec<Vec<SortField>> = vec![
+            vec![SortField {
+                field: "v".into(),
+                ascending: true,
+            }],
+            vec![SortField {
+                field: "v".into(),
+                ascending: false,
+            }],
+            vec![
+                SortField {
+                    field: "v".into(),
+                    ascending: true,
+                },
+                SortField {
+                    field: "w".into(),
+                    ascending: false,
+                },
+            ],
+            vec![],
+        ];
+        for spec in &specs {
+            let keys: Vec<DocSortKey> = docs.iter().map(|d| extract_sort_key(d, spec)).collect();
+            for (i, a) in docs.iter().enumerate() {
+                for (j, b) in docs.iter().enumerate() {
+                    assert_eq!(
+                        compare_decorated(&keys[i], &keys[j], spec),
+                        compare_docs(a, b, spec),
+                        "docs {i} vs {j} under spec {spec:?}"
+                    );
+                }
+            }
+        }
+    }
+}

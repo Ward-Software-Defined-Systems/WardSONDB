@@ -9169,3 +9169,293 @@ async fn test_fjall_window_tiling() {
     assert_eq!(or_probe["meta"]["scan_strategy"], "or_union");
     assert_eq!(or_probe["meta"]["total_count"], 20);
 }
+
+// ── H-P2: streamed FullScan pages ────────────────────────────────────────
+//
+// The full scan no longer materializes the collection. Unsorted filtered
+// pages early-exit at the limit+1 probe — total_count is omitted exactly
+// when has_more is true and exact when the scan ran out. Unfiltered pages
+// skip offset entries without parsing and take total_count from DocCounters.
+// Sorted pages keep only the offset+limit+1 smallest rows (top-K) while
+// still seeing every match, so their totals stay exact.
+
+async fn seed_full_scan_stream(client: &Client, base_url: &str) {
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "fs_stream"}))
+        .send()
+        .await
+        .unwrap();
+    for i in 0..30 {
+        let resp = client
+            .post(format!("{base_url}/fs_stream/docs"))
+            .json(&json!({
+                "_id": format!("d{i:02}"),
+                "grp": i % 3,
+                "s": i % 4,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+    }
+}
+
+async fn fs_query(client: &Client, base_url: &str, body: Value) -> Value {
+    let resp = client
+        .post(format!("{base_url}/fs_stream/query"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    resp.json().await.unwrap()
+}
+
+#[tokio::test]
+async fn test_full_scan_streamed_filtered_pages() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+    seed_full_scan_stream(&client, &base_url).await;
+
+    // grp == 0 matches d00, d03, ..., d27 — 10 of 30 docs. Page 1's probe
+    // row (the 4th match, d09) lands at the 10th parsed doc.
+    let body = fs_query(
+        &client,
+        &base_url,
+        json!({"filter": {"grp": 0}, "limit": 3}),
+    )
+    .await;
+    assert_eq!(
+        ids_of(body["data"].as_array().unwrap()),
+        ["d00", "d03", "d06"]
+    );
+    assert_eq!(body["meta"]["has_more"], true);
+    assert!(
+        body["meta"]["total_count"].is_null(),
+        "early-exited page must omit total_count"
+    );
+    assert_eq!(body["meta"]["docs_scanned"], 10);
+
+    // Mid page: skips 3 matches, keeps 3 + probe — parsed through d18.
+    let body = fs_query(
+        &client,
+        &base_url,
+        json!({"filter": {"grp": 0}, "limit": 3, "offset": 3}),
+    )
+    .await;
+    assert_eq!(
+        ids_of(body["data"].as_array().unwrap()),
+        ["d09", "d12", "d15"]
+    );
+    assert_eq!(body["meta"]["has_more"], true);
+    assert!(body["meta"]["total_count"].is_null());
+    assert_eq!(body["meta"]["docs_scanned"], 19);
+
+    // Final page: the scan runs out, so the exact total returns.
+    let body = fs_query(
+        &client,
+        &base_url,
+        json!({"filter": {"grp": 0}, "limit": 3, "offset": 9}),
+    )
+    .await;
+    assert_eq!(ids_of(body["data"].as_array().unwrap()), ["d27"]);
+    assert_ne!(
+        body["meta"]["has_more"], true,
+        "final page must not report has_more"
+    );
+    assert_eq!(body["meta"]["total_count"], 10);
+    assert_eq!(body["meta"]["docs_scanned"], 30);
+
+    // count_only is untouched: exact count, whole collection evaluated.
+    let body = fs_query(
+        &client,
+        &base_url,
+        json!({"filter": {"grp": 0}, "count_only": true}),
+    )
+    .await;
+    assert_eq!(body["meta"]["total_count"], 10);
+    assert_eq!(body["meta"]["docs_scanned"], 30);
+    assert_eq!(body["meta"]["scan_strategy"], "full_scan");
+
+    // Offset tiling with a constant filter covers every match exactly once.
+    let expected = reference_ids(
+        &client,
+        &base_url,
+        "fs_stream",
+        json!({"filter": {"grp": 0}}),
+    )
+    .await;
+    let mut tiled = Vec::new();
+    for offset in (0..12).step_by(3) {
+        let body = fs_query(
+            &client,
+            &base_url,
+            json!({"filter": {"grp": 0}, "limit": 3, "offset": offset}),
+        )
+        .await;
+        tiled.extend(ids_of(body["data"].as_array().unwrap()));
+    }
+    assert_eq!(tiled, expected);
+}
+
+#[tokio::test]
+async fn test_full_scan_unfiltered_offset_page_skips_unparsed() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+    seed_full_scan_stream(&client, &base_url).await;
+
+    // Mid-collection window: offset entries skipped without parsing —
+    // docs_scanned counts only page + probe; the total comes from DocCounters.
+    let body = fs_query(&client, &base_url, json!({"limit": 5, "offset": 10})).await;
+    assert_eq!(
+        ids_of(body["data"].as_array().unwrap()),
+        ["d10", "d11", "d12", "d13", "d14"]
+    );
+    assert_eq!(body["meta"]["total_count"], 30);
+    assert_eq!(body["meta"]["docs_scanned"], 6);
+    assert_eq!(body["meta"]["has_more"], true);
+
+    // Final window: exhaustion, no probe row beyond the end.
+    let body = fs_query(&client, &base_url, json!({"limit": 5, "offset": 25})).await;
+    assert_eq!(
+        ids_of(body["data"].as_array().unwrap()),
+        ["d25", "d26", "d27", "d28", "d29"]
+    );
+    assert_eq!(body["meta"]["total_count"], 30);
+    assert_eq!(body["meta"]["docs_scanned"], 5);
+    assert_ne!(
+        body["meta"]["has_more"], true,
+        "final page must not report has_more"
+    );
+}
+
+#[tokio::test]
+async fn test_full_scan_sorted_topk_pages_match_reference() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+    seed_full_scan_stream(&client, &base_url).await;
+
+    // s == i % 4 gives four big tie runs; ties order by _id in the last
+    // sort field's direction (asc here).
+    let body = fs_query(
+        &client,
+        &base_url,
+        json!({"sort": [{"s": "asc"}], "limit": 7}),
+    )
+    .await;
+    assert_eq!(
+        ids_of(body["data"].as_array().unwrap()),
+        ["d00", "d04", "d08", "d12", "d16", "d20", "d24"]
+    );
+    assert_eq!(body["meta"]["total_count"], 30, "top-K keeps exact totals");
+    assert_eq!(body["meta"]["has_more"], true);
+    assert!(
+        body["meta"]["next_cursor"].is_string(),
+        "sorted pages still emit cursors"
+    );
+
+    // Descending flips the tiebreak with the direction.
+    let body = fs_query(
+        &client,
+        &base_url,
+        json!({"sort": [{"s": "desc"}], "limit": 3}),
+    )
+    .await;
+    assert_eq!(
+        ids_of(body["data"].as_array().unwrap()),
+        ["d27", "d23", "d19"]
+    );
+
+    // Offset tiling over the sorted order equals the one-shot.
+    let expected = reference_ids(
+        &client,
+        &base_url,
+        "fs_stream",
+        json!({"sort": [{"s": "asc"}]}),
+    )
+    .await;
+    let mut tiled = Vec::new();
+    for offset in (0..35).step_by(7) {
+        let body = fs_query(
+            &client,
+            &base_url,
+            json!({"sort": [{"s": "asc"}], "limit": 7, "offset": offset}),
+        )
+        .await;
+        tiled.extend(ids_of(body["data"].as_array().unwrap()));
+    }
+    assert_eq!(tiled, expected);
+
+    // Filtered + sorted: every match is still seen, totals stay exact.
+    let body = fs_query(
+        &client,
+        &base_url,
+        json!({"filter": {"grp": 0}, "sort": [{"s": "desc"}], "limit": 4}),
+    )
+    .await;
+    assert_eq!(body["meta"]["total_count"], 10);
+    assert_eq!(body["meta"]["docs_scanned"], 30);
+    assert_eq!(body["meta"]["has_more"], true);
+}
+
+#[tokio::test]
+async fn test_fjall_full_scan_streamed_pages() {
+    let (base_url, _tmp) = start_test_server_with_engine("fjall").await;
+    let client = Client::new();
+    seed_full_scan_stream(&client, &base_url).await;
+
+    let body = fs_query(
+        &client,
+        &base_url,
+        json!({"filter": {"grp": 0}, "limit": 3}),
+    )
+    .await;
+    assert_eq!(
+        ids_of(body["data"].as_array().unwrap()),
+        ["d00", "d03", "d06"]
+    );
+    assert!(body["meta"]["total_count"].is_null());
+    assert_eq!(body["meta"]["docs_scanned"], 10);
+
+    let body = fs_query(
+        &client,
+        &base_url,
+        json!({"filter": {"grp": 0}, "limit": 3, "offset": 9}),
+    )
+    .await;
+    assert_eq!(ids_of(body["data"].as_array().unwrap()), ["d27"]);
+    assert_eq!(body["meta"]["total_count"], 10);
+
+    let expected = reference_ids(
+        &client,
+        &base_url,
+        "fs_stream",
+        json!({"filter": {"grp": 0}}),
+    )
+    .await;
+    let mut tiled = Vec::new();
+    for offset in (0..12).step_by(3) {
+        let body = fs_query(
+            &client,
+            &base_url,
+            json!({"filter": {"grp": 0}, "limit": 3, "offset": offset}),
+        )
+        .await;
+        tiled.extend(ids_of(body["data"].as_array().unwrap()));
+    }
+    assert_eq!(tiled, expected);
+
+    // Sorted top-K on fjall.
+    let body = fs_query(
+        &client,
+        &base_url,
+        json!({"sort": [{"s": "asc"}], "limit": 7}),
+    )
+    .await;
+    assert_eq!(
+        ids_of(body["data"].as_array().unwrap()),
+        ["d00", "d04", "d08", "d12", "d16", "d20", "d24"]
+    );
+    assert_eq!(body["meta"]["total_count"], 30);
+}

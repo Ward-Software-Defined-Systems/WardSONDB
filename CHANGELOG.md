@@ -11,6 +11,20 @@ first tagged version.
 
 Behavior changes an existing client could observe, most significant first.
 
+- **Streaming scans: `total_count` is omitted on early-exited filtered
+  pages.** Unsorted filtered pages now stop scanning once the page plus one
+  probe row is full, so `meta.total_count` appears only when the scan ran to
+  natural exhaustion — omitted exactly when `has_more` is `true` (single-page
+  results, final pages, `count_only`, sorted queries, and unfiltered pages
+  all keep exact counts; unfiltered full-scan pages serve theirs from the
+  document counter). Page contents, ordering, offset tiling, and `has_more`
+  exactness are unchanged.
+- **`meta.docs_scanned` now reports documents actually loaded and parsed.**
+  Early-exited pages report the (smaller) number of documents visited before
+  the page filled; unfiltered full-scan pages skip `offset` entries without
+  parsing them and report only the page window; the three paths that
+  previously reported the raw candidate count (indexed, compound-range, and
+  `$or`-union materializing pages) now match the rest.
 - **Numeric `-1` sort direction on `/query` now sorts descending.** It was
   silently accepted and sorted ASCENDING. Clients calibrated to the buggy
   order will see reversed results with no error.
