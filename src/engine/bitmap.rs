@@ -226,11 +226,29 @@ impl Default for AcceleratorConfig {
     }
 }
 
+/// One CRUD delta captured while a rebuild owns the maps (S2-1). The doc
+/// values are cloned — the cost only exists during rebuild windows.
+enum PendingOp {
+    Insert(String, Value),
+    Delete(String, Value),
+    Update(String, Value, Value),
+}
+
 pub struct ScanAccelerator {
     /// One BitmapColumn per tracked field.
     columns: RwLock<HashMap<String, BitmapColumn>>,
     /// Row position <-> document ID mapping.
     pub positions: RowPositionMap,
+    /// True while a rebuild owns the maps: CRUD hooks queue their deltas in
+    /// `pending` instead of touching state the rebuild is clearing and
+    /// re-filling (S2-1 — hooks used to keep assigning positions from the
+    /// live counter while `clear()` reset it, dropping or colliding
+    /// positions for the whole rebuild window). Only `finish_rebuild` clears
+    /// the flag, under the `pending` lock.
+    rebuild_active: AtomicBool,
+    /// Deltas that arrived during the rebuild window, drained idempotently
+    /// by `finish_rebuild` before the accelerator serves again.
+    pending: parking_lot::Mutex<Vec<PendingOp>>,
     /// Configuration.
     config: RwLock<AcceleratorConfig>,
     /// Cached copy of `config.max_cardinality` — read on every insert/update,
@@ -263,6 +281,8 @@ impl ScanAccelerator {
         ScanAccelerator {
             columns,
             positions: RowPositionMap::new(),
+            rebuild_active: AtomicBool::new(false),
+            pending: parking_lot::Mutex::new(Vec::new()),
             config: RwLock::new(config),
             max_cardinality,
             ready: AtomicBool::new(false),
@@ -270,6 +290,22 @@ impl ScanAccelerator {
             over_budget: AtomicBool::new(false),
             cached_memory_bytes: AtomicU64::new(0),
         }
+    }
+
+    /// True when the hook must queue instead of applying live. The re-check
+    /// under the queue lock closes the drain boundary: `finish_rebuild`
+    /// drains and clears the flag while holding `pending`, so an op can
+    /// neither land in a drained queue nor race the flag.
+    fn queue_if_rebuilding(&self, op: impl FnOnce() -> PendingOp) -> bool {
+        if !self.rebuild_active.load(Ordering::Acquire) {
+            return false;
+        }
+        let mut q = self.pending.lock();
+        if self.rebuild_active.load(Ordering::Acquire) {
+            q.push(op());
+            return true;
+        }
+        false
     }
 
     /// Set the per-column cardinality cap, keeping the hot-path atomic cache
@@ -348,6 +384,13 @@ impl ScanAccelerator {
 
     /// Called after a document insert transaction commits.
     pub fn on_insert(&self, doc_id: &str, doc: &Value) {
+        if self.queue_if_rebuilding(|| PendingOp::Insert(doc_id.to_string(), doc.clone())) {
+            return;
+        }
+        self.insert_live(doc_id, doc);
+    }
+
+    fn insert_live(&self, doc_id: &str, doc: &Value) {
         let pos = match self.positions.assign(doc_id) {
             Some(p) => p,
             None => return,
@@ -444,6 +487,13 @@ impl ScanAccelerator {
 
     /// Called after a document delete transaction commits.
     pub fn on_delete(&self, doc_id: &str, doc: &Value) {
+        if self.queue_if_rebuilding(|| PendingOp::Delete(doc_id.to_string(), doc.clone())) {
+            return;
+        }
+        self.delete_live(doc_id, doc);
+    }
+
+    fn delete_live(&self, doc_id: &str, doc: &Value) {
         let pos = match self.positions.get_position(doc_id) {
             Some(p) => p,
             None => return,
@@ -485,6 +535,15 @@ impl ScanAccelerator {
     /// Called after a document update transaction commits.
     /// Uses a single write lock acquisition per column.
     pub fn on_update(&self, doc_id: &str, old_doc: &Value, new_doc: &Value) {
+        if self.queue_if_rebuilding(|| {
+            PendingOp::Update(doc_id.to_string(), old_doc.clone(), new_doc.clone())
+        }) {
+            return;
+        }
+        self.update_live(doc_id, old_doc, new_doc);
+    }
+
+    fn update_live(&self, doc_id: &str, old_doc: &Value, new_doc: &Value) {
         let pos = match self.positions.get_position(doc_id) {
             Some(p) => p,
             None => return,
@@ -570,38 +629,89 @@ impl ScanAccelerator {
         self.profiler.reset();
     }
 
+    /// Enter rebuild mode: queries already fall back (ready flips false),
+    /// CRUD hooks switch to the pending queue, and only then are the maps
+    /// cleared — nothing can assign a position against a counter that is
+    /// about to reset (S2-1).
+    pub fn begin_rebuild(&self) {
+        self.set_ready(false);
+        {
+            let mut q = self.pending.lock();
+            q.clear();
+            self.rebuild_active.store(true, Ordering::Release);
+        }
+        self.clear();
+    }
+
+    /// Drain the deltas that arrived during the rebuild window
+    /// (idempotently — the scan may have already indexed some of them),
+    /// leave rebuild mode, and start serving. The drain holds the queue
+    /// lock, so hooks block for its (bounded) duration and then observe
+    /// `rebuild_active == false`; nothing can slip between drain and flag.
+    pub fn finish_rebuild(&self) {
+        let mut q = self.pending.lock();
+        for op in q.drain(..) {
+            match op {
+                PendingOp::Insert(id, doc) => {
+                    // The scan indexes any doc committed before it visited
+                    // the doc's key — insert-if-absent keeps one position.
+                    if self.positions.get_position(&id).is_none() {
+                        self.insert_live(&id, &doc);
+                    }
+                }
+                // delete_live no-ops when the scan never saw the doc.
+                PendingOp::Delete(id, doc) => self.delete_live(&id, &doc),
+                PendingOp::Update(id, old, new) => {
+                    if self.positions.get_position(&id).is_some() {
+                        // Bitmap ops are idempotent, so this is safe whether
+                        // the scan saw the old or the new value.
+                        self.update_live(&id, &old, &new);
+                    } else {
+                        // The scan never saw the doc (inserted mid-scan past
+                        // its region, then updated) — index its new state.
+                        self.insert_live(&id, &new);
+                    }
+                }
+            }
+        }
+        self.rebuild_active.store(false, Ordering::Release);
+        drop(q);
+        self.set_ready(true);
+    }
+
     /// Rebuild the accelerator from all documents in storage (used by benchmarks).
     #[allow(dead_code)]
     pub fn rebuild_from_storage(&self, docs: &[(String, Value)]) {
-        self.ready.store(false, Ordering::Release);
+        self.begin_rebuild();
 
         let start = std::time::Instant::now();
-        for (doc_id, doc) in docs {
-            self.on_insert(doc_id, doc);
-        }
+        self.rebuild_batch(docs);
 
         let elapsed = start.elapsed();
         let count = docs.len();
-        let cols = self.columns.read();
-        let col_names: Vec<&str> = cols.keys().map(|s| s.as_str()).collect();
-        info!(
-            docs = count,
-            elapsed_ms = elapsed.as_millis(),
-            fields = ?col_names,
-            "Scan accelerator rebuilt"
-        );
+        {
+            let cols = self.columns.read();
+            let col_names: Vec<&str> = cols.keys().map(|s| s.as_str()).collect();
+            info!(
+                docs = count,
+                elapsed_ms = elapsed.as_millis(),
+                fields = ?col_names,
+                "Scan accelerator rebuilt"
+            );
+        }
 
-        self.ready.store(true, Ordering::Release);
+        self.finish_rebuild();
     }
 
-    /// Process a batch of documents during incremental rebuild.
-    /// Stops early if the memory budget is exceeded.
+    /// Process a batch of documents during incremental rebuild. Applies
+    /// LIVE (this is the rebuild's own feed — it must not queue against
+    /// itself). Stops early if the memory budget is exceeded.
     pub fn rebuild_batch(&self, docs: &[(String, Value)]) {
         for (doc_id, doc) in docs {
             if self.over_budget.load(Ordering::Relaxed) {
                 return;
             }
-            self.on_insert(doc_id, doc);
+            self.insert_live(doc_id, doc);
         }
     }
 
@@ -1306,6 +1416,79 @@ mod tests {
             .exists_bitmap
             .read()
             .len()
+    }
+
+    fn eq_filter(field: &str, value: Value) -> crate::query::filter::FilterNode {
+        crate::query::filter::FilterNode::Comparison {
+            field: field.to_string(),
+            op: crate::query::filter::FilterOp::Eq,
+            value,
+        }
+    }
+
+    /// S2-1: CRUD hooks firing during a rebuild land in the pending queue —
+    /// never in the maps the rebuild is clearing — and the drain applies
+    /// them idempotently before the accelerator serves again.
+    #[test]
+    fn rebuild_queues_hooks_and_drains_idempotently() {
+        let a = accel(&["f"]);
+        a.on_insert("a", &json!({"f": "x"}));
+        a.on_insert("b", &json!({"f": "y"}));
+
+        a.begin_rebuild();
+        assert!(!a.is_ready());
+
+        // Concurrent-writer stand-ins while the rebuild owns the maps:
+        // a brand-new doc the scan will never see, a delete of a doc the
+        // scan WILL see, and an update of a doc the scan sees (new value).
+        a.on_insert("c", &json!({"f": "x"}));
+        a.on_delete("b", &json!({"f": "y"}));
+        a.on_update("a", &json!({"f": "x"}), &json!({"f": "z"}));
+        assert_eq!(
+            a.positions.len(),
+            0,
+            "hooks must not touch the cleared maps mid-rebuild"
+        );
+
+        // The "scan": storage at visit time still shows a (already updated
+        // to z — scans read post-commit state) and b (its delete raced in
+        // after the scan passed it).
+        a.rebuild_batch(&[
+            ("a".to_string(), json!({"f": "z"})),
+            ("b".to_string(), json!({"f": "y"})),
+        ]);
+        a.finish_rebuild();
+        assert!(a.is_ready());
+
+        // a: seen by scan, update drained idempotently (stays at z, once).
+        // b: drained delete removed it. c: drained insert added it.
+        assert_eq!(a.positions.len(), 2);
+        assert!(a.positions.get_position("a").is_some());
+        assert!(a.positions.get_position("b").is_none());
+        assert!(a.positions.get_position("c").is_some());
+
+        let z = a.bitmap_scan(&eq_filter("f", json!("z"))).unwrap();
+        assert_eq!(z.bitmap.len(), 1, "a counted exactly once under z");
+        let x = a.bitmap_scan(&eq_filter("f", json!("x"))).unwrap();
+        assert_eq!(x.bitmap.len(), 1, "c counted exactly once under x");
+        let y = a.bitmap_scan(&eq_filter("f", json!("y"))).unwrap();
+        assert_eq!(y.bitmap.len(), 0, "b fully gone");
+    }
+
+    /// S2-1 dedup: a doc whose insert-hook fired mid-rebuild AND was seen by
+    /// the scan (committed before the scan reached it) gets exactly one
+    /// position — the drain inserts only if absent.
+    #[test]
+    fn rebuild_drain_dedups_scan_seen_insert() {
+        let a = accel(&["f"]);
+        a.begin_rebuild();
+        a.on_insert("dup", &json!({"f": "x"}));
+        a.rebuild_batch(&[("dup".to_string(), json!({"f": "x"}))]);
+        a.finish_rebuild();
+
+        assert_eq!(a.positions.len(), 1);
+        let x = a.bitmap_scan(&eq_filter("f", json!("x"))).unwrap();
+        assert_eq!(x.bitmap.len(), 1, "one position, one bit");
     }
 
     /// The invariant that lets on_delete keep the exists write lock inside

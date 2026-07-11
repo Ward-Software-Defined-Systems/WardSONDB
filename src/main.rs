@@ -347,10 +347,11 @@ fn rebuild_all_accelerators(storage: &Storage) {
         }
     };
 
-    storage.scan_accelerator.set_ready(false);
-    storage.scan_accelerator.clear();
+    // Hooks queue their deltas from here until finish_rebuild drains them —
+    // the maps are cleared and re-filled without live writers in them.
+    storage.scan_accelerator.begin_rebuild();
 
-    // Re-create columns after clear
+    // Re-create columns after the clear
     let fields = storage.scan_accelerator.config_read().bitmap_fields.clone();
     if !fields.is_empty() {
         storage.scan_accelerator.configure_fields(fields);
@@ -409,7 +410,7 @@ fn rebuild_all_accelerators(storage: &Storage) {
         elapsed_ms = start.elapsed().as_millis(),
         "Scan accelerator rebuilt (batched)"
     );
-    storage.scan_accelerator.set_ready(true);
+    storage.scan_accelerator.finish_rebuild();
 }
 
 /// Check the OS file descriptor limit and warn if too low.
