@@ -10258,3 +10258,128 @@ async fn test_randomized_walk_and_tiling_equivalence() {
         }
     }
 }
+
+/// DT-22 (bundled with S2-1..5): deletes punch holes in the bitmap position
+/// map — the windowed bitmap path and the cursor walk must skip holes
+/// without consuming the window: pages contain exactly the survivors, and
+/// tiling still equals the one-shot.
+#[tokio::test]
+async fn test_bitmap_window_walk_with_holes() {
+    let (base_url, _tmp) = start_test_server_with_bitmap("kind").await;
+    let client = Client::new();
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "holey"}))
+        .send()
+        .await
+        .unwrap();
+    for i in 0..20 {
+        client
+            .post(format!("{base_url}/holey/docs"))
+            .json(&json!({"_id": format!("d{i:02}"), "kind": if i % 2 == 0 { "a" } else { "b" }, "i": i}))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    // The bitmap path must actually serve this filter.
+    let probe: Value = client
+        .post(format!("{base_url}/holey/query"))
+        .json(&json!({"filter": {"kind": "a"}, "count_only": true}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(probe["meta"]["scan_strategy"], "bitmap");
+    assert_eq!(probe["meta"]["total_count"], 10);
+
+    // Punch holes: delete 4 of the kind=a docs (positions stay allocated,
+    // slots go None) and 2 of kind=b for good measure.
+    for id in ["d00", "d08", "d12", "d16", "d03", "d11"] {
+        let resp = client
+            .delete(format!("{base_url}/holey/docs/{id}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "delete {id}");
+    }
+
+    // One-shot over the survivors, in insertion-position order.
+    let one_shot: Value = client
+        .post(format!("{base_url}/holey/query"))
+        .json(&json!({"filter": {"kind": "a"}, "limit": 100}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let survivors = ids_of(one_shot["data"].as_array().unwrap());
+    assert_eq!(survivors, ["d02", "d04", "d06", "d10", "d14", "d18"]);
+    assert_eq!(one_shot["meta"]["total_count"], 6);
+
+    // Windowed tiling across the holes equals the one-shot — resolve_window
+    // must skip hole positions without consuming the window.
+    let mut tiled: Vec<String> = Vec::new();
+    for offset in (0..9).step_by(3) {
+        let page: Value = client
+            .post(format!("{base_url}/holey/query"))
+            .json(&json!({"filter": {"kind": "a"}, "limit": 3, "offset": offset}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(page["meta"]["scan_strategy"], "bitmap");
+        tiled.extend(ids_of(page["data"].as_array().unwrap()));
+    }
+    assert_eq!(tiled, survivors, "tiling over holes == one-shot");
+
+    // Cursor walk over the bitmap path (deterministic _id re-sort) with
+    // MORE holes punched mid-walk: already-returned deletions must not
+    // disturb later pages; a deleted-ahead doc must not appear.
+    let page1: Value = client
+        .post(format!("{base_url}/holey/query"))
+        .json(&json!({"filter": {"kind": "a"}, "sort": [{"_id": "asc"}], "limit": 2}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(ids_of(page1["data"].as_array().unwrap()), ["d02", "d04"]);
+    let mut cursor = page1["meta"]["next_cursor"].as_str().unwrap().to_string();
+    // Delete one already-returned (d02) and one ahead (d14).
+    for id in ["d02", "d14"] {
+        client
+            .delete(format!("{base_url}/holey/docs/{id}"))
+            .send()
+            .await
+            .unwrap();
+    }
+    let mut walked: Vec<String> = vec!["d02".into(), "d04".into()];
+    for _ in 0..10 {
+        let body: Value = client
+            .post(format!("{base_url}/holey/query"))
+            .json(&json!({"filter": {"kind": "a"}, "sort": [{"_id": "asc"}], "limit": 2, "cursor": cursor}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        walked.extend(ids_of(body["data"].as_array().unwrap()));
+        match body["meta"]["next_cursor"].as_str() {
+            Some(c) => cursor = c.to_string(),
+            None => break,
+        }
+    }
+    assert_eq!(
+        walked,
+        ["d02", "d04", "d06", "d10", "d18"],
+        "holes skipped; deleted-ahead doc absent; no dups"
+    );
+}
