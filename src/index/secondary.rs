@@ -549,4 +549,38 @@ mod tests {
             RangeScanBounds::Empty
         );
     }
+
+    /// DT-7: the general trailing-0xFF loop and the all-0xFF sentinel.
+    /// Planner-built prefixes always end with a 0x00/0x01 separator (the
+    /// plain-bump case); the rest is pinned here so a future caller with
+    /// arbitrary prefixes inherits documented behavior.
+    #[test]
+    fn prefix_successor_bumps_pops_and_sentinels() {
+        // Plain bump of the last byte.
+        assert_eq!(prefix_successor(&[0x01, 0x02]), vec![0x01, 0x03]);
+        assert_eq!(prefix_successor(&[0x00]), vec![0x01]);
+        // Trailing 0xFF bytes pop until a bumpable byte is found.
+        assert_eq!(prefix_successor(&[0x01, 0xFF]), vec![0x02]);
+        assert_eq!(prefix_successor(&[0x01, 0xFF, 0xFF]), vec![0x02]);
+        // All-0xFF has no finite successor: maximal sentinel, one byte longer.
+        assert_eq!(prefix_successor(&[0xFF]), vec![0xFF, 0xFF]);
+        assert_eq!(prefix_successor(&[0xFF, 0xFF]), vec![0xFF; 3]);
+        // Empty prefix (every key matches it) also takes the sentinel arm.
+        assert_eq!(prefix_successor(&[]), vec![0xFF]);
+
+        // The load-bearing property for the bumpable cases: the successor is
+        // strictly greater than every key extending the prefix.
+        for prefix in [&[0x01u8, 0x02][..], &[0x01, 0xFF], &[0x00]] {
+            let succ = prefix_successor(prefix);
+            assert!(succ.as_slice() > prefix);
+            for ext in [&[0x00u8][..], &[0x7F], &[0xFF], &[0xFF, 0xFF]] {
+                let mut key = prefix.to_vec();
+                key.extend_from_slice(ext);
+                assert!(
+                    key < succ,
+                    "extension {key:?} must sort below successor {succ:?}"
+                );
+            }
+        }
+    }
 }

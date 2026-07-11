@@ -484,6 +484,43 @@ mod tests {
         });
     }
 
+    /// DT-6/DT-21 remainders: window edges beyond the data, and the count
+    /// methods' documented empty-prefix / inverted-range semantics.
+    #[test]
+    fn scan_and_count_edges() {
+        for_each_engine(|engine| {
+            let p = seed(engine);
+
+            // end beyond the last key: forward covers the tail, reverse
+            // starts from the actual last key.
+            let got = collect_visited(|v| engine.scan_range(&p, b"b:05", b"zzzz", v));
+            assert_eq!(got.len(), 5, "b:05..b:09");
+            let got = collect_visited(|v| engine.scan_range_rev(&p, b"a:05", b"zzzz", v));
+            assert_eq!(got.len(), 15, "a:05..a:09 + all of b: descending");
+            assert_eq!(
+                got.first().map(|(k, _)| k.as_slice()),
+                Some(b"b:09".as_ref())
+            );
+            assert_eq!(
+                got.last().map(|(k, _)| k.as_slice()),
+                Some(b"a:05".as_ref())
+            );
+
+            // Empty window between two real keys.
+            let got = collect_visited(|v| engine.scan_range(&p, b"a:05a", b"a:06", v));
+            assert!(got.is_empty());
+
+            // Counts: empty prefix = whole partition; no-match prefix = 0;
+            // half-open range; inverted range guarded to zero.
+            assert_eq!(engine.count_prefix(&p, b"").unwrap(), 20);
+            assert_eq!(engine.count_prefix(&p, b"a:").unwrap(), 10);
+            assert_eq!(engine.count_prefix(&p, b"zz").unwrap(), 0);
+            assert_eq!(engine.count_range(&p, b"a:03", b"a:07").unwrap(), 4);
+            assert_eq!(engine.count_range(&p, b"a:07", b"a:03").unwrap(), 0);
+            assert_eq!(engine.count_range(&p, b"a:05", b"a:05").unwrap(), 0);
+        });
+    }
+
     #[test]
     fn scan_break_stops_early() {
         for_each_engine(|engine| {
