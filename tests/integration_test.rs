@@ -9679,3 +9679,582 @@ async fn test_collection_drop_recreate_cycle_both_engines() {
         );
     }
 }
+
+// ── Queue #5: test-debt sweep (DT-2/3/4/5/10/12/17/18) ──────────────────
+
+/// DT-5: custom `_id`s mixed with server UUIDs inside cursor walks — sorted
+/// (dup values force `_id` tiebreaks across id "styles") and no-sort walks
+/// both concatenate to the one-shot reference.
+#[tokio::test]
+async fn test_cursor_walks_with_mixed_custom_ids() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "walk_ids"}))
+        .send()
+        .await
+        .unwrap();
+    for i in 0..12 {
+        let mut doc = json!({"s": i % 3, "n": i});
+        if i % 2 == 0 {
+            doc["_id"] = json!(format!("cust-{i:02}"));
+        }
+        let resp = client
+            .post(format!("{base_url}/walk_ids/docs"))
+            .json(&doc)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201);
+    }
+
+    let reference = reference_ids(
+        &client,
+        &base_url,
+        "walk_ids",
+        json!({"sort": [{"s": "asc"}]}),
+    )
+    .await;
+    let walked = cursor_walk(
+        &client,
+        &base_url,
+        "walk_ids",
+        json!({"sort": [{"s": "asc"}], "limit": 4}),
+    )
+    .await;
+    assert_eq!(ids_of(&walked), reference, "sorted walk with mixed ids");
+
+    let reference = reference_ids(&client, &base_url, "walk_ids", json!({})).await;
+    let walked = cursor_walk(&client, &base_url, "walk_ids", json!({"limit": 5})).await;
+    assert_eq!(ids_of(&walked), reference, "no-sort id walk with mixed ids");
+}
+
+/// DT-12: projection that strips the sort field, riding the index_sorted
+/// SEEK path across cursor resumes — the cursor is built pre-projection, so
+/// every page must stay on the fast path AND return only projected fields.
+#[tokio::test]
+async fn test_index_sorted_cursor_walk_with_projection() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+    seed_index_sorted_collection(&client, &base_url).await;
+
+    let unprojected = reference_ids(
+        &client,
+        &base_url,
+        "events",
+        json!({"filter": {"event_type": "fw"}, "sort": [{"received_at": "asc"}]}),
+    )
+    .await;
+
+    let mut collected: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..20 {
+        let mut req = json!({
+            "filter": {"event_type": "fw"},
+            "sort": [{"received_at": "asc"}],
+            "limit": 4,
+            "fields": ["event_type"]
+        });
+        if let Some(c) = &cursor {
+            req["cursor"] = json!(c);
+        }
+        let body: Value = client
+            .post(format!("{base_url}/events/query"))
+            .json(&req)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            body["meta"]["scan_strategy"], "index_sorted",
+            "every page (incl. resumes) stays on the seek path"
+        );
+        for doc in body["data"].as_array().unwrap() {
+            let keys: Vec<&str> = doc
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(|k| k.as_str())
+                .collect();
+            assert_eq!(
+                keys.len(),
+                2,
+                "projected doc has only _id + event_type: {doc}"
+            );
+            assert!(doc.get("received_at").is_none(), "sort field stripped");
+            collected.push(doc["_id"].as_str().unwrap().to_string());
+        }
+        match body["meta"]["next_cursor"].as_str() {
+            Some(c) => cursor = Some(c.to_string()),
+            None => break,
+        }
+    }
+    assert_eq!(
+        collected, unprojected,
+        "projection must not disturb the walk"
+    );
+}
+
+/// DT-2: inserts landing mid-walk. Strictly-after semantics: a doc inserted
+/// BEHIND the cursor position never appears; one inserted AHEAD appears
+/// exactly once.
+#[tokio::test]
+async fn test_cursor_walk_insert_mid_pagination() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "ins_walk"}))
+        .send()
+        .await
+        .unwrap();
+    for i in 1..=10 {
+        client
+            .post(format!("{base_url}/ins_walk/docs"))
+            .json(&json!({"_id": format!("d{i:02}"), "s": i * 10}))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let page1: Value = client
+        .post(format!("{base_url}/ins_walk/query"))
+        .json(&json!({"sort": [{"s": "asc"}], "limit": 3}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let mut seen: Vec<i64> = page1["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["s"].as_i64().unwrap())
+        .collect();
+    assert_eq!(seen, [10, 20, 30]);
+    let mut cursor = page1["meta"]["next_cursor"].as_str().unwrap().to_string();
+
+    // Insert behind the cursor (s=15) and ahead of it (s=55).
+    for (id, s) in [("x-behind", 15), ("x-ahead", 55)] {
+        client
+            .post(format!("{base_url}/ins_walk/docs"))
+            .json(&json!({"_id": id, "s": s}))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let mut remaining_ids: Vec<String> = Vec::new();
+    for _ in 0..10 {
+        let body: Value = client
+            .post(format!("{base_url}/ins_walk/query"))
+            .json(&json!({"sort": [{"s": "asc"}], "limit": 3, "cursor": cursor}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        for doc in body["data"].as_array().unwrap() {
+            seen.push(doc["s"].as_i64().unwrap());
+            remaining_ids.push(doc["_id"].as_str().unwrap().to_string());
+        }
+        match body["meta"]["next_cursor"].as_str() {
+            Some(c) => cursor = c.to_string(),
+            None => break,
+        }
+    }
+    assert_eq!(
+        seen,
+        [10, 20, 30, 40, 50, 55, 60, 70, 80, 90, 100],
+        "behind-insert invisible, ahead-insert exactly once"
+    );
+    assert!(!remaining_ids.contains(&"x-behind".to_string()));
+    assert_eq!(
+        remaining_ids.iter().filter(|id| *id == "x-ahead").count(),
+        1
+    );
+}
+
+/// DT-3: updates moving docs across the cursor boundary. Documented
+/// semantics (API.md): moved-behind may be skipped, moved-ahead may
+/// re-surface — but never duplicated within the remaining walk.
+#[tokio::test]
+async fn test_cursor_walk_update_across_boundary() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "upd_walk"}))
+        .send()
+        .await
+        .unwrap();
+    for i in 1..=10 {
+        client
+            .post(format!("{base_url}/upd_walk/docs"))
+            .json(&json!({"_id": format!("d{i:02}"), "s": i * 10}))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let page1: Value = client
+        .post(format!("{base_url}/upd_walk/query"))
+        .json(&json!({"sort": [{"s": "asc"}], "limit": 3}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        ids_of(page1["data"].as_array().unwrap()),
+        ["d01", "d02", "d03"]
+    );
+    let mut cursor = page1["meta"]["next_cursor"].as_str().unwrap().to_string();
+
+    // d05 (s=50, ahead) moves BEHIND the cursor; d02 (s=20, already
+    // returned) moves AHEAD to s=75.
+    client
+        .patch(format!("{base_url}/upd_walk/docs/d05"))
+        .json(&json!({"s": 5}))
+        .send()
+        .await
+        .unwrap();
+    client
+        .patch(format!("{base_url}/upd_walk/docs/d02"))
+        .json(&json!({"s": 75}))
+        .send()
+        .await
+        .unwrap();
+
+    let mut remaining: Vec<String> = Vec::new();
+    for _ in 0..10 {
+        let body: Value = client
+            .post(format!("{base_url}/upd_walk/query"))
+            .json(&json!({"sort": [{"s": "asc"}], "limit": 3, "cursor": cursor}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        remaining.extend(ids_of(body["data"].as_array().unwrap()));
+        match body["meta"]["next_cursor"].as_str() {
+            Some(c) => cursor = c.to_string(),
+            None => break,
+        }
+    }
+    assert_eq!(
+        remaining,
+        ["d04", "d06", "d07", "d02", "d08", "d09", "d10"],
+        "strictly-after order over the NEW values"
+    );
+    assert!(
+        !remaining.contains(&"d05".to_string()),
+        "moved-behind doc is skipped (documented)"
+    );
+    assert_eq!(
+        remaining.iter().filter(|id| *id == "d02").count(),
+        1,
+        "moved-ahead doc re-surfaces exactly once (documented)"
+    );
+}
+
+/// DT-4: a cursor carrying a Missing sort value must NOT route to the index
+/// seek even when a covering compound index exists (created mid-walk here —
+/// the only way such a cursor can meet such an index, since index_sorted
+/// pages never contain missing-field docs).
+#[tokio::test]
+async fn test_missing_sort_cursor_avoids_index_seek() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "miss_walk"}))
+        .send()
+        .await
+        .unwrap();
+    // d01 lacks `score` entirely; Missing sorts before every present value.
+    client
+        .post(format!("{base_url}/miss_walk/docs"))
+        .json(&json!({"_id": "d01", "event_type": "x"}))
+        .send()
+        .await
+        .unwrap();
+    for i in 2..=5 {
+        client
+            .post(format!("{base_url}/miss_walk/docs"))
+            .json(&json!({"_id": format!("d{i:02}"), "event_type": "x", "score": i}))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let page1: Value = client
+        .post(format!("{base_url}/miss_walk/query"))
+        .json(&json!({"filter": {"event_type": "x"}, "sort": [{"score": "asc"}], "limit": 1}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(ids_of(page1["data"].as_array().unwrap()), ["d01"]);
+    let mut cursor = page1["meta"]["next_cursor"]
+        .as_str()
+        .expect("boundary doc with Missing sort value still yields a cursor")
+        .to_string();
+
+    // NOW create a compound index covering filter + sort: the planner must
+    // still refuse the seek for this cursor (its position isn't an index key).
+    client
+        .post(format!("{base_url}/miss_walk/indexes"))
+        .json(&json!({"name": "idx_type_score", "fields": ["event_type", "score"]}))
+        .send()
+        .await
+        .unwrap();
+
+    let mut walked = vec!["d01".to_string()];
+    let mut missing_cursor_resume = true;
+    for _ in 0..10 {
+        let body: Value = client
+            .post(format!("{base_url}/miss_walk/query"))
+            .json(&json!({
+                "filter": {"event_type": "x"},
+                "sort": [{"score": "asc"}],
+                "limit": 1,
+                "cursor": cursor
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if missing_cursor_resume {
+            // Only THIS resume carries the Missing value; once the boundary
+            // doc has the field, later cursors may legitimately re-enter the
+            // index_sorted seek (and do — pinned below).
+            assert_ne!(
+                body["meta"]["scan_strategy"], "index_sorted",
+                "Missing-valued cursor must fall back off the seek path"
+            );
+            missing_cursor_resume = false;
+        } else {
+            assert_eq!(
+                body["meta"]["scan_strategy"], "index_sorted",
+                "Present-valued cursors re-enter the seek path"
+            );
+        }
+        walked.extend(ids_of(body["data"].as_array().unwrap()));
+        match body["meta"]["next_cursor"].as_str() {
+            Some(c) => cursor = c.to_string(),
+            None => break,
+        }
+    }
+    assert_eq!(
+        walked,
+        ["d01", "d02", "d03", "d04", "d05"],
+        "no loss, no dups"
+    );
+}
+
+/// DT-17 remainder: concurrent bulk inserts racing delete_by_query must
+/// leave DocCounters exactly agreeing with a full evaluation.
+#[tokio::test]
+async fn test_doc_counter_concurrent_bulk_and_delete_by_query() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "ctr_race"}))
+        .send()
+        .await
+        .unwrap();
+
+    let mut handles = Vec::new();
+    for t in 0..3u64 {
+        let client = client.clone();
+        let base = base_url.clone();
+        handles.push(tokio::spawn(async move {
+            for round in 0..5 {
+                let docs: Vec<Value> = (0..40)
+                    .map(|i| json!({"grp": t, "round": round, "i": i}))
+                    .collect();
+                client
+                    .post(format!("{base}/ctr_race/docs/_bulk"))
+                    .json(&json!({"documents": docs}))
+                    .send()
+                    .await
+                    .unwrap();
+            }
+        }));
+    }
+    for t in 0..2u64 {
+        let client = client.clone();
+        let base = base_url.clone();
+        handles.push(tokio::spawn(async move {
+            for _ in 0..4 {
+                client
+                    .post(format!("{base}/ctr_race/docs/_delete_by_query"))
+                    .json(&json!({"filter": {"grp": t}}))
+                    .send()
+                    .await
+                    .unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }));
+    }
+    for h in handles {
+        h.await.unwrap();
+    }
+
+    let counter: Value = client
+        .post(format!("{base_url}/ctr_race/query"))
+        .json(&json!({"count_only": true}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(counter["meta"]["scan_strategy"], "doc_counter");
+    let full: Value = client
+        .post(format!("{base_url}/ctr_race/query"))
+        .json(&json!({"filter": {"_id": {"$exists": true}}, "count_only": true}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(full["meta"]["scan_strategy"], "full_scan");
+    assert_eq!(
+        counter["meta"]["total_count"], full["meta"]["total_count"],
+        "authoritative counter must equal full evaluation after racing mutations"
+    );
+}
+
+/// DT-18: the DEFAULT 64 MiB body ceiling itself (only the 1 MiB-cap server
+/// was tested): a ~68 MiB request is rejected with 413.
+#[tokio::test]
+async fn test_default_body_limit_ceiling() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "big"}))
+        .send()
+        .await
+        .unwrap();
+
+    let pad = "a".repeat(68 * 1024 * 1024);
+    let resp = client
+        .post(format!("{base_url}/big/docs"))
+        .json(&json!({"pad": pad}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 413, "default 64 MiB ceiling enforced");
+}
+
+/// DT-10: seeded randomized walk equivalence. Random mixed-type values
+/// (with missing fields and heavy duplicates), random page sizes, several
+/// sort specs — cursor walks AND offset tiling must both concatenate to the
+/// one-shot reference. Fixed seeds keep CI deterministic.
+#[tokio::test]
+async fn test_randomized_walk_and_tiling_equivalence() {
+    use rand::{Rng, SeedableRng, rngs::StdRng};
+
+    for (engine, seeds) in [("rocksdb", vec![7u64, 42, 1337]), ("fjall", vec![42u64])] {
+        for seed in seeds {
+            let (base_url, _tmp) = start_test_server_with_engine(engine).await;
+            let client = Client::new();
+            let mut rng = StdRng::seed_from_u64(seed);
+            client
+                .post(format!("{base_url}/_collections"))
+                .json(&json!({"name": "rand_walk"}))
+                .send()
+                .await
+                .unwrap();
+
+            let strings = ["alpha", "beta", "", "zz"];
+            for i in 0..80 {
+                let mut doc = json!({"_id": format!("d{i:03}"), "w": rng.gen_range(0..4)});
+                match rng.gen_range(0..8) {
+                    0 => doc["v"] = json!(null),
+                    1 => doc["v"] = json!(rng.gen_bool(0.5)),
+                    2 | 3 => doc["v"] = json!(rng.gen_range(0..5)),
+                    4 => doc["v"] = json!(rng.gen_range(-3.0..3.0)),
+                    5 | 6 => doc["v"] = json!(strings[rng.gen_range(0..strings.len())]),
+                    _ => {} // v missing entirely
+                }
+                client
+                    .post(format!("{base_url}/rand_walk/docs"))
+                    .json(&doc)
+                    .send()
+                    .await
+                    .unwrap();
+            }
+
+            let specs: Vec<Option<Value>> = vec![
+                Some(json!([{"v": "asc"}])),
+                Some(json!([{"v": "desc"}])),
+                Some(json!([{"w": "asc"}, {"v": "desc"}])),
+                None, // no-sort _id walk
+            ];
+            for spec in &specs {
+                let mut base_body = json!({});
+                if let Some(s) = spec {
+                    base_body["sort"] = s.clone();
+                }
+                let reference =
+                    reference_ids(&client, &base_url, "rand_walk", base_body.clone()).await;
+                assert_eq!(reference.len(), 80);
+
+                let limit = rng.gen_range(1..=7);
+                let mut walk_body = base_body.clone();
+                walk_body["limit"] = json!(limit);
+                let walked = cursor_walk(&client, &base_url, "rand_walk", walk_body).await;
+                assert_eq!(
+                    ids_of(&walked),
+                    reference,
+                    "cursor walk: engine {engine} seed {seed} spec {spec:?} limit {limit}"
+                );
+
+                let mut tiled: Vec<String> = Vec::new();
+                let mut offset = 0u64;
+                loop {
+                    let mut page_body = base_body.clone();
+                    page_body["limit"] = json!(limit);
+                    page_body["offset"] = json!(offset);
+                    let page: Value = client
+                        .post(format!("{base_url}/rand_walk/query"))
+                        .json(&page_body)
+                        .send()
+                        .await
+                        .unwrap()
+                        .json()
+                        .await
+                        .unwrap();
+                    let ids = ids_of(page["data"].as_array().unwrap());
+                    let n = ids.len();
+                    tiled.extend(ids);
+                    if n < limit as usize {
+                        break;
+                    }
+                    offset += limit;
+                }
+                assert_eq!(
+                    tiled, reference,
+                    "offset tiling: engine {engine} seed {seed} spec {spec:?} limit {limit}"
+                );
+            }
+        }
+    }
+}
