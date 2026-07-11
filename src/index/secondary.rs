@@ -48,13 +48,22 @@ impl IndexDef {
 /// `compare_values_total` below must stay byte-for-byte consistent with this
 /// encoding — the lockstep test in this file enforces it.
 pub fn value_to_sortable_bytes(value: &Value) -> Vec<u8> {
+    let mut out = Vec::new();
+    value_to_sortable_bytes_append(value, &mut out);
+    out
+}
+
+/// Append `value`'s sortable encoding to `out` — the composing form the key
+/// builders share, so multi-field keys and reusable scratch buffers never
+/// pay per-field intermediate allocations.
+pub fn value_to_sortable_bytes_append(value: &Value, out: &mut Vec<u8>) {
     match value {
-        Value::Null => vec![0x00],
-        Value::Bool(false) => vec![0x01],
-        Value::Bool(true) => vec![0x02],
+        Value::Null => out.push(0x00),
+        Value::Bool(false) => out.push(0x01),
+        Value::Bool(true) => out.push(0x02),
         Value::Number(n) => {
             let f = n.as_f64().unwrap_or(0.0);
-            let mut bytes = vec![0x03];
+            out.push(0x03);
             let bits = f.to_bits();
             // Flip sign bit for positive numbers; flip all bits for negative
             let sortable = if f.is_sign_negative() {
@@ -62,19 +71,16 @@ pub fn value_to_sortable_bytes(value: &Value) -> Vec<u8> {
             } else {
                 bits ^ (1u64 << 63)
             };
-            bytes.extend_from_slice(&sortable.to_be_bytes());
-            bytes
+            out.extend_from_slice(&sortable.to_be_bytes());
         }
         Value::String(s) => {
-            let mut bytes = vec![0x04];
-            bytes.extend_from_slice(s.as_bytes());
-            bytes
+            out.push(0x04);
+            out.extend_from_slice(s.as_bytes());
         }
         // Arrays/objects: serialize to JSON string for consistent ordering
         other => {
-            let mut bytes = vec![0x05];
-            bytes.extend_from_slice(serde_json::to_string(other).unwrap_or_default().as_bytes());
-            bytes
+            out.push(0x05);
+            out.extend_from_slice(serde_json::to_string(other).unwrap_or_default().as_bytes());
         }
     }
 }
@@ -124,25 +130,39 @@ pub fn compare_values_total(a: &Value, b: &Value) -> std::cmp::Ordering {
 
 /// Build an index key for a single-field index: {encoded_value}\x00{doc_id}
 pub fn make_index_key(value: &Value, doc_id: &str) -> Vec<u8> {
-    let mut key = value_to_sortable_bytes(value);
-    key.push(0x00);
-    key.extend_from_slice(doc_id.as_bytes());
+    let mut key = Vec::new();
+    make_index_key_into(value, doc_id, &mut key);
     key
+}
+
+/// `make_index_key` into a reusable buffer (cleared first) — the index write
+/// path encodes one entry per doc per index and reuses one scratch.
+pub fn make_index_key_into(value: &Value, doc_id: &str, out: &mut Vec<u8>) {
+    out.clear();
+    value_to_sortable_bytes_append(value, out);
+    out.push(0x00);
+    out.extend_from_slice(doc_id.as_bytes());
 }
 
 /// Build an index key for a compound index: {encoded_v1}\x01{encoded_v2}\x01...\x00{doc_id}
 /// Uses \x01 as field separator (distinct from \x00 doc_id separator).
 pub fn make_compound_index_key(values: &[&Value], doc_id: &str) -> Vec<u8> {
     let mut key = Vec::new();
+    make_compound_index_key_into(values, doc_id, &mut key);
+    key
+}
+
+/// `make_compound_index_key` into a reusable buffer (cleared first).
+pub fn make_compound_index_key_into(values: &[&Value], doc_id: &str, out: &mut Vec<u8>) {
+    out.clear();
     for (i, value) in values.iter().enumerate() {
         if i > 0 {
-            key.push(0x01); // field separator
+            out.push(0x01); // field separator
         }
-        key.extend_from_slice(&value_to_sortable_bytes(value));
+        value_to_sortable_bytes_append(value, out);
     }
-    key.push(0x00); // doc_id separator
-    key.extend_from_slice(doc_id.as_bytes());
-    key
+    out.push(0x00); // doc_id separator
+    out.extend_from_slice(doc_id.as_bytes());
 }
 
 /// Smallest byte string greater than every key that has `prefix` as a

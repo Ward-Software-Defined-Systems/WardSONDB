@@ -38,8 +38,8 @@ impl IndexScanShape {
 }
 
 use self::secondary::{
-    IndexDef, RangeScanBounds, extract_doc_id_from_key, make_compound_index_key, make_index_key,
-    range_scan_bounds, value_to_sortable_bytes,
+    IndexDef, RangeScanBounds, extract_doc_id_from_key, make_compound_index_key_into,
+    make_index_key_into, range_scan_bounds, value_to_sortable_bytes,
 };
 
 /// Cached index: definition + opaque partition handle.
@@ -275,6 +275,9 @@ impl IndexManager {
         doc: &Value,
     ) -> Result<(), AppError> {
         let indexes = self.indexes.read();
+        // One scratch across every index of the doc (the batch copies what
+        // it stages, so the buffer is free to be reused immediately).
+        let mut key = Vec::new();
         for ((col, _), entry) in indexes.iter() {
             if col != collection {
                 continue;
@@ -287,11 +290,11 @@ impl IndexManager {
                     .filter_map(|f| resolve_json_path(doc, f))
                     .collect();
                 if values.len() == entry.def.fields.len() {
-                    let key = make_compound_index_key(&values, doc_id);
+                    make_compound_index_key_into(&values, doc_id, &mut key);
                     batch.insert(&entry.partition, &key, b"")?;
                 }
             } else if let Some(field_val) = resolve_json_path(doc, &entry.def.fields[0]) {
-                let key = make_index_key(field_val, doc_id);
+                make_index_key_into(field_val, doc_id, &mut key);
                 batch.insert(&entry.partition, &key, b"")?;
             }
         }
@@ -307,6 +310,7 @@ impl IndexManager {
         doc: &Value,
     ) -> Result<(), AppError> {
         let indexes = self.indexes.read();
+        let mut key = Vec::new();
         for ((col, _), entry) in indexes.iter() {
             if col != collection {
                 continue;
@@ -319,11 +323,11 @@ impl IndexManager {
                     .filter_map(|f| resolve_json_path(doc, f))
                     .collect();
                 if values.len() == entry.def.fields.len() {
-                    let key = make_compound_index_key(&values, doc_id);
+                    make_compound_index_key_into(&values, doc_id, &mut key);
                     batch.remove(&entry.partition, &key)?;
                 }
             } else if let Some(field_val) = resolve_json_path(doc, &entry.def.fields[0]) {
-                let key = make_index_key(field_val, doc_id);
+                make_index_key_into(field_val, doc_id, &mut key);
                 batch.remove(&entry.partition, &key)?;
             }
         }
