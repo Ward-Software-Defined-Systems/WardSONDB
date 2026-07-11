@@ -459,6 +459,61 @@ fn execute_index_stream(
     })
 }
 
+/// Bare-page fast path without candidate materialization (single-shape
+/// plans): the exact total comes from the keys-only backend count, offset
+/// entries are skipped at the KEY level, and only the window's ids are
+/// collected and hydrated. `has_more` derives from the count, so it always
+/// agrees with `total_count`; the count and the id scan are two reads
+/// instants apart — the documented snapshot-gap semantic of this path. An
+/// entry whose id can't be extracted (unreachable via the write path) or
+/// whose doc vanished shortens the page rather than shifting it, as before.
+fn windowed_bare_page(
+    storage: &Storage,
+    collection: &str,
+    query: &ParsedQuery,
+    index_name: &str,
+    partition: &PartitionId,
+    shape: &IndexScanShape,
+    doc_strategy: Option<String>,
+) -> Result<QueryResult, AppError> {
+    let total = match shape {
+        IndexScanShape::Prefix(p) => storage.engine.count_prefix(partition, p)?,
+        IndexScanShape::Range { start, end } => {
+            storage.engine.count_range(partition, start, end)?
+        }
+    };
+    let offset = query.offset as usize;
+    let limit = query.limit as usize;
+    let mut to_skip = offset;
+    let mut ids: Vec<String> = Vec::new();
+    shape.scan(&storage.engine, partition, &mut |k, _| {
+        if to_skip > 0 {
+            to_skip -= 1;
+            return ControlFlow::Continue(());
+        }
+        if ids.len() >= limit {
+            return ControlFlow::Break(());
+        }
+        if let Some(id) = extract_doc_id_from_key(k) {
+            ids.push(id);
+        }
+        ControlFlow::Continue(())
+    })?;
+    let docs_partition = storage.get_docs_partition(collection)?;
+    let docs = load_docs_by_ids(storage, &docs_partition, &ids)?;
+    let docs_scanned = ids.len() as u64;
+    let has_more = total > (offset as u64).saturating_add(limit as u64);
+    Ok(QueryResult {
+        docs: apply_projection(docs, &query.fields),
+        total_count: Some(total),
+        docs_scanned,
+        index_used: Some(index_name.to_string()),
+        scan_strategy: doc_strategy,
+        has_more,
+        next_cursor: None,
+    })
+}
+
 /// The no-usable-index result (the planner resolved one moments ago, so at
 /// worst this is a race with a concurrent index drop): zero candidates,
 /// mirroring the old empty-id-list output on every sub-path.
@@ -935,10 +990,22 @@ fn execute_index_scan(
         | ScanPlan::OrUnion { .. } => unreachable!(),
     };
 
-    // Bare page: the page is exactly candidate_ids[offset..offset+limit] in
-    // index order — collect the ids and load only that window instead of
-    // every candidate.
+    // Bare page: the page is exactly candidates[offset..offset+limit] in
+    // index order. Single-shape plans never materialize the candidates —
+    // keys-only count + key-level window (C5b); multi-shape $in still
+    // collects (cross-shape offset math isn't worth it) and windows the load.
     if bare_page(query, &plan.post_filter) {
+        if let [shape] = shapes.as_slice() {
+            return windowed_bare_page(
+                storage,
+                collection,
+                query,
+                &index_name,
+                &partition,
+                shape,
+                None,
+            );
+        }
         let candidate_ids = collect_ids(&storage.engine, &partition, &shapes)?;
         let total = candidate_ids.len() as u64;
         let (docs, docs_scanned, has_more) =
@@ -1202,23 +1269,18 @@ fn execute_compound_range(
         end: end_key,
     }];
 
-    // Bare page: window the range-ordered candidates (same rationale and
-    // semantics as the index-scan fast path above; compound_range labels its
-    // doc pages, unlike the single-field paths).
+    // Bare page: keys-only count + key-level window over the range (C5b);
+    // compound_range labels its doc pages, unlike the single-field paths.
     if bare_page(query, &plan.post_filter) {
-        let candidate_ids = collect_ids(&storage.engine, &partition, &shapes)?;
-        let total = candidate_ids.len() as u64;
-        let (docs, docs_scanned, has_more) =
-            load_id_window(storage, collection, query, &candidate_ids)?;
-        return Ok(QueryResult {
-            docs,
-            total_count: Some(total),
-            docs_scanned,
-            index_used: Some(index_name.to_string()),
-            scan_strategy: Some(plan.scan.name().to_string()),
-            has_more,
-            next_cursor: None,
-        });
+        return windowed_bare_page(
+            storage,
+            collection,
+            query,
+            index_name,
+            &partition,
+            &shapes[0],
+            Some(plan.scan.name().to_string()),
+        );
     }
 
     execute_index_stream(
