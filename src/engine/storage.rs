@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -105,6 +105,16 @@ pub struct Storage {
     pub scan_accelerator: ScanAccelerator,
     pub data_dir: PathBuf,
     pub engine_name: &'static str,
+    /// Collections known to exist — replaces the `_meta` point read that
+    /// every document op and query paid. Seeded at startup; insert happens
+    /// AFTER a successful create commit, removal BEFORE the drop commit
+    /// (re-inserted if that commit fails), so a miss never claims existence
+    /// for a half-dropped collection. Misses fall back to `_meta`.
+    pub(crate) collections: RwLock<HashSet<String>>,
+    /// Partition handles by name. Staleness-safe because partitions are
+    /// NEVER dropped — drop_collection/drop_index empty them and reuse them
+    /// on re-create (invariant noted at drop_collection).
+    pub(crate) partitions: RwLock<HashMap<String, PartitionId>>,
 }
 
 impl Storage {
@@ -158,6 +168,8 @@ impl Storage {
             scan_accelerator,
             data_dir: data_dir.to_path_buf(),
             engine_name,
+            collections: RwLock::new(HashSet::new()),
+            partitions: RwLock::new(HashMap::new()),
         };
 
         storage
@@ -176,17 +188,24 @@ impl Storage {
     fn initialize_doc_counts(&self) -> Result<(), AppError> {
         // Names first, partition opens + counts after the registry scan's
         // snapshot is released. Counts are keys-only and exact — required:
-        // these counters are authoritative for count_only.
+        // these counters are authoritative for count_only. This pass also
+        // warms the existence and partition caches.
         for col_name in self.collection_names()? {
             let docs_partition = self.create_partition(&format!("{col_name}#docs"))?;
             let count = self.engine.count_prefix(&docs_partition, b"")? as i64;
             self.doc_counts.initialize(&col_name, count);
+            self.collections.write().insert(col_name);
         }
         Ok(())
     }
 
     pub fn create_partition(&self, name: &str) -> Result<PartitionId, AppError> {
-        Ok(self.engine.create_or_open_partition(name)?)
+        if let Some(p) = self.partitions.read().get(name) {
+            return Ok(p.clone());
+        }
+        let p = self.engine.create_or_open_partition(name)?;
+        self.partitions.write().insert(name.to_string(), p.clone());
+        Ok(p)
     }
 
     pub fn write_batch(&self) -> WriteBatchWrapper {

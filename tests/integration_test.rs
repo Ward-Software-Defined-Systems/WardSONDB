@@ -9593,3 +9593,89 @@ async fn test_delete_by_query_survivors_and_index_atomicity() {
     assert_eq!(count["meta"]["total_count"], 0);
     assert_eq!(count["meta"]["scan_strategy"], "doc_counter");
 }
+
+/// Existence-cache + partition-cache lifecycle (H-P1.3): create → visible,
+/// drop → immediately 404 on reads AND writes (the cache entry leaves before
+/// the drop commits), recreate → fresh counter over the reused partition.
+#[tokio::test]
+async fn test_collection_drop_recreate_cycle_both_engines() {
+    for engine in ["rocksdb", "fjall"] {
+        let (base_url, _tmp) = start_test_server_with_engine(engine).await;
+        let client = Client::new();
+
+        client
+            .post(format!("{base_url}/_collections"))
+            .json(&json!({"name": "cyc"}))
+            .send()
+            .await
+            .unwrap();
+        let resp = client
+            .post(format!("{base_url}/cyc/docs"))
+            .json(&json!({"v": 1}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201, "{engine}: insert into fresh collection");
+
+        let resp = client
+            .delete(format!("{base_url}/cyc"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{engine}: drop");
+
+        let resp = client
+            .post(format!("{base_url}/cyc/query"))
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404, "{engine}: query after drop");
+        let resp = client
+            .post(format!("{base_url}/cyc/docs"))
+            .json(&json!({"v": 2}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404, "{engine}: insert after drop");
+
+        // Recreate: counter starts fresh, reads and writes work again.
+        client
+            .post(format!("{base_url}/_collections"))
+            .json(&json!({"name": "cyc"}))
+            .send()
+            .await
+            .unwrap();
+        let count: Value = client
+            .post(format!("{base_url}/cyc/query"))
+            .json(&json!({"count_only": true}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(count["meta"]["total_count"], 0, "{engine}: fresh counter");
+
+        let resp = client
+            .post(format!("{base_url}/cyc/docs"))
+            .json(&json!({"v": 3}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201, "{engine}: insert after recreate");
+        let count: Value = client
+            .post(format!("{base_url}/cyc/query"))
+            .json(&json!({"count_only": true}))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            count["meta"]["total_count"], 1,
+            "{engine}: count after recreate"
+        );
+    }
+}

@@ -83,6 +83,12 @@ pub enum PartitionId {
     },
 }
 
+/// One staged RocksDB mutation; the CF resolves at commit time.
+pub enum RocksOp {
+    Put(Vec<u8>, Vec<u8>),
+    Del(Vec<u8>),
+}
+
 /// Atomic write batch. All staged mutations commit together.
 ///
 /// For fjall we use `Batch` (non-serialized but atomic on commit) rather than
@@ -90,18 +96,24 @@ pub enum PartitionId {
 /// keyspace, which would force a lifetime parameter all the way up through
 /// `Storage`. WardSONDB never uses read-modify-write inside a transaction, so
 /// the weaker atomicity of `Batch` is sufficient.
+///
+/// RocksDB ops are STAGED by CF name and resolved to handles once per
+/// distinct CF at commit (a 500-doc bulk insert with K indexes used to pay
+/// 500×(1+K) name-hash lookups, one per staged key). Caching resolved
+/// handles here instead would be a self-referential lifetime trap —
+/// `cf_handle` borrows the DB the wrapper owns.
 pub enum WriteBatchWrapper {
     Fjall(::fjall::Batch),
     RocksDb {
-        batch: ::rust_rocksdb::WriteBatch,
+        staged: Vec<(std::sync::Arc<str>, RocksOp)>,
         db: std::sync::Arc<::rust_rocksdb::DB>,
     },
 }
 
 impl WriteBatchWrapper {
-    // Both failure arms are unreachable today (nothing drops a CF, one engine
-    // per process) — surfaced as BackendError rather than a mid-batch abort so
-    // an eventual violation fails the request, not the process.
+    // The mismatch arms are unreachable today (one engine per process) —
+    // surfaced as BackendError so an eventual violation fails the request,
+    // not the process. A missing CF surfaces at commit_batch.
     pub fn insert(
         &mut self,
         partition: &PartitionId,
@@ -113,13 +125,8 @@ impl WriteBatchWrapper {
                 batch.insert(handle.inner(), key, value);
                 Ok(())
             }
-            (WriteBatchWrapper::RocksDb { batch, db }, PartitionId::RocksDb { cf_name, .. }) => {
-                let cf = db.cf_handle(cf_name).ok_or_else(|| {
-                    BackendError::Internal(format!(
-                        "column family '{cf_name}' missing at batch insert"
-                    ))
-                })?;
-                batch.put_cf(&cf, key, value);
+            (WriteBatchWrapper::RocksDb { staged, .. }, PartitionId::RocksDb { cf_name, .. }) => {
+                staged.push((cf_name.clone(), RocksOp::Put(key.to_vec(), value.to_vec())));
                 Ok(())
             }
             _ => Err(BackendError::Internal(
@@ -134,13 +141,8 @@ impl WriteBatchWrapper {
                 batch.remove(handle.inner(), key);
                 Ok(())
             }
-            (WriteBatchWrapper::RocksDb { batch, db }, PartitionId::RocksDb { cf_name, .. }) => {
-                let cf = db.cf_handle(cf_name).ok_or_else(|| {
-                    BackendError::Internal(format!(
-                        "column family '{cf_name}' missing at batch remove"
-                    ))
-                })?;
-                batch.delete_cf(&cf, key);
+            (WriteBatchWrapper::RocksDb { staged, .. }, PartitionId::RocksDb { cf_name, .. }) => {
+                staged.push((cf_name.clone(), RocksOp::Del(key.to_vec())));
                 Ok(())
             }
             _ => Err(BackendError::Internal(

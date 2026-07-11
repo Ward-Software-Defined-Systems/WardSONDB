@@ -48,6 +48,9 @@ impl Storage {
         // every read/write path).
         self.doc_counts.initialize(name, 0);
         self.commit_batch(batch)?;
+        // Cache only after the commit: a pre-commit insert could let a
+        // racing write land docs for a collection whose meta commit fails.
+        self.collections.write().insert(name.to_string());
 
         self.persist()?;
 
@@ -166,7 +169,17 @@ impl Storage {
         }
 
         batch.remove(&self.meta, meta_key.as_bytes())?;
-        self.commit_batch(batch)?;
+        // Uncache BEFORE the commit (re-cache if it fails): once the commit
+        // lands, no writer may slip a doc into the dropped collection via a
+        // stale existence hit. NOTE the partition itself is never dropped —
+        // only emptied — which is what keeps Storage::partitions and every
+        // cached PartitionId valid across drops; a re-created collection
+        // reuses the same partition.
+        self.collections.write().remove(name);
+        if let Err(e) = self.commit_batch(batch) {
+            self.collections.write().insert(name.to_string());
+            return Err(e);
+        }
 
         for idx_def in &index_defs {
             self.index_manager.unregister(name, &idx_def.name);
@@ -188,8 +201,20 @@ impl Storage {
     }
 
     pub fn collection_exists(&self, name: &str) -> Result<bool, AppError> {
+        // Read-mostly cache: this runs on EVERY document op and query, and
+        // used to be an engine point read each time. Misses still consult
+        // `_meta` (and self-heal the cache), so a false negative is
+        // impossible; a false positive is prevented by the drop path
+        // removing the entry BEFORE its commit.
+        if self.collections.read().contains(name) {
+            return Ok(true);
+        }
         let meta_key = format!("collection:{name}");
-        Ok(self.engine.get(&self.meta, meta_key.as_bytes())?.is_some())
+        let exists = self.engine.get(&self.meta, meta_key.as_bytes())?.is_some();
+        if exists {
+            self.collections.write().insert(name.to_string());
+        }
+        Ok(exists)
     }
 
     pub fn get_docs_partition(&self, collection: &str) -> Result<PartitionId, AppError> {
