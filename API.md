@@ -1311,7 +1311,11 @@ The response always includes `fields` as an array, regardless of whether the ind
 
 **Errors:**
 - `404 COLLECTION_NOT_FOUND`
-- `409 INDEX_EXISTS` — index name or field(s) already has an index
+- `409 INDEX_EXISTS` — the index name is taken, or a single-field index on
+  that exact field already exists. A compound index sharing the leading
+  field does NOT conflict with a new single-field index: compound indexes
+  only contain documents carrying **all** their component fields, so they
+  never serve single-field lookups — the single-field index is the real one
 - `400 INVALID_INDEX` — empty name, empty field/fields, or both `field` and `fields` provided
 
 ### GET /{collection}/indexes — List Indexes
