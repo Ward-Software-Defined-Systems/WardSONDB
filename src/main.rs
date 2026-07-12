@@ -129,16 +129,19 @@ async fn main() {
             // results (S2-2). On any disagreement, rebuild from storage.
             let loaded = storage.scan_accelerator.load_from_disk(data_dir, "_all");
             let consistent = loaded && {
-                let expected: u64 = storage
+                // Per-collection reconcile (F1 upgraded S2-2's total-count
+                // check): every collection's membership must match storage's
+                // count, and no membership may outlive a dropped collection.
+                let expected: std::collections::HashMap<String, u64> = storage
                     .list_collections()
-                    .map(|cols| cols.iter().map(|c| c.doc_count).sum())
-                    .unwrap_or(0);
-                let ok = storage.scan_accelerator.snapshot_matches(expected);
+                    .map(|cols| cols.iter().map(|c| (c.name.clone(), c.doc_count)).collect())
+                    .unwrap_or_default();
+                let ok = storage.scan_accelerator.snapshot_matches(&expected);
                 if !ok {
                     warn!(
                         snapshot_docs = storage.scan_accelerator.positions.len(),
-                        storage_docs = expected,
-                        "Bitmap snapshot disagrees with storage; rebuilding"
+                        storage_docs = expected.values().sum::<u64>(),
+                        "Bitmap snapshot disagrees with storage (per-collection); rebuilding"
                     );
                 }
                 ok
@@ -411,7 +414,7 @@ fn rebuild_all_accelerators(storage: &Storage) {
             }
             if batch.len() >= BATCH_SIZE {
                 total_docs += batch.len();
-                storage.scan_accelerator.rebuild_batch(&batch);
+                storage.scan_accelerator.rebuild_batch(&col.name, &batch);
                 batch.clear();
                 if storage.scan_accelerator.is_over_budget() {
                     over_budget = true;
@@ -432,7 +435,7 @@ fn rebuild_all_accelerators(storage: &Storage) {
         }
         if !batch.is_empty() {
             total_docs += batch.len();
-            storage.scan_accelerator.rebuild_batch(&batch);
+            storage.scan_accelerator.rebuild_batch(&col.name, &batch);
         }
     }
 

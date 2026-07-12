@@ -186,15 +186,14 @@ impl Storage {
         }
 
         self.doc_counts.remove(name);
-        self.scan_accelerator.clear();
-
-        // Delete persisted bitmap files (accelerator is global, stored under "_all").
-        let bitmap_dir = self.data_dir.join("bitmap").join("_all");
-        if bitmap_dir.exists()
-            && let Err(e) = std::fs::remove_dir_all(&bitmap_dir)
-        {
-            tracing::debug!("Failed to remove bitmap dir: {e}");
-        }
+        // Surgical: only this collection's positions and bits leave the
+        // accelerator — every other collection stays accelerated (this used
+        // to clear() the whole thing and delete the persisted snapshot,
+        // leaving bitmaps off until restart). The snapshot on disk is
+        // rewritten by the 60s persist task; a crash before that leaves a
+        // stale snapshot whose membership for this collection the
+        // per-collection load reconcile rejects — rebuild, not wrong data.
+        self.scan_accelerator.on_drop_collection(name);
 
         self.persist()?;
         Ok(())

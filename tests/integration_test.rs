@@ -10383,3 +10383,257 @@ async fn test_bitmap_window_walk_with_holes() {
         "holes skipped; deleted-ahead doc absent; no dups"
     );
 }
+
+// ── F1: multi-collection bitmap scoping ─────────────────────────────────────
+// The accelerator's position space and value bitmaps are GLOBAL across
+// collections; every answer must be scoped to the queried collection's
+// membership. Pre-fix, fully-covered count_only returned global counts
+// (more docs than the collection held), bare pages ghosted past the
+// collection's real matches (0-doc pages with has_more=true), bitmap
+// aggregates counted every collection, and drop_collection wiped ALL
+// acceleration until restart. Found live by the pre-merge SIEM rig
+// (PRE-MERGE-LIVE-TESTING.md § F1); every bitmap test above runs a single
+// collection, which is exactly why CI never saw it.
+
+/// events_a: 6 red + 4 blue; events_b: 3 red + 5 green. "red" spans both
+/// (global 9 — the pre-fix wrong answer), "blue"/"green" are
+/// single-collection (the aggregate-omission check).
+async fn setup_two_collection_bitmap_data(base_url: &str, client: &Client) {
+    for name in ["events_a", "events_b"] {
+        client
+            .post(format!("{base_url}/_collections"))
+            .json(&json!({"name": name}))
+            .send()
+            .await
+            .unwrap();
+    }
+    let a_docs: Vec<Value> = (0..10)
+        .map(|i| json!({"category": if i < 6 { "red" } else { "blue" }, "n": i}))
+        .collect();
+    let b_docs: Vec<Value> = (0..8)
+        .map(|i| json!({"category": if i < 3 { "red" } else { "green" }, "n": i}))
+        .collect();
+    for (coll, docs) in [("events_a", a_docs), ("events_b", b_docs)] {
+        client
+            .post(format!("{base_url}/{coll}/docs/_bulk"))
+            .json(&json!({"documents": docs}))
+            .send()
+            .await
+            .unwrap();
+    }
+}
+
+async fn count_only_with_strategy(
+    client: &Client,
+    base_url: &str,
+    coll: &str,
+    filter: Value,
+) -> (u64, String) {
+    let body: Value = client
+        .post(format!("{base_url}/{coll}/query"))
+        .json(&json!({"filter": filter, "count_only": true}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["ok"], true, "count_only failed: {body}");
+    (
+        body["meta"]["total_count"].as_u64().unwrap(),
+        body["meta"]["scan_strategy"]
+            .as_str()
+            .unwrap_or("")
+            .to_string(),
+    )
+}
+
+/// F1a: fully-covered bitmap counts are per-collection, and membership
+/// follows delete_by_query (the SIEM's rollup-churn shape).
+#[tokio::test]
+async fn test_bitmap_multi_collection_scoped_counts() {
+    let (base_url, _tmp) = start_test_server_with_bitmap("category").await;
+    let client = Client::new();
+    setup_two_collection_bitmap_data(&base_url, &client).await;
+
+    let (a_red, strat) =
+        count_only_with_strategy(&client, &base_url, "events_a", json!({"category": "red"})).await;
+    assert_eq!(strat, "bitmap");
+    assert_eq!(a_red, 6, "events_a red — not the global 9");
+    let (b_red, _) =
+        count_only_with_strategy(&client, &base_url, "events_b", json!({"category": "red"})).await;
+    assert_eq!(b_red, 3);
+
+    // Ground-truth twin (the live sweep's method): $exists forces doc
+    // evaluation, which is inherently collection-scoped.
+    let (twin, _) = count_only_with_strategy(
+        &client,
+        &base_url,
+        "events_a",
+        json!({"$and": [{"category": "red"}, {"_id": {"$exists": true}}]}),
+    )
+    .await;
+    assert_eq!(twin, a_red);
+
+    // Membership maintenance through delete_by_query.
+    client
+        .post(format!("{base_url}/events_b/docs/_delete_by_query"))
+        .json(&json!({"filter": {"category": "red"}}))
+        .send()
+        .await
+        .unwrap();
+    let (b_after, _) =
+        count_only_with_strategy(&client, &base_url, "events_b", json!({"category": "red"})).await;
+    assert_eq!(b_after, 0);
+    let (a_after, _) =
+        count_only_with_strategy(&client, &base_url, "events_a", json!({"category": "red"})).await;
+    assert_eq!(a_after, 6, "events_a unaffected by events_b churn");
+}
+
+/// F1b: bare-page windows report the collection's total and never ghost —
+/// pre-fix, offsets past the collection's matches (but inside the global
+/// count) returned 0-doc pages with has_more=true.
+#[tokio::test]
+async fn test_bitmap_bare_pages_have_no_ghost_tail() {
+    let (base_url, _tmp) = start_test_server_with_bitmap("category").await;
+    let client = Client::new();
+    setup_two_collection_bitmap_data(&base_url, &client).await;
+
+    let body: Value = client
+        .post(format!("{base_url}/events_a/query"))
+        .json(&json!({"filter": {"category": "red"}, "limit": 4, "offset": 4}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["meta"]["scan_strategy"], "bitmap");
+    let docs = body["data"].as_array().unwrap();
+    assert_eq!(docs.len(), 2, "6 red docs, offset 4 → final 2");
+    for doc in docs {
+        assert_eq!(doc["category"], "red");
+    }
+    assert_eq!(body["meta"]["total_count"], 6, "not the global 9");
+    // has_more is skip-serialized when false — absent is the pass state.
+    assert_ne!(body["meta"]["has_more"], true);
+
+    // The pre-fix ghost zone: offset in (collection matches, global matches].
+    let body: Value = client
+        .post(format!("{base_url}/events_a/query"))
+        .json(&json!({"filter": {"category": "red"}, "limit": 4, "offset": 7}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["data"].as_array().unwrap().len(), 0);
+    assert_ne!(
+        body["meta"]["has_more"], true,
+        "no ghost pages past the collection's matches"
+    );
+}
+
+/// F1c: bitmap_aggregate group counts are per-collection; values with no
+/// documents in the queried collection are absent from the result.
+#[tokio::test]
+async fn test_bitmap_aggregate_scoped_groups() {
+    let (base_url, _tmp) = start_test_server_with_bitmap("category").await;
+    let client = Client::new();
+    setup_two_collection_bitmap_data(&base_url, &client).await;
+
+    let body: Value = client
+        .post(format!("{base_url}/events_a/aggregate"))
+        .json(&json!({"pipeline": [{"$group": {"_id": "category", "n": {"$count": {}}}}]}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["meta"]["scan_strategy"], "bitmap_aggregate");
+    let groups: std::collections::HashMap<String, u64> = body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| {
+            (
+                g["_id"].as_str().unwrap().to_string(),
+                g["n"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        groups.len(),
+        2,
+        "green (events_b-only) must be absent: {groups:?}"
+    );
+    assert_eq!(groups["red"], 6, "not the global 9");
+    assert_eq!(groups["blue"], 4);
+}
+
+/// F1d: dropping one collection is surgical — every other collection stays
+/// bitmap-accelerated (pre-fix the drop cleared the whole accelerator and
+/// nothing re-armed it until restart), new writes keep being tracked, and
+/// /_stats reflects the removal.
+#[tokio::test]
+async fn test_drop_collection_keeps_others_accelerated() {
+    let (base_url, _tmp) = start_test_server_with_bitmap("category").await;
+    let client = Client::new();
+    setup_two_collection_bitmap_data(&base_url, &client).await;
+
+    let resp = client
+        .delete(format!("{base_url}/events_b"))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+
+    let (a_red, strat) =
+        count_only_with_strategy(&client, &base_url, "events_a", json!({"category": "red"})).await;
+    assert_eq!(strat, "bitmap", "acceleration survives an unrelated drop");
+    assert_eq!(a_red, 6);
+
+    // Still tracking new writes post-drop.
+    client
+        .post(format!("{base_url}/events_a/docs"))
+        .json(&json!({"category": "red"}))
+        .send()
+        .await
+        .unwrap();
+    let (after, strat) =
+        count_only_with_strategy(&client, &base_url, "events_a", json!({"category": "red"})).await;
+    assert_eq!(strat, "bitmap");
+    assert_eq!(after, 7);
+
+    let stats: Value = client
+        .get(format!("{base_url}/_stats"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let accel = &stats["data"]["scan_accelerator"];
+    assert_eq!(accel["ready"], true);
+    let by_coll = accel["positions_by_collection"].as_array().unwrap();
+    assert_eq!(by_coll.len(), 1, "only events_a remains: {by_coll:?}");
+    assert_eq!(by_coll[0]["collection"], "events_a");
+    assert_eq!(by_coll[0]["positions"], 11);
+}
+
+/// F1 fjall twin: scoping is engine-independent, pinned cheaply.
+#[tokio::test]
+async fn test_fjall_bitmap_multi_collection_scoped_counts() {
+    let (base_url, _tmp) = start_test_server_with_engine_and_bitmap("fjall", "category").await;
+    let client = Client::new();
+    setup_two_collection_bitmap_data(&base_url, &client).await;
+
+    let (a_red, strat) =
+        count_only_with_strategy(&client, &base_url, "events_a", json!({"category": "red"})).await;
+    assert_eq!((a_red, strat.as_str()), (6, "bitmap"));
+    let (b_red, _) =
+        count_only_with_strategy(&client, &base_url, "events_b", json!({"category": "red"})).await;
+    assert_eq!(b_red, 3);
+}

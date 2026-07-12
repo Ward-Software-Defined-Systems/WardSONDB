@@ -84,7 +84,7 @@ async fn run_concurrent_workload(
             for i in 0..inserts_per_thread {
                 let seed = (thread_idx * 1_000_000 + i) as u64;
                 let (id, doc) = synthetic_doc(seed);
-                accel.on_insert(&id, &doc);
+                accel.on_insert("c1", &id, &doc);
             }
         });
     }
@@ -98,7 +98,7 @@ async fn run_concurrent_workload(
                 let id = &ids[(seed as usize) % ids.len()];
                 let old_doc = doc_for_id(id, seed);
                 let new_doc = doc_for_id(id, seed.wrapping_add(17));
-                accel.on_update(id, &old_doc, &new_doc);
+                accel.on_update("c1", id, &old_doc, &new_doc);
             }
         });
     }
@@ -139,7 +139,7 @@ async fn test_bitmap_no_deadlock_under_concurrent_load() {
     let mut preloaded_ids = Vec::with_capacity(10_000);
     for i in 0..10_000u64 {
         let (id, doc) = synthetic_doc(i);
-        accel.on_insert(&id, &doc);
+        accel.on_insert("c1", &id, &doc);
         preloaded_ids.push(id);
     }
     let preloaded = Arc::new(preloaded_ids);
@@ -187,7 +187,7 @@ async fn test_stats_under_concurrent_columns_writer() {
 
     for i in 0..1_000u64 {
         let (id, doc) = synthetic_doc(i);
-        accel.on_insert(&id, &doc);
+        accel.on_insert("c1", &id, &doc);
     }
 
     let mut set = JoinSet::new();
@@ -241,7 +241,7 @@ async fn test_bitmap_no_deadlock_smoke() {
     let mut preloaded_ids = Vec::with_capacity(2_000);
     for i in 0..2_000u64 {
         let (id, doc) = synthetic_doc(i);
-        accel.on_insert(&id, &doc);
+        accel.on_insert("c1", &id, &doc);
         preloaded_ids.push(id);
     }
 

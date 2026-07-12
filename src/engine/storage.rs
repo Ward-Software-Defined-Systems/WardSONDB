@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use parking_lot::RwLock;
@@ -103,7 +103,6 @@ pub struct Storage {
     pub doc_counts: DocCounters,
     pub memory_config: MemoryConfig,
     pub scan_accelerator: ScanAccelerator,
-    pub data_dir: PathBuf,
     pub engine_name: &'static str,
     /// Collections known to exist — replaces the `_meta` point read that
     /// every document op and query paid. Seeded at startup; insert happens
@@ -166,7 +165,6 @@ impl Storage {
             doc_counts,
             memory_config: mem,
             scan_accelerator,
-            data_dir: data_dir.to_path_buf(),
             engine_name,
             collections: RwLock::new(HashSet::new()),
             partitions: RwLock::new(HashMap::new()),

@@ -93,7 +93,7 @@ impl Storage {
         self.commit_batch(batch)?;
 
         self.doc_counts.increment(collection, 1);
-        self.scan_accelerator.on_insert(&id, &doc);
+        self.scan_accelerator.on_insert(collection, &id, &doc);
 
         Ok(doc)
     }
@@ -179,7 +179,8 @@ impl Storage {
             .add_index_entries_to_batch(&mut batch, collection, id, &doc)?;
         self.commit_batch(batch)?;
 
-        self.scan_accelerator.on_update(id, &existing_doc, &doc);
+        self.scan_accelerator
+            .on_update(collection, id, &existing_doc, &doc);
 
         Ok(doc)
     }
@@ -217,7 +218,8 @@ impl Storage {
         self.commit_batch(batch)?;
 
         self.doc_counts.increment(collection, -1);
-        self.scan_accelerator.on_delete(id, &existing_doc);
+        self.scan_accelerator
+            .on_delete(collection, id, &existing_doc);
 
         Ok(())
     }
@@ -318,7 +320,7 @@ impl Storage {
             self.doc_counts.increment(collection, inserted as i64);
 
             for (id, _bytes, doc) in &to_write {
-                self.scan_accelerator.on_insert(id, doc);
+                self.scan_accelerator.on_insert(collection, id, doc);
             }
         }
 
@@ -399,7 +401,7 @@ impl Storage {
 
         for doc in &matching {
             if let Some(id) = doc.get("_id").and_then(|v| v.as_str()) {
-                self.scan_accelerator.on_delete(id, doc);
+                self.scan_accelerator.on_delete(collection, id, doc);
             }
         }
 
@@ -473,7 +475,8 @@ impl Storage {
         self.commit_batch(batch)?;
 
         for (id, old_doc, new_doc) in &update_pairs {
-            self.scan_accelerator.on_update(id, old_doc, new_doc);
+            self.scan_accelerator
+                .on_update(collection, id, old_doc, new_doc);
         }
 
         Ok(count)

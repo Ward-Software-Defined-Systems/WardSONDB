@@ -55,7 +55,9 @@ fn setup_storage_with_bitmap(n: u64, bitmap_fields: Vec<String>) -> (Storage, Te
                 .map(|id| (id.to_string(), doc.clone()))
         })
         .collect();
-    storage.scan_accelerator.rebuild_from_storage(&all_docs);
+    storage
+        .scan_accelerator
+        .rebuild_from_storage("events", &all_docs);
     storage.scan_accelerator.set_ready(true);
 
     (storage, tmp)

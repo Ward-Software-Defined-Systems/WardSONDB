@@ -8,14 +8,14 @@ use parking_lot::RwLock;
 use roaring::RoaringBitmap;
 use serde_json::Value;
 use tracing::info;
-use uuid::Uuid;
 
 use crate::query::filter::{FilterNode, FilterOp, resolve_json_path};
 
 /// Bumped when the value-key encoding (or any persisted layout) changes:
 /// `load_from_disk` refuses other formats, which routes startup through a
 /// storage rebuild instead of serving keys the query side can't match.
-const BITMAP_SNAPSHOT_FORMAT: u64 = 2;
+/// v3: per-collection membership bitmaps (F1 — collection-scoped answers).
+const BITMAP_SNAPSHOT_FORMAT: u64 = 3;
 
 /// Collision-free, type-tagged string key for a value. One prefix byte
 /// keeps every JSON type in a disjoint key space — under the old untagged
@@ -54,6 +54,15 @@ pub fn string_key_to_value(key: &str) -> Value {
 pub struct RowPositionMap {
     id_to_pos: RwLock<HashMap<Arc<str>, u32>>,
     pos_to_id: RwLock<Vec<Option<Arc<str>>>>,
+    /// Which positions belong to which collection. The position space and
+    /// the value bitmaps are GLOBAL across collections, so every bitmap
+    /// answer must be intersected with the queried collection's membership
+    /// (F1 — un-scoped answers returned other collections' documents), and
+    /// drop_collection subtracts one membership instead of wiping the
+    /// accelerator. This guard is only ever taken alone or after the id/pos
+    /// guards drop — never nested under `columns` — so it adds no
+    /// lock-order edge to the positions-before-columns discipline.
+    by_collection: RwLock<HashMap<String, RoaringBitmap>>,
     next_pos: AtomicU32,
     hole_count: AtomicU32,
 }
@@ -69,21 +78,32 @@ impl RowPositionMap {
         RowPositionMap {
             id_to_pos: RwLock::new(HashMap::new()),
             pos_to_id: RwLock::new(Vec::new()),
+            by_collection: RwLock::new(HashMap::new()),
             next_pos: AtomicU32::new(0),
             hole_count: AtomicU32::new(0),
         }
     }
 
-    /// Assign the next row position to a document ID.
-    pub fn assign(&self, doc_id: &str) -> Option<u32> {
+    /// Assign the next row position to a document ID. Membership is set
+    /// last (sequential guards, never nested): a scan between the steps
+    /// sees a position outside every collection, which simply doesn't
+    /// match — the benign direction.
+    pub fn assign(&self, doc_id: &str, collection: &str) -> Option<u32> {
         let pos = self.next_pos.fetch_add(1, Ordering::Relaxed);
         let shared: Arc<str> = Arc::from(doc_id);
         self.id_to_pos.write().insert(Arc::clone(&shared), pos);
-        let mut vec = self.pos_to_id.write();
-        if pos as usize >= vec.len() {
-            vec.resize(pos as usize + 1, None);
+        {
+            let mut vec = self.pos_to_id.write();
+            if pos as usize >= vec.len() {
+                vec.resize(pos as usize + 1, None);
+            }
+            vec[pos as usize] = Some(shared);
         }
-        vec[pos as usize] = Some(shared);
+        self.by_collection
+            .write()
+            .entry(collection.to_string())
+            .or_default()
+            .insert(pos);
         Some(pos)
     }
 
@@ -101,15 +121,73 @@ impl RowPositionMap {
     }
 
     /// Remove a document from id_to_pos (position stays allocated; bitmap handles the hole).
-    pub fn remove(&self, doc_id: &str) {
+    pub fn remove(&self, doc_id: &str, collection: &str) {
         let pos = self.id_to_pos.write().remove(doc_id);
         if let Some(pos) = pos {
-            let mut vec = self.pos_to_id.write();
-            if let Some(slot) = vec.get_mut(pos as usize) {
-                *slot = None;
+            {
+                let mut vec = self.pos_to_id.write();
+                if let Some(slot) = vec.get_mut(pos as usize) {
+                    *slot = None;
+                }
+            }
+            if let Some(members) = self.by_collection.write().get_mut(collection) {
+                members.remove(pos);
             }
             self.hole_count.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Restrict a global bitmap answer to one collection's positions (F1).
+    /// A collection with no membership entry has no documents: the result
+    /// empties rather than leaking other collections' positions.
+    pub fn scope_to_collection(&self, bitmap: &mut RoaringBitmap, collection: &str) {
+        match self.by_collection.read().get(collection) {
+            Some(members) => *bitmap &= members,
+            None => bitmap.clear(),
+        }
+    }
+
+    /// `len(bitmap ∩ collection membership)` without materializing.
+    pub fn scoped_len(&self, bitmap: &RoaringBitmap, collection: &str) -> u64 {
+        self.by_collection
+            .read()
+            .get(collection)
+            .map(|m| bitmap.intersection_len(m))
+            .unwrap_or(0)
+    }
+
+    /// Remove every position belonging to `collection` (drop_collection).
+    /// The membership entry is taken out FIRST, so scoped scans exclude the
+    /// collection immediately; the id/pos cleanup then proceeds in bounded
+    /// chunks so concurrent writers never stall behind one long guard.
+    /// Returns the removed positions for the caller's column subtraction.
+    pub fn remove_collection(&self, collection: &str) -> RoaringBitmap {
+        let removed = match self.by_collection.write().remove(collection) {
+            Some(m) => m,
+            None => return RoaringBitmap::new(),
+        };
+        let mut holes = 0u32;
+        let mut iter = removed.iter();
+        loop {
+            let chunk: Vec<u32> = iter.by_ref().take(65_536).collect();
+            if chunk.is_empty() {
+                break;
+            }
+            // id_to_pos then pos_to_id — the same acquisition order as
+            // assign/remove/persist (one global order, no ABBA).
+            let mut ids = self.id_to_pos.write();
+            let mut vec = self.pos_to_id.write();
+            for &pos in &chunk {
+                if let Some(slot) = vec.get_mut(pos as usize)
+                    && let Some(id) = slot.take()
+                {
+                    ids.remove(&*id);
+                    holes += 1;
+                }
+            }
+        }
+        self.hole_count.fetch_add(holes, Ordering::Relaxed);
+        removed
     }
 
     /// Number of active mappings.
@@ -125,6 +203,7 @@ impl RowPositionMap {
     pub fn clear(&self) {
         self.id_to_pos.write().clear();
         self.pos_to_id.write().clear();
+        self.by_collection.write().clear();
         self.next_pos.store(0, Ordering::Relaxed);
         self.hole_count.store(0, Ordering::Relaxed);
     }
@@ -172,7 +251,15 @@ impl RowPositionMap {
         }
         // Vec: each slot is Option<Arc<str>> = 8 bytes (pointer-sized)
         let vec_bytes = pos_vec.len() * std::mem::size_of::<Option<Arc<str>>>();
-        id_bytes + vec_bytes
+        drop(pos_vec);
+        drop(id_map);
+        let member_bytes: usize = self
+            .by_collection
+            .read()
+            .iter()
+            .map(|(name, bm)| name.len() + bm.serialized_size())
+            .sum();
+        id_bytes + vec_bytes + member_bytes
     }
 }
 
@@ -252,10 +339,17 @@ impl Default for AcceleratorConfig {
 
 /// One CRUD delta captured while a rebuild owns the maps (S2-1). The doc
 /// values are cloned — the cost only exists during rebuild windows.
+/// Fields: collection, doc id, doc value(s).
 enum PendingOp {
-    Insert(String, Value),
-    Delete(String, Value),
-    Update(String, Value, Value),
+    Insert(String, String, Value),
+    Delete(String, String, Value),
+    Update(String, String, Value, Value),
+    /// A drop_collection that arrived while a rebuild owned the maps. The
+    /// partition is already gone from storage, so the rebuild scan can't
+    /// see its docs — draining this cleans up whatever the scan indexed
+    /// before the drop landed (no-op when that's nothing). Drained in
+    /// arrival order, so a same-name recreate's inserts replay after it.
+    DropCollection(String),
 }
 
 pub struct ScanAccelerator {
@@ -407,15 +501,17 @@ impl ScanAccelerator {
     // ── CRUD Hooks ──────────────────────────────────────────────────────
 
     /// Called after a document insert transaction commits.
-    pub fn on_insert(&self, doc_id: &str, doc: &Value) {
-        if self.queue_if_rebuilding(|| PendingOp::Insert(doc_id.to_string(), doc.clone())) {
+    pub fn on_insert(&self, collection: &str, doc_id: &str, doc: &Value) {
+        if self.queue_if_rebuilding(|| {
+            PendingOp::Insert(collection.to_string(), doc_id.to_string(), doc.clone())
+        }) {
             return;
         }
-        self.insert_live(doc_id, doc);
+        self.insert_live(collection, doc_id, doc);
     }
 
-    fn insert_live(&self, doc_id: &str, doc: &Value) {
-        let pos = match self.positions.assign(doc_id) {
+    fn insert_live(&self, collection: &str, doc_id: &str, doc: &Value) {
+        let pos = match self.positions.assign(doc_id, collection) {
             Some(p) => p,
             None => return,
         };
@@ -510,14 +606,16 @@ impl ScanAccelerator {
     }
 
     /// Called after a document delete transaction commits.
-    pub fn on_delete(&self, doc_id: &str, doc: &Value) {
-        if self.queue_if_rebuilding(|| PendingOp::Delete(doc_id.to_string(), doc.clone())) {
+    pub fn on_delete(&self, collection: &str, doc_id: &str, doc: &Value) {
+        if self.queue_if_rebuilding(|| {
+            PendingOp::Delete(collection.to_string(), doc_id.to_string(), doc.clone())
+        }) {
             return;
         }
-        self.delete_live(doc_id, doc);
+        self.delete_live(collection, doc_id, doc);
     }
 
-    fn delete_live(&self, doc_id: &str, doc: &Value) {
+    fn delete_live(&self, collection: &str, doc_id: &str, doc: &Value) {
         let pos = match self.positions.get_position(doc_id) {
             Some(p) => p,
             None => return,
@@ -529,7 +627,7 @@ impl ScanAccelerator {
         // persist snapshot. A reader between the two steps sees column bits
         // for a position with no id, which `resolve_window` skips — the
         // benign direction.
-        self.positions.remove(doc_id);
+        self.positions.remove(doc_id, collection);
 
         let columns = self.columns.read();
         for (field_path, column) in columns.iter() {
@@ -557,10 +655,18 @@ impl ScanAccelerator {
     }
 
     /// Called after a document update transaction commits.
-    /// Uses a single write lock acquisition per column.
-    pub fn on_update(&self, doc_id: &str, old_doc: &Value, new_doc: &Value) {
+    /// Uses a single write lock acquisition per column. `collection` rides
+    /// along for the rebuild queue (an update whose doc the rebuild scan
+    /// never saw drains as an insert, which needs the membership home);
+    /// a live in-place update never moves a position between collections.
+    pub fn on_update(&self, collection: &str, doc_id: &str, old_doc: &Value, new_doc: &Value) {
         if self.queue_if_rebuilding(|| {
-            PendingOp::Update(doc_id.to_string(), old_doc.clone(), new_doc.clone())
+            PendingOp::Update(
+                collection.to_string(),
+                doc_id.to_string(),
+                old_doc.clone(),
+                new_doc.clone(),
+            )
         }) {
             return;
         }
@@ -639,7 +745,48 @@ impl ScanAccelerator {
         }
     }
 
-    /// Clear all accelerator data for a collection (called on drop_collection).
+    /// Called when a collection is dropped: surgically remove its positions
+    /// and column bits. Acceleration for every other collection stays live
+    /// — this path used to `clear()` the WHOLE accelerator and flip ready
+    /// off with nothing to re-arm it until restart (F1d). During a rebuild
+    /// the drop queues like any other delta.
+    pub fn on_drop_collection(&self, collection: &str) {
+        if self.queue_if_rebuilding(|| PendingOp::DropCollection(collection.to_string())) {
+            return;
+        }
+        self.drop_collection_live(collection);
+    }
+
+    fn drop_collection_live(&self, collection: &str) {
+        // Positions before columns (the global lock order); membership goes
+        // first inside remove_collection, so scoped scans exclude the
+        // collection before any bits move.
+        let removed = self.positions.remove_collection(collection);
+        if removed.is_empty() {
+            return;
+        }
+        let columns = self.columns.read();
+        for column in columns.values() {
+            let mut bitmaps = column.value_bitmaps.write();
+            bitmaps.retain(|_, bm| {
+                *bm -= &removed;
+                !bm.is_empty()
+            });
+            column
+                .cardinality
+                .store(bitmaps.len() as u32, Ordering::Relaxed);
+            drop(bitmaps);
+            *column.exists_bitmap.write() -= &removed;
+        }
+        // over_budget may now read stale-high; the 60s persist task's
+        // recompute corrects it. hole_count rose by the removed count, so
+        // a large drop naturally schedules the >25%-holes compaction
+        // rebuild, which reclaims the position space.
+    }
+
+    /// Reset ALL accelerator state. Only the rebuild protocol
+    /// (`begin_rebuild`) uses this — collection drops go through the
+    /// surgical `on_drop_collection` and never disable acceleration.
     pub fn clear(&self) {
         self.positions.clear();
         let mut cols = self.columns.write();
@@ -676,16 +823,16 @@ impl ScanAccelerator {
         let mut q = self.pending.lock();
         for op in q.drain(..) {
             match op {
-                PendingOp::Insert(id, doc) => {
+                PendingOp::Insert(coll, id, doc) => {
                     // The scan indexes any doc committed before it visited
                     // the doc's key — insert-if-absent keeps one position.
                     if self.positions.get_position(&id).is_none() {
-                        self.insert_live(&id, &doc);
+                        self.insert_live(&coll, &id, &doc);
                     }
                 }
                 // delete_live no-ops when the scan never saw the doc.
-                PendingOp::Delete(id, doc) => self.delete_live(&id, &doc),
-                PendingOp::Update(id, old, new) => {
+                PendingOp::Delete(coll, id, doc) => self.delete_live(&coll, &id, &doc),
+                PendingOp::Update(coll, id, old, new) => {
                     if self.positions.get_position(&id).is_some() {
                         // Bitmap ops are idempotent, so this is safe whether
                         // the scan saw the old or the new value.
@@ -693,9 +840,11 @@ impl ScanAccelerator {
                     } else {
                         // The scan never saw the doc (inserted mid-scan past
                         // its region, then updated) — index its new state.
-                        self.insert_live(&id, &new);
+                        self.insert_live(&coll, &id, &new);
                     }
                 }
+                // Idempotent: no-ops on an absent membership entry.
+                PendingOp::DropCollection(coll) => self.drop_collection_live(&coll),
             }
         }
         self.rebuild_active.store(false, Ordering::Release);
@@ -703,13 +852,14 @@ impl ScanAccelerator {
         self.set_ready(true);
     }
 
-    /// Rebuild the accelerator from all documents in storage (used by benchmarks).
+    /// Rebuild the accelerator from one collection's documents (used by
+    /// benchmarks; the server's batched rebuild loop lives in main.rs).
     #[allow(dead_code)]
-    pub fn rebuild_from_storage(&self, docs: &[(String, Value)]) {
+    pub fn rebuild_from_storage(&self, collection: &str, docs: &[(String, Value)]) {
         self.begin_rebuild();
 
         let start = std::time::Instant::now();
-        self.rebuild_batch(docs);
+        self.rebuild_batch(collection, docs);
 
         let elapsed = start.elapsed();
         let count = docs.len();
@@ -727,27 +877,34 @@ impl ScanAccelerator {
         self.finish_rebuild();
     }
 
-    /// Process a batch of documents during incremental rebuild. Applies
+    /// Process one collection's batch during incremental rebuild. Applies
     /// LIVE (this is the rebuild's own feed — it must not queue against
     /// itself). Stops early if the memory budget is exceeded.
-    pub fn rebuild_batch(&self, docs: &[(String, Value)]) {
+    pub fn rebuild_batch(&self, collection: &str, docs: &[(String, Value)]) {
         for (doc_id, doc) in docs {
             if self.over_budget.load(Ordering::Relaxed) {
                 return;
             }
-            self.insert_live(doc_id, doc);
+            self.insert_live(collection, doc_id, doc);
         }
     }
 
     // ── Query (bitmap_scan) ─────────────────────────────────────────────
 
-    /// Attempt to resolve a filter entirely or partially via bitmaps.
-    /// Returns None if the filter cannot be handled by bitmaps at all.
-    pub fn bitmap_scan(&self, filter: &FilterNode) -> Option<BitmapScanResult> {
+    /// Attempt to resolve a filter entirely or partially via bitmaps,
+    /// scoped to `collection`. Returns None if the filter cannot be handled
+    /// by bitmaps at all. The position space and value bitmaps are GLOBAL
+    /// across collections; the final membership intersection is what keeps
+    /// counts, bare-page windows, and aggregate inputs collection-correct
+    /// (F1 — un-scoped answers counted and paged other collections' docs).
+    pub fn bitmap_scan(&self, collection: &str, filter: &FilterNode) -> Option<BitmapScanResult> {
         if !self.is_ready() {
             return None;
         }
-        self.bitmap_scan_inner(filter)
+        let mut result = self.bitmap_scan_inner(filter)?;
+        self.positions
+            .scope_to_collection(&mut result.bitmap, collection);
+        Some(result)
     }
 
     fn bitmap_scan_inner(&self, filter: &FilterNode) -> Option<BitmapScanResult> {
@@ -904,21 +1061,28 @@ impl ScanAccelerator {
 
     // ── Aggregation helpers ─────────────────────────────────────────────
 
-    /// Count documents per value for a bitmap field (for $group + $count aggregation).
+    /// Count documents per value for a bitmap field within `collection`
+    /// (for $group + $count aggregation). Values with no documents in this
+    /// collection are omitted — their bits belong to other collections.
     /// Returns None if the field doesn't have a bitmap column.
-    pub fn count_by_field(&self, field: &str) -> Option<Vec<(String, u64)>> {
+    pub fn count_by_field(&self, collection: &str, field: &str) -> Option<Vec<(String, u64)>> {
         let columns = self.columns.read();
         let column = columns.get(field)?;
         let bitmaps = column.value_bitmaps.read();
-        let result: Vec<(String, u64)> = bitmaps
-            .iter()
-            .map(|(value, bitmap)| (value.clone(), bitmap.len()))
-            .collect();
+        let mut result = Vec::new();
+        for (value, bitmap) in bitmaps.iter() {
+            let count = self.positions.scoped_len(bitmap, collection);
+            if count > 0 {
+                result.push((value.clone(), count));
+            }
+        }
         Some(result)
     }
 
     /// Count documents per value for a bitmap field, filtered by a match bitmap.
-    /// For $match + $group + $count aggregation.
+    /// For $match + $group + $count aggregation. The caller must pass a
+    /// bitmap that is already collection-scoped (i.e. one produced by
+    /// `bitmap_scan`) — the per-value intersections inherit its scope.
     pub fn count_by_field_filtered(
         &self,
         field: &str,
@@ -965,9 +1129,21 @@ impl ScanAccelerator {
                 });
             }
         }
+        let mut collection_positions: Vec<CollectionPositions> = self
+            .positions
+            .by_collection
+            .read()
+            .iter()
+            .map(|(name, bm)| CollectionPositions {
+                collection: name.clone(),
+                positions: bm.len(),
+            })
+            .collect();
+        collection_positions.sort_by(|a, b| a.collection.cmp(&b.collection));
         AcceleratorStats {
             ready: self.is_ready(),
             total_positions: self.positions.len(),
+            collections: collection_positions,
             columns: column_stats,
             memory_bytes: columns_memory + self.positions.memory_bytes(),
             memory_budget_bytes: self.config.read().max_memory_bytes,
@@ -1020,6 +1196,18 @@ impl ScanAccelerator {
             )
         };
 
+        // Membership snapshots after the pair drops (same benign-skew
+        // analysis as columns: a doc inserted in the gap is in membership
+        // but has no id/bits — resolve skips it and no value bitmap counts
+        // it; a doc deleted in the gap is correctly absent from membership).
+        let membership_snapshot: Vec<(String, RoaringBitmap)> = {
+            let members = self.positions.by_collection.read();
+            members
+                .iter()
+                .map(|(name, bm)| (name.clone(), bm.clone()))
+                .collect()
+        };
+
         let columns_snapshot: Vec<ColumnSnapshot> = {
             let cols = self.columns.read();
             cols.iter()
@@ -1034,10 +1222,21 @@ impl ScanAccelerator {
 
         // From here on, no RwLock guards are held. All I/O runs lock-free.
 
+        let mut membership_meta = Vec::new();
+        for (i, (coll, bm)) in membership_snapshot.iter().enumerate() {
+            let mut bytes = Vec::new();
+            bm.serialize_into(&mut bytes)
+                .map_err(std::io::Error::other)?;
+            let filename = format!("membership_{i}.roaring");
+            fs::write(bitmap_dir.join(&filename), &bytes)?;
+            membership_meta.push(serde_json::json!({"collection": coll, "file": filename}));
+        }
+
         let meta = serde_json::json!({
             "format": BITMAP_SNAPSHOT_FORMAT,
             "next_pos": next_pos,
             "count": pos_vec_snapshot.len(),
+            "memberships": membership_meta,
         });
         fs::write(
             bitmap_dir.join("positions.meta.json"),
@@ -1112,10 +1311,22 @@ impl ScanAccelerator {
     /// persist-interval stale, so docs written after the last persist are
     /// silently absent from it — serving it unreconciled means
     /// false-negative query results until an unrelated >25%-hole rebuild.
-    /// The live document count is the cheap invariant to check on load; on
+    /// Checked PER COLLECTION against storage's counts (F1 made the
+    /// per-collection grain available): a total that happens to balance
+    /// across collections can no longer mask skew, and a snapshot carrying
+    /// membership for a since-dropped collection is rejected too. On any
     /// mismatch the caller must rebuild from storage instead of serving.
-    pub fn snapshot_matches(&self, expected_docs: u64) -> bool {
-        u64::from(self.positions.len()) == expected_docs
+    pub fn snapshot_matches(&self, expected: &HashMap<String, u64>) -> bool {
+        let members = self.positions.by_collection.read();
+        for (coll, want) in expected {
+            let have = members.get(coll.as_str()).map(|m| m.len()).unwrap_or(0);
+            if have != *want {
+                return false;
+            }
+        }
+        members
+            .iter()
+            .all(|(coll, m)| m.is_empty() || expected.contains_key(coll))
     }
 
     /// Try to load bitmaps from disk. Returns true on success.
@@ -1150,62 +1361,51 @@ impl ScanAccelerator {
         }
         let next_pos = meta.get("next_pos").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
 
-        // Load position map (JSON format — supports variable-length string IDs)
-        // Try new JSON format first, fall back to legacy binary format
-        let (pos_vec, id_map) = if let Ok(json_data) =
-            fs::read_to_string(bitmap_dir.join("positions.map.json"))
-        {
-            let pos_vec: Vec<Option<String>> = match serde_json::from_str(&json_data) {
-                Ok(v) => v,
-                Err(_) => return false,
-            };
-            let id_json = match fs::read_to_string(bitmap_dir.join("positions.ids.json")) {
-                Ok(d) => d,
-                Err(_) => return false,
-            };
-            let id_map: HashMap<String, u32> = match serde_json::from_str(&id_json) {
-                Ok(v) => v,
-                Err(_) => return false,
-            };
-            (pos_vec, id_map)
-        } else {
-            // Legacy binary format (UUID-only, 16 bytes per entry)
-            let pos_data = match fs::read(bitmap_dir.join("positions.map.bin")) {
-                Ok(d) => d,
-                Err(_) => return false,
-            };
-            let mut pos_vec = Vec::new();
-            let mut i = 0;
-            while i + 17 <= pos_data.len() {
-                let present = pos_data[i];
-                i += 1;
-                if present == 1 {
-                    let uuid = Uuid::from_bytes(pos_data[i..i + 16].try_into().unwrap_or([0; 16]));
-                    pos_vec.push(Some(uuid.to_string()));
-                } else {
-                    pos_vec.push(None);
-                }
-                i += 16;
-            }
-            let id_data = match fs::read(bitmap_dir.join("positions.ids.bin")) {
-                Ok(d) => d,
-                Err(_) => return false,
-            };
-            let mut id_map = HashMap::new();
-            let mut j = 0;
-            while j + 20 <= id_data.len() {
-                let uuid = Uuid::from_bytes(id_data[j..j + 16].try_into().unwrap_or([0; 16]));
-                let pos = u32::from_le_bytes([
-                    id_data[j + 16],
-                    id_data[j + 17],
-                    id_data[j + 18],
-                    id_data[j + 19],
-                ]);
-                id_map.insert(uuid.to_string(), pos);
-                j += 20;
-            }
-            (pos_vec, id_map)
+        // Load position map (JSON — variable-length string IDs). The
+        // pre-format binary fallback died with the v2 gate: any snapshot
+        // old enough to carry .bin files reports format 1 and was refused
+        // above.
+        let json_data = match fs::read_to_string(bitmap_dir.join("positions.map.json")) {
+            Ok(d) => d,
+            Err(_) => return false,
         };
+        let pos_vec: Vec<Option<String>> = match serde_json::from_str(&json_data) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        let id_json = match fs::read_to_string(bitmap_dir.join("positions.ids.json")) {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
+        let id_map: HashMap<String, u32> = match serde_json::from_str(&id_json) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+
+        // Membership map (v3): refuse a snapshot without it — serving one
+        // would leave every collection scoped to empty.
+        let mut memberships: HashMap<String, RoaringBitmap> = HashMap::new();
+        let entries = match meta.get("memberships").and_then(|v| v.as_array()) {
+            Some(a) => a,
+            None => return false,
+        };
+        for entry in entries {
+            let (Some(coll), Some(file)) = (
+                entry.get("collection").and_then(|v| v.as_str()),
+                entry.get("file").and_then(|v| v.as_str()),
+            ) else {
+                return false;
+            };
+            let bytes = match fs::read(bitmap_dir.join(file)) {
+                Ok(d) => d,
+                Err(_) => return false,
+            };
+            let bm = match RoaringBitmap::deserialize_from(&bytes[..]) {
+                Ok(b) => b,
+                Err(_) => return false,
+            };
+            memberships.insert(coll.to_string(), bm);
+        }
 
         // Install position data (convert String → Arc<str>)
         *self.positions.id_to_pos.write() = id_map
@@ -1216,6 +1416,7 @@ impl ScanAccelerator {
             .into_iter()
             .map(|opt| opt.map(|s| Arc::from(s.as_str())))
             .collect();
+        *self.positions.by_collection.write() = memberships;
         self.positions.next_pos.store(next_pos, Ordering::Relaxed);
 
         // Load columns metadata
@@ -1311,10 +1512,18 @@ impl ScanAccelerator {
 pub struct AcceleratorStats {
     pub ready: bool,
     pub total_positions: u32,
+    /// Live positions per collection (the F1 scoping data, surfaced so a
+    /// deployment can verify per-collection counts against `/_collections`).
+    pub collections: Vec<CollectionPositions>,
     pub columns: Vec<ColumnStat>,
     pub memory_bytes: usize,
     pub memory_budget_bytes: u64,
     pub over_budget: bool,
+}
+
+pub struct CollectionPositions {
+    pub collection: String,
+    pub positions: u64,
 }
 
 pub struct ColumnStat {
@@ -1480,8 +1689,8 @@ mod tests {
     #[test]
     fn rebuild_queues_hooks_and_drains_idempotently() {
         let a = accel(&["f"]);
-        a.on_insert("a", &json!({"f": "x"}));
-        a.on_insert("b", &json!({"f": "y"}));
+        a.on_insert("c1", "a", &json!({"f": "x"}));
+        a.on_insert("c1", "b", &json!({"f": "y"}));
 
         a.begin_rebuild();
         assert!(!a.is_ready());
@@ -1489,9 +1698,9 @@ mod tests {
         // Concurrent-writer stand-ins while the rebuild owns the maps:
         // a brand-new doc the scan will never see, a delete of a doc the
         // scan WILL see, and an update of a doc the scan sees (new value).
-        a.on_insert("c", &json!({"f": "x"}));
-        a.on_delete("b", &json!({"f": "y"}));
-        a.on_update("a", &json!({"f": "x"}), &json!({"f": "z"}));
+        a.on_insert("c1", "c", &json!({"f": "x"}));
+        a.on_delete("c1", "b", &json!({"f": "y"}));
+        a.on_update("c1", "a", &json!({"f": "x"}), &json!({"f": "z"}));
         assert_eq!(
             a.positions.len(),
             0,
@@ -1501,10 +1710,13 @@ mod tests {
         // The "scan": storage at visit time still shows a (already updated
         // to z — scans read post-commit state) and b (its delete raced in
         // after the scan passed it).
-        a.rebuild_batch(&[
-            ("a".to_string(), json!({"f": "z"})),
-            ("b".to_string(), json!({"f": "y"})),
-        ]);
+        a.rebuild_batch(
+            "c1",
+            &[
+                ("a".to_string(), json!({"f": "z"})),
+                ("b".to_string(), json!({"f": "y"})),
+            ],
+        );
         a.finish_rebuild();
         assert!(a.is_ready());
 
@@ -1515,11 +1727,11 @@ mod tests {
         assert!(a.positions.get_position("b").is_none());
         assert!(a.positions.get_position("c").is_some());
 
-        let z = a.bitmap_scan(&eq_filter("f", json!("z"))).unwrap();
+        let z = a.bitmap_scan("c1", &eq_filter("f", json!("z"))).unwrap();
         assert_eq!(z.bitmap.len(), 1, "a counted exactly once under z");
-        let x = a.bitmap_scan(&eq_filter("f", json!("x"))).unwrap();
+        let x = a.bitmap_scan("c1", &eq_filter("f", json!("x"))).unwrap();
         assert_eq!(x.bitmap.len(), 1, "c counted exactly once under x");
-        let y = a.bitmap_scan(&eq_filter("f", json!("y"))).unwrap();
+        let y = a.bitmap_scan("c1", &eq_filter("f", json!("y"))).unwrap();
         assert_eq!(y.bitmap.len(), 0, "b fully gone");
     }
 
@@ -1530,12 +1742,12 @@ mod tests {
     fn rebuild_drain_dedups_scan_seen_insert() {
         let a = accel(&["f"]);
         a.begin_rebuild();
-        a.on_insert("dup", &json!({"f": "x"}));
-        a.rebuild_batch(&[("dup".to_string(), json!({"f": "x"}))]);
+        a.on_insert("c1", "dup", &json!({"f": "x"}));
+        a.rebuild_batch("c1", &[("dup".to_string(), json!({"f": "x"}))]);
         a.finish_rebuild();
 
         assert_eq!(a.positions.len(), 1);
-        let x = a.bitmap_scan(&eq_filter("f", json!("x"))).unwrap();
+        let x = a.bitmap_scan("c1", &eq_filter("f", json!("x"))).unwrap();
         assert_eq!(x.bitmap.len(), 1, "one position, one bit");
     }
 
@@ -1571,18 +1783,20 @@ mod tests {
     #[test]
     fn bitmap_eq_does_not_cross_match_types() {
         let a = accel(&["f"]);
-        a.on_insert("num", &json!({"f": 123}));
-        a.on_insert("str", &json!({"f": "123"}));
-        a.on_insert("nul", &json!({"f": null}));
-        a.on_insert("marker", &json!({"f": "__null__"}));
+        a.on_insert("c1", "num", &json!({"f": 123}));
+        a.on_insert("c1", "str", &json!({"f": "123"}));
+        a.on_insert("c1", "nul", &json!({"f": null}));
+        a.on_insert("c1", "marker", &json!({"f": "__null__"}));
 
-        let s = a.bitmap_scan(&eq_filter("f", json!("123"))).unwrap();
+        let s = a.bitmap_scan("c1", &eq_filter("f", json!("123"))).unwrap();
         assert_eq!(s.bitmap.len(), 1, "string eq matches only the string doc");
-        let n = a.bitmap_scan(&eq_filter("f", json!(123))).unwrap();
+        let n = a.bitmap_scan("c1", &eq_filter("f", json!(123))).unwrap();
         assert_eq!(n.bitmap.len(), 1, "number eq matches only the number doc");
-        let z = a.bitmap_scan(&eq_filter("f", json!(null))).unwrap();
+        let z = a.bitmap_scan("c1", &eq_filter("f", json!(null))).unwrap();
         assert_eq!(z.bitmap.len(), 1, "null eq matches only the null doc");
-        let m = a.bitmap_scan(&eq_filter("f", json!("__null__"))).unwrap();
+        let m = a
+            .bitmap_scan("c1", &eq_filter("f", json!("__null__")))
+            .unwrap();
         assert_eq!(
             m.bitmap.len(),
             1,
@@ -1597,21 +1811,26 @@ mod tests {
     fn stale_snapshot_fails_reconciliation_on_load() {
         let tmp = tempfile::TempDir::new().unwrap();
         let a = accel(&["f"]);
-        a.on_insert("a", &json!({"f": "x"}));
-        a.on_insert("b", &json!({"f": "y"}));
+        a.on_insert("c1", "a", &json!({"f": "x"}));
+        a.on_insert("c1", "b", &json!({"f": "y"}));
         a.persist_to_disk(tmp.path(), "_all").unwrap();
         // Written after the persist — the snapshot no longer covers storage.
-        a.on_insert("c", &json!({"f": "x"}));
+        a.on_insert("c1", "c", &json!({"f": "x"}));
 
         let restarted = accel(&["f"]);
         assert!(restarted.load_from_disk(tmp.path(), "_all"));
+        let expect = |n: u64| HashMap::from([("c1".to_string(), n)]);
         assert!(
-            restarted.snapshot_matches(2),
+            restarted.snapshot_matches(&expect(2)),
             "snapshot agrees with its own era"
         );
         assert!(
-            !restarted.snapshot_matches(3),
+            !restarted.snapshot_matches(&expect(3)),
             "snapshot must fail reconciliation against post-persist storage"
+        );
+        assert!(
+            !restarted.snapshot_matches(&HashMap::new()),
+            "membership for a since-dropped collection must fail reconciliation"
         );
     }
 
@@ -1621,12 +1840,12 @@ mod tests {
     #[test]
     fn on_delete_missing_field_leaves_other_columns_alone() {
         let a = accel(&["kind", "tier"]);
-        a.on_insert("doc-1", &json!({"kind": "a"})); // no tier
-        a.on_insert("doc-2", &json!({"kind": "b", "tier": "x"}));
+        a.on_insert("c1", "doc-1", &json!({"kind": "a"})); // no tier
+        a.on_insert("c1", "doc-2", &json!({"kind": "b", "tier": "x"}));
         assert_eq!(exists_len(&a, "kind"), 2);
         assert_eq!(exists_len(&a, "tier"), 1);
 
-        a.on_delete("doc-1", &json!({"kind": "a"}));
+        a.on_delete("c1", "doc-1", &json!({"kind": "a"}));
         assert_eq!(exists_len(&a, "kind"), 1);
         assert_eq!(exists_len(&a, "tier"), 1); // untouched — doc-1 had none
     }
@@ -1636,11 +1855,12 @@ mod tests {
     #[test]
     fn on_update_unchanged_column_is_noop() {
         let a = accel(&["kind", "tier"]);
-        a.on_insert("doc-1", &json!({"kind": "a", "tier": "x"}));
-        a.on_insert("doc-2", &json!({"kind": "a", "tier": "y"}));
+        a.on_insert("c1", "doc-1", &json!({"kind": "a", "tier": "x"}));
+        a.on_insert("c1", "doc-2", &json!({"kind": "a", "tier": "y"}));
 
         // Same values on both sides for kind; only tier changes.
         a.on_update(
+            "c1",
             "doc-1",
             &json!({"kind": "a", "tier": "x"}),
             &json!({"kind": "a", "tier": "z"}),
@@ -1664,9 +1884,9 @@ mod tests {
     fn set_max_cardinality_applies_to_next_insert() {
         let a = accel(&["kind"]);
         a.set_max_cardinality(2);
-        a.on_insert("d1", &json!({"kind": "a"}));
-        a.on_insert("d2", &json!({"kind": "b"}));
-        a.on_insert("d3", &json!({"kind": "c"})); // over the cap — not tracked
+        a.on_insert("c1", "d1", &json!({"kind": "a"}));
+        a.on_insert("c1", "d2", &json!({"kind": "b"}));
+        a.on_insert("c1", "d3", &json!({"kind": "c"})); // over the cap — not tracked
 
         let cols = a.columns.read();
         let kind = cols.get("kind").unwrap();
@@ -1682,9 +1902,9 @@ mod tests {
     fn resolve_window_skips_holes_without_consuming_window() {
         let a = accel(&["kind"]);
         for i in 0..5 {
-            a.on_insert(&format!("doc-{i}"), &json!({"kind": "a"}));
+            a.on_insert("c1", &format!("doc-{i}"), &json!({"kind": "a"}));
         }
-        a.on_delete("doc-2", &json!({"kind": "a"})); // hole at position 2
+        a.on_delete("c1", "doc-2", &json!({"kind": "a"})); // hole at position 2
 
         let all: RoaringBitmap = (0u32..5).collect();
         let ids = a.positions.resolve_window(&all, 0, usize::MAX);
@@ -1697,6 +1917,150 @@ mod tests {
         assert_eq!(
             ids.iter().map(|s| s.as_ref()).collect::<Vec<_>>(),
             ["doc-1", "doc-3"]
+        );
+    }
+
+    /// F1: the position space and value bitmaps are global across
+    /// collections, so every answer must be intersected with the queried
+    /// collection's membership — un-scoped answers counted (and bare pages
+    /// ghosted) other collections' documents.
+    #[test]
+    fn bitmap_scan_is_collection_scoped() {
+        let a = accel(&["kind"]);
+        a.on_insert("c1", "a1", &json!({"kind": "x"}));
+        a.on_insert("c1", "a2", &json!({"kind": "x"}));
+        a.on_insert("c2", "b1", &json!({"kind": "x"}));
+
+        let c1 = a.bitmap_scan("c1", &eq_filter("kind", json!("x"))).unwrap();
+        assert_eq!(c1.bitmap.len(), 2);
+        let c2 = a.bitmap_scan("c2", &eq_filter("kind", json!("x"))).unwrap();
+        assert_eq!(c2.bitmap.len(), 1);
+        let none = a
+            .bitmap_scan("absent", &eq_filter("kind", json!("x")))
+            .unwrap();
+        assert_eq!(none.bitmap.len(), 0, "unknown collection scopes to empty");
+
+        // Deletes maintain membership, not just the value bitmaps.
+        a.on_delete("c1", "a2", &json!({"kind": "x"}));
+        let c1 = a.bitmap_scan("c1", &eq_filter("kind", json!("x"))).unwrap();
+        assert_eq!(c1.bitmap.len(), 1);
+    }
+
+    /// F1c: aggregate group counts are per-collection; values with no
+    /// documents in the queried collection are omitted entirely.
+    #[test]
+    fn count_by_field_is_collection_scoped() {
+        let a = accel(&["kind"]);
+        a.on_insert("c1", "a1", &json!({"kind": "x"}));
+        a.on_insert("c2", "b1", &json!({"kind": "x"}));
+        a.on_insert("c2", "b2", &json!({"kind": "y"}));
+
+        let mut c2 = a.count_by_field("c2", "kind").unwrap();
+        c2.sort();
+        assert_eq!(c2, vec![("sx".to_string(), 1), ("sy".to_string(), 1)]);
+        let c1 = a.count_by_field("c1", "kind").unwrap();
+        assert_eq!(
+            c1,
+            vec![("sx".to_string(), 1)],
+            "y omitted — zero docs in c1"
+        );
+    }
+
+    /// F1d: dropping a collection removes exactly its positions and bits —
+    /// other collections stay accelerated and ready never flips.
+    #[test]
+    fn drop_collection_is_surgical() {
+        let a = accel(&["kind"]);
+        a.on_insert("c1", "a1", &json!({"kind": "x"}));
+        a.on_insert("c2", "b1", &json!({"kind": "x"}));
+        a.on_insert("c2", "b2", &json!({"kind": "y"}));
+
+        a.on_drop_collection("c2");
+
+        assert!(a.is_ready(), "drop must not disable acceleration");
+        assert_eq!(a.positions.len(), 1, "only c1's position survives");
+        assert!(a.positions.get_position("b1").is_none());
+        let c2 = a.bitmap_scan("c2", &eq_filter("kind", json!("x"))).unwrap();
+        assert_eq!(c2.bitmap.len(), 0, "dropped collection scans empty");
+        let c1 = a.bitmap_scan("c1", &eq_filter("kind", json!("x"))).unwrap();
+        assert_eq!(c1.bitmap.len(), 1, "surviving collection intact");
+
+        // "y" existed only in c2: its bitmap emptied and was removed, so
+        // cardinality reflects live values only.
+        let cols = a.columns.read();
+        let kind = cols.get("kind").unwrap();
+        assert_eq!(kind.cardinality.load(Ordering::Relaxed), 1);
+        drop(cols);
+
+        // Idempotent.
+        a.on_drop_collection("c2");
+        assert_eq!(a.positions.len(), 1);
+    }
+
+    /// A drop_collection landing mid-rebuild queues like any other delta
+    /// and drains after the scan — cleaning up whatever the scan indexed
+    /// for the dropped collection before the drop arrived.
+    #[test]
+    fn drop_during_rebuild_queues_and_drains() {
+        let a = accel(&["kind"]);
+        a.begin_rebuild();
+        a.rebuild_batch("c1", &[("a1".to_string(), json!({"kind": "x"}))]);
+        a.rebuild_batch("c2", &[("b1".to_string(), json!({"kind": "x"}))]);
+        a.on_drop_collection("c1"); // queued — not applied yet
+        assert_eq!(a.positions.len(), 2, "drop is queued during rebuild");
+        a.finish_rebuild();
+
+        assert!(a.is_ready());
+        assert_eq!(a.positions.len(), 1);
+        assert!(a.positions.get_position("a1").is_none());
+        let c2 = a.bitmap_scan("c2", &eq_filter("kind", json!("x"))).unwrap();
+        assert_eq!(c2.bitmap.len(), 1);
+    }
+
+    /// v3 snapshots round-trip the membership map: scoped answers and the
+    /// per-collection reconcile both work on a freshly loaded accelerator.
+    #[test]
+    fn membership_persists_and_reloads_v3() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let a = accel(&["kind"]);
+        a.on_insert("c1", "a1", &json!({"kind": "x"}));
+        a.on_insert("c2", "b1", &json!({"kind": "x"}));
+        a.on_insert("c2", "b2", &json!({"kind": "y"}));
+        a.persist_to_disk(tmp.path(), "_all").unwrap();
+
+        let r = accel(&["kind"]);
+        assert!(r.load_from_disk(tmp.path(), "_all"));
+        let c1 = r.bitmap_scan("c1", &eq_filter("kind", json!("x"))).unwrap();
+        assert_eq!(c1.bitmap.len(), 1);
+        let c2 = r.bitmap_scan("c2", &eq_filter("kind", json!("x"))).unwrap();
+        assert_eq!(c2.bitmap.len(), 1);
+        let expected = HashMap::from([("c1".to_string(), 1u64), ("c2".to_string(), 2u64)]);
+        assert!(r.snapshot_matches(&expected));
+    }
+
+    /// Pre-v3 snapshots (no membership map) are refused on load, routing
+    /// startup through a storage rebuild — the S2-4 format-gate precedent.
+    #[test]
+    fn pre_v3_snapshot_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let a = accel(&["kind"]);
+        a.on_insert("c1", "a1", &json!({"kind": "x"}));
+        a.persist_to_disk(tmp.path(), "_all").unwrap();
+
+        let meta_path = tmp
+            .path()
+            .join("bitmap")
+            .join("_all")
+            .join("positions.meta.json");
+        let mut meta: Value =
+            serde_json::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+        meta["format"] = json!(2);
+        fs::write(&meta_path, serde_json::to_string(&meta).unwrap()).unwrap();
+
+        let r = accel(&["kind"]);
+        assert!(
+            !r.load_from_disk(tmp.path(), "_all"),
+            "v2 snapshots must route to a rebuild"
         );
     }
 }

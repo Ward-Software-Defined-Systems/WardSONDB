@@ -167,7 +167,7 @@ pub fn plan_query(
     // For count_only queries, bitmap is ~2500x faster than index counting.
     // Try bitmap before indexes when all filter fields have bitmap columns.
     if count_only {
-        match try_bitmap_scan(scan_accelerator, filter) {
+        match try_bitmap_scan(scan_accelerator, collection, filter) {
             Some(plan) if plan.post_filter.is_none() => return plan,
             other => bitmap_memo = Some(other),
         }
@@ -186,7 +186,7 @@ pub fn plan_query(
             // Try bitmap scan before full scan
             if let Some(plan) = bitmap_memo
                 .take()
-                .unwrap_or_else(|| try_bitmap_scan(scan_accelerator, filter))
+                .unwrap_or_else(|| try_bitmap_scan(scan_accelerator, collection, filter))
             {
                 return plan;
             }
@@ -279,7 +279,7 @@ pub fn plan_query(
             // Try bitmap scan before full scan
             if let Some(plan) = bitmap_memo
                 .take()
-                .unwrap_or_else(|| try_bitmap_scan(scan_accelerator, filter))
+                .unwrap_or_else(|| try_bitmap_scan(scan_accelerator, collection, filter))
             {
                 return plan;
             }
@@ -296,7 +296,7 @@ pub fn plan_query(
         FilterNode::Or(children) => {
             if let Some(plan) = bitmap_memo
                 .take()
-                .unwrap_or_else(|| try_bitmap_scan(scan_accelerator, filter))
+                .unwrap_or_else(|| try_bitmap_scan(scan_accelerator, collection, filter))
             {
                 return plan;
             }
@@ -314,7 +314,7 @@ pub fn plan_query(
         _ => {
             if let Some(plan) = bitmap_memo
                 .take()
-                .unwrap_or_else(|| try_bitmap_scan(scan_accelerator, filter))
+                .unwrap_or_else(|| try_bitmap_scan(scan_accelerator, collection, filter))
             {
                 return plan;
             }
@@ -780,12 +780,17 @@ fn try_compound_range(
     })
 }
 
-/// Try to use the bitmap scan accelerator for a filter.
-fn try_bitmap_scan(scan_accelerator: &ScanAccelerator, filter: &FilterNode) -> Option<QueryPlan> {
+/// Try to use the bitmap scan accelerator for a filter, scoped to the
+/// queried collection (the accelerator's position space is global — F1).
+fn try_bitmap_scan(
+    scan_accelerator: &ScanAccelerator,
+    collection: &str,
+    filter: &FilterNode,
+) -> Option<QueryPlan> {
     if !scan_accelerator.is_ready() {
         return None;
     }
-    let result = scan_accelerator.bitmap_scan(filter)?;
+    let result = scan_accelerator.bitmap_scan(collection, filter)?;
     // Only use bitmap scan if the bitmap has a reasonable size (not empty)
     // or if it's a count_only query (where empty is a valid fast result)
     Some(QueryPlan {

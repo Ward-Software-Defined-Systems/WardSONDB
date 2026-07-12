@@ -114,6 +114,21 @@ Behavior changes an existing client could observe, most significant first.
 
 ### Fixed
 
+- **Bitmap-accelerated answers are now collection-scoped.** The accelerator
+  shares one position space across all collections, and fully-covered
+  filters leaked that: `count_only` could report more matches than the
+  collection holds (other collections' documents sharing the value were
+  counted), windowed pages reported the cross-collection total and returned
+  empty pages with `has_more: true` past the collection's real matches, and
+  bitmap-served `$group` counts summed every collection. Single-collection
+  deployments were unaffected. Persisted bitmap snapshots move to format v3
+  (per-collection membership); the first start after upgrading rebuilds the
+  accelerator from storage once.
+- **Dropping a collection no longer disables the bitmap accelerator.** The
+  drop now surgically removes only the dropped collection's bitmap data —
+  every other collection stays accelerated (previously ALL acceleration was
+  cleared and nothing re-enabled it until restart). `/_stats` gains
+  `scan_accelerator.positions_by_collection` for verifying the scoping.
 - Bitmap-accelerated `$or` with partial column coverage returned the
   **intersection** of the covered arms instead of the union; mixed-coverage
   `$or` now falls back to a full scan (fully-covered `$or` keeps

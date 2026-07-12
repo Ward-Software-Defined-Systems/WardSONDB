@@ -78,6 +78,10 @@ pub async fn stats(State(state): State<Arc<AppState>>) -> Result<Json<ApiRespons
         "scan_accelerator": {
             "ready": accel_stats.ready,
             "total_positions": accel_stats.total_positions,
+            "positions_by_collection": accel_stats.collections.iter().map(|c| serde_json::json!({
+                "collection": c.collection,
+                "positions": c.positions,
+            })).collect::<Vec<_>>(),
             "memory_bytes": accel_stats.memory_bytes,
             "memory_budget_bytes": accel_stats.memory_budget_bytes,
             "over_budget": accel_stats.over_budget,

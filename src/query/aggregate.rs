@@ -621,7 +621,7 @@ fn try_index_only_aggregate(
 /// 2. $match on bitmap field(s) + $group by bitmap field with $count only
 fn try_bitmap_aggregate(
     storage: &Storage,
-    _collection: &str,
+    collection: &str,
     pipeline: &[Value],
 ) -> Result<Option<AggregateResult>, AppError> {
     let accelerator = &storage.scan_accelerator;
@@ -688,7 +688,7 @@ fn try_bitmap_aggregate(
     // Execute bitmap aggregation
     let counts = if let Some(ref filter) = match_filter {
         // Pattern 2: $match + $group
-        let bitmap_result = match accelerator.bitmap_scan(filter) {
+        let bitmap_result = match accelerator.bitmap_scan(collection, filter) {
             Some(r) if r.residual_filter.is_none() => r,
             _ => return Ok(None), // Can't fully resolve $match via bitmaps
         };
@@ -698,7 +698,7 @@ fn try_bitmap_aggregate(
         }
     } else {
         // Pattern 1: $group only
-        match accelerator.count_by_field(group_field) {
+        match accelerator.count_by_field(collection, group_field) {
             Some(c) => c,
             None => return Ok(None),
         }
