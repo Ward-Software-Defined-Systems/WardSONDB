@@ -1799,7 +1799,10 @@ async fn test_compound_index_creation() {
     assert_eq!(indexes.len(), 1);
     assert_eq!(indexes[0]["name"], "idx_type_severity");
 
-    // Query on the first field of compound index should use it
+    // A query on the first field ALONE is correct but not served from the
+    // compound index (F2: compound indexes exclude docs missing other
+    // components, so the old leading-field fallback could return wrong
+    // results; single-field lookups now require a single-field index).
     let resp = client
         .post(format!("{base_url}/events/query"))
         .json(&json!({"filter": {"event_type": "firewall"}}))
@@ -1808,8 +1811,19 @@ async fn test_compound_index_creation() {
         .unwrap();
     let body: Value = resp.json().await.unwrap();
     assert!(body["ok"].as_bool().unwrap());
-    assert_eq!(body["meta"]["index_used"], "idx_type_severity");
+    assert_eq!(body["meta"]["index_used"], Value::Null);
     assert_eq!(body["meta"]["total_count"], 10); // 30/3 = 10 firewall
+
+    // Both fields — the compound index's real contract (CompoundEq).
+    let resp = client
+        .post(format!("{base_url}/events/query"))
+        .json(&json!({"filter": {"event_type": "firewall", "severity": 0}}))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["meta"]["index_used"], "idx_type_severity");
+    assert_eq!(body["meta"]["total_count"], 2); // firewall docs i ∈ {0, 15}
 }
 
 #[tokio::test]
@@ -1915,10 +1929,11 @@ async fn test_compound_index_maintained_on_crud() {
         .unwrap()
         .to_string();
 
-    // Query on first field should use compound index
+    // Both-field query exercises the compound index (leading-field-only
+    // queries are no longer served from it — F2).
     let resp = client
         .post(format!("{base_url}/tasks/query"))
-        .json(&json!({"filter": {"status": "active"}}))
+        .json(&json!({"filter": {"status": "active", "priority": 1}}))
         .send()
         .await
         .unwrap();
@@ -1948,6 +1963,16 @@ async fn test_compound_index_maintained_on_crud() {
     let resp = client
         .post(format!("{base_url}/tasks/query"))
         .json(&json!({"filter": {"status": "done"}}))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["meta"]["total_count"], 1);
+
+    // ...and the compound path still finds it with both fields.
+    let resp = client
+        .post(format!("{base_url}/tasks/query"))
+        .json(&json!({"filter": {"status": "done", "priority": 1}}))
         .send()
         .await
         .unwrap();
@@ -10636,4 +10661,112 @@ async fn test_fjall_bitmap_multi_collection_scoped_counts() {
     let (b_red, _) =
         count_only_with_strategy(&client, &base_url, "events_b", json!({"category": "red"})).await;
     assert_eq!(b_red, 3);
+}
+
+/// F2: eq/in/range on a field whose ONLY index is compound must not be
+/// served from that index — compound indexes exclude documents missing any
+/// component field, so the old leading-field fallback silently dropped them
+/// (with several matching compounds, WHICH one served was per-process
+/// HashMap order; with exactly one, the undercount is deterministic — this
+/// test fails on the pre-fix planner with 2 instead of 3). Also pins the
+/// unblocked remedy: a real single-field index is creatable (the fallback
+/// used to misdetect it as a duplicate) and takes over, complete.
+#[tokio::test]
+async fn test_compound_leading_field_not_served_from_partial_index() {
+    let (base_url, _tmp) = start_test_server().await;
+    let client = Client::new();
+    client
+        .post(format!("{base_url}/_collections"))
+        .json(&json!({"name": "logs"}))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("{base_url}/logs/indexes"))
+        .json(&json!({"name": "idx_kind_action", "fields": ["kind", "action"]}))
+        .send()
+        .await
+        .unwrap();
+    for doc in [
+        json!({"kind": "sys", "action": "a"}),
+        json!({"kind": "sys", "action": "b"}),
+        json!({"kind": "sys"}), // no action — absent from the compound index
+        json!({"kind": "net", "action": "a"}),
+    ] {
+        client
+            .post(format!("{base_url}/logs/docs"))
+            .json(&doc)
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let count = |filter: Value, count_only: bool| {
+        let client = client.clone();
+        let base_url = base_url.clone();
+        async move {
+            let body: Value = client
+                .post(format!("{base_url}/logs/query"))
+                .json(&json!({"filter": filter, "count_only": count_only}))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(body["ok"], true, "query failed: {body}");
+            (
+                body["meta"]["total_count"].as_u64(),
+                body["meta"]["scan_strategy"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string(),
+                body["data"].as_array().map(|d| d.len()).unwrap_or(0),
+            )
+        }
+    };
+
+    // eq count: all 3 sys docs, including the action-less one.
+    let (total, strat, _) = count(json!({"kind": "sys"}), true).await;
+    assert_eq!(
+        total,
+        Some(3),
+        "must include the doc the compound index skipped"
+    );
+    assert_ne!(
+        strat, "index_eq",
+        "no single-field index exists — no index_eq"
+    );
+
+    // eq doc query: same 3 docs.
+    let (_, strat, n) = count(json!({"kind": "sys"}), false).await;
+    assert_eq!(n, 3);
+    assert_ne!(strat, "index_eq");
+
+    // $in and bounded range on the leading field: same rule.
+    let (total, strat, _) = count(json!({"kind": {"$in": ["sys", "net"]}}), true).await;
+    assert_eq!(total, Some(4));
+    assert_ne!(strat, "index_in");
+    let (total, strat, _) = count(json!({"kind": {"$gte": "sys", "$lte": "sys"}}), true).await;
+    assert_eq!(total, Some(3));
+    assert_ne!(strat, "index_range");
+
+    // The remedy is unblocked: a single-field index on the same leading
+    // field is NOT a duplicate of the compound one...
+    let resp = client
+        .post(format!("{base_url}/logs/indexes"))
+        .json(&json!({"name": "idx_kind", "field": "kind"}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        resp.status().is_success(),
+        "single-field index creation must not collide with the compound: {:?}",
+        resp.text().await
+    );
+
+    // ...and once it exists (complete — every doc has kind), index_eq
+    // serves the full answer.
+    let (total, strat, _) = count(json!({"kind": "sys"}), true).await;
+    assert_eq!((total, strat.as_str()), (Some(3), "index_eq"));
 }

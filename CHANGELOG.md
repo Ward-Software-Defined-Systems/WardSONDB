@@ -114,6 +114,15 @@ Behavior changes an existing client could observe, most significant first.
 
 ### Fixed
 
+- **Single-field queries are no longer served from compound indexes.**
+  With no single-field index, an equality/`$in`/range filter on a field was
+  answered from an arbitrary compound index leading with it — but compound
+  indexes exclude documents missing any of their other component fields, so
+  such queries silently dropped those documents (and WHICH compound index
+  answered was arbitrary per process, so results could differ across
+  restarts). These filters now fall through to the bitmap accelerator or a
+  full scan; create a real single-field index for hot paths — doing so is
+  no longer misdetected as a duplicate of the compound index.
 - **Bitmap-accelerated answers are now collection-scoped.** The accelerator
   shares one position space across all collections, and fully-covered
   filters leaked that: `count_only` could report more matches than the

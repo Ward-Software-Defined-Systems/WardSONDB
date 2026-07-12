@@ -134,30 +134,31 @@ impl IndexManager {
             .collect()
     }
 
-    /// Get a single-field index (or the first field of a compound index) by field path.
-    /// Prefers exact single-field indexes over compound indexes.
+    /// Get the SINGLE-FIELD index for a field path, if one exists.
+    ///
+    /// Deliberately never falls back to a compound index whose leading
+    /// field matches: compound indexes only contain documents that have ALL
+    /// component fields (missing-field docs are skipped at write time), so
+    /// serving a single-field lookup from one silently drops every document
+    /// lacking the other components — and WHICH compound index won the old
+    /// fallback was HashMap iteration order, i.e. arbitrary per process
+    /// (F2, found by the pre-merge rig: `{"event_type":"system"}` counted 0
+    /// through idx_type_action because system events carry no
+    /// network.action, while a fresh process picking idx_type_time answered
+    /// correctly). Single-field lookups on compound-only fields fall
+    /// through to the bitmap accelerator or a full scan; the remedy for hot
+    /// paths is creating the real single-field index — which is no longer
+    /// misdetected as a duplicate of the compound one.
     pub fn get_index_for_field(
         &self,
         collection: &str,
         field: &str,
     ) -> Option<(IndexDef, PartitionId)> {
         let indexes = self.indexes.read();
-
-        let single = indexes
-            .iter()
-            .find(|((col, _), entry)| {
-                col == collection && entry.def.fields.len() == 1 && entry.def.fields[0] == field
-            })
-            .map(|(_, entry)| (entry.def.clone(), entry.partition.clone()));
-
-        if single.is_some() {
-            return single;
-        }
-
         indexes
             .iter()
             .find(|((col, _), entry)| {
-                col == collection && !entry.def.fields.is_empty() && entry.def.fields[0] == field
+                col == collection && entry.def.fields.len() == 1 && entry.def.fields[0] == field
             })
             .map(|(_, entry)| (entry.def.clone(), entry.partition.clone()))
     }
