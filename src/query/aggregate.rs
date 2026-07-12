@@ -38,6 +38,9 @@ pub fn execute_aggregate(
     if request.pipeline.is_empty() {
         return Err(AppError::InvalidPipeline("Pipeline cannot be empty".into()));
     }
+    // Uniform 404 contract regardless of which path serves the pipeline —
+    // the bitmap/index-only fast paths never touch the doc partition (F3).
+    storage.ensure_collection_exists(collection)?;
 
     if request.pipeline.len() > MAX_PIPELINE_STAGES {
         return Err(AppError::InvalidPipeline(format!(

@@ -33,12 +33,17 @@ pub fn execute_query(
     collection: &str,
     query: &ParsedQuery,
 ) -> Result<QueryResult, AppError> {
+    // The 404 contract holds for EVERY plan shape. Only execute_full_scan
+    // gated it before, so bitmap/index-planned queries on a missing
+    // collection answered 200-with-empty instead of COLLECTION_NOT_FOUND
+    // (F3 — observed right after the rig's rotation drop).
+    storage.ensure_collection_exists(collection)?;
+
     // Unfiltered count: DocCounters is authoritative (seeded by a full count
     // at startup, maintained on every insert/delete path including bulk,
     // delete_by_query, and TTL cleanup), so the O(n) scan-and-parse the full
     // scan would do is pure waste — ~335 ms on a 100k-doc collection.
     if query.count_only && query.filter.is_none() {
-        storage.ensure_collection_exists(collection)?;
         return Ok(QueryResult {
             docs: vec![],
             total_count: Some(storage.doc_counts.get(collection).max(0) as u64),

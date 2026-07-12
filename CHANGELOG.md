@@ -114,6 +114,11 @@ Behavior changes an existing client could observe, most significant first.
 
 ### Fixed
 
+- **Queries on a missing collection return `404 COLLECTION_NOT_FOUND` on
+  every plan shape.** The existence check previously ran only on the
+  full-scan path, so `/query`, `/aggregate`, and `/distinct` requests served
+  by the bitmap or index-only fast paths answered `200` with empty results
+  for collections that don't exist (e.g. just-dropped ones).
 - **Single-field queries are no longer served from compound indexes.**
   With no single-field index, an equality/`$in`/range filter on a field was
   answered from an arbitrary compound index leading with it — but compound

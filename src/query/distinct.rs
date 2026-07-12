@@ -24,6 +24,9 @@ pub fn execute_distinct(
     filter: Option<&FilterNode>,
     limit: usize,
 ) -> Result<DistinctResult, AppError> {
+    // Uniform 404 contract regardless of which path serves the distinct (F3).
+    storage.ensure_collection_exists(collection)?;
+
     // If no filter, try index-only scan on the distinct field
     if filter.is_none()
         && let Some(result) = try_index_only_distinct(storage, collection, field, limit)?

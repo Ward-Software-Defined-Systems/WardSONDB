@@ -10770,3 +10770,82 @@ async fn test_compound_leading_field_not_served_from_partial_index() {
     let (total, strat, _) = count(json!({"kind": "sys"}), true).await;
     assert_eq!((total, strat.as_str()), (Some(3), "index_eq"));
 }
+
+/// F3: the COLLECTION_NOT_FOUND contract must not depend on the query plan.
+/// The existence gate lived only in execute_full_scan, so bitmap- and
+/// index-fast-path-planned queries/aggregates/distincts on a missing (e.g.
+/// freshly dropped) collection returned 200-with-empty instead of 404 —
+/// observed live right after the rig's rotation drop.
+#[tokio::test]
+async fn test_missing_collection_404_regardless_of_plan() {
+    let (base_url, _tmp) = start_test_server_with_bitmap("category").await;
+    let client = Client::new();
+    // One real collection so the accelerator has live columns; the queried
+    // collection never exists.
+    setup_two_collection_bitmap_data(&base_url, &client).await;
+
+    // Bitmap-planned count (pre-fix: 200, count 0, strategy "bitmap").
+    let resp = client
+        .post(format!("{base_url}/never_created/query"))
+        .json(&json!({"filter": {"category": "red"}, "count_only": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "COLLECTION_NOT_FOUND");
+
+    // Bitmap-planned doc page.
+    let resp = client
+        .post(format!("{base_url}/never_created/query"))
+        .json(&json!({"filter": {"category": "red"}, "limit": 5}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    // Bitmap aggregate fast path.
+    let resp = client
+        .post(format!("{base_url}/never_created/aggregate"))
+        .json(&json!({"pipeline": [{"$group": {"_id": "category", "n": {"$count": {}}}}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    // Distinct.
+    let resp = client
+        .post(format!("{base_url}/never_created/distinct"))
+        .json(&json!({"field": "category"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    // Dropped-collection variant: exists, then dropped, then queried.
+    client
+        .delete(format!("{base_url}/events_b"))
+        .send()
+        .await
+        .unwrap();
+    let resp = client
+        .post(format!("{base_url}/events_b/query"))
+        .json(&json!({"filter": {"category": "red"}, "count_only": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        404,
+        "dropped collection must 404 on bitmap plans"
+    );
+
+    // The unfiltered doc_counter count keeps its 404 too.
+    let resp = client
+        .post(format!("{base_url}/events_b/query"))
+        .json(&json!({"count_only": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
