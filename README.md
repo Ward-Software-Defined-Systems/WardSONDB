@@ -14,7 +14,7 @@ A lightweight, high-performance JSON document database built in Rust. Designed f
 - **Single self-contained binary** — no JVM, no cluster setup, no external services at runtime. Build-time requires a C/C++ toolchain, `cmake`, `clang`, and `libclang` (RocksDB + zstd use bindgen; aws-lc-sys via rustls uses cmake + cc) — see Quick Start
 - **High-throughput ingest** — 76,000+ single inserts/sec, 278,000+ docs/sec bulk
 - **Secondary & compound indexes** — sub-millisecond indexed lookups at millions of documents
-- **Bitmap Scan Accelerator** *(Alpha)* — sub-millisecond aggregation and filtered counts on categorical fields without touching documents
+- **Bitmap Scan Accelerator** — sub-millisecond aggregation and filtered counts on categorical fields without touching documents
 - **Compound Range Scans** *(Alpha)* — equality prefix + range suffix on compound indexes for fast time-windowed queries
 - **Aggregation pipelines** — `$match`, `$group`, `$sort`, `$limit`, `$skip` with index-accelerated execution
 - **Cursor pagination** — opaque `next_cursor` tokens for gap-free keyset walks over large result sets (strict sort validation; directions `asc`/`desc`/`1`/`-1` on both `/query` and `$sort`)
@@ -218,7 +218,7 @@ curl -X PUT http://localhost:8080/events/ttl \
 | `--metrics-public` | `false` | Allow unauthenticated access to `/_metrics` |
 | `--log-level` | `info` | Log level (trace/debug/info/warn/error) |
 | `--log-file` | `wardsondb.log` | Log file path (non-blocking writer; unwritable path = warn and continue without file logging) |
-| `--bitmap-fields` | | Comma-separated fields for bitmap scan acceleration *(Alpha)* |
+| `--bitmap-fields` | | Comma-separated fields for bitmap scan acceleration |
 | `--bitmap-memory-mb` | `0` | Bitmap memory budget in MiB (0 = auto: min(4096, 10% system RAM)) |
 | `--verbose` | `false` | Enable per-request logging (terminal **and** file; off by default — request logs grow without bound over long uptimes) |
 | `--query-timeout` | `30` | Read timeout in seconds for query/aggregate/distinct/get-by-id (0 = no timeout) |
@@ -274,7 +274,7 @@ Full API documentation: [API.md](API.md)
 | GET | `/{collection}/ttl` | Get retention policy |
 | DELETE | `/{collection}/ttl` | Remove retention policy |
 
-## Bitmap Scan Accelerator *(Alpha)*
+## Bitmap Scan Accelerator
 
 The bitmap scan accelerator eliminates full-collection scans for queries on low-cardinality categorical fields (e.g., `event_type`, `severity`, `network.action`). It maintains in-memory bitmaps that map field values to document positions, enabling sub-millisecond filtered counts and aggregations at any scale — without touching a single document.
 
@@ -325,7 +325,6 @@ To add, remove, or change bitmap fields, update the `--bitmap-fields` flag and r
 
 ### Limitations
 
-- **Alpha feature** — API and behavior may change
 - Only effective for low-cardinality fields (< ~100 distinct values)
 - **Activation requires `--bitmap-fields` at startup.** Auto-detection is recommendation-only: it profiles the first N new inserts (default 10,000, `--bitmap-sample-size`) and logs a suggested `--bitmap-fields` value — it never enables bitmaps by itself, because documents inserted before detection completes would be missing from the bitmaps (the startup flag rebuilds them from storage before serving). Existing documents are not profiled
 - Bitmap scan is used for count-only queries and aggregations; document-return queries may still use index paths
@@ -412,7 +411,7 @@ WardSONDB is designed for trusted network environments. Below are security consi
 - [x] Storage info endpoint
 - [x] Query performance optimization (early termination, index-only aggregation)
 - [x] Security hardening (regex, timing attacks, resource limits, timeouts)
-- [x] Bitmap scan accelerator — sub-millisecond categorical field queries *(Alpha)*
+- [x] Bitmap scan accelerator — sub-millisecond categorical field queries
 - [x] Compound range scans — equality prefix + range suffix on compound indexes *(Alpha)*
 - [x] Bitmap planner priority — prefer bitmap over secondary index for count_only queries on bitmap-enabled fields
 - [x] Bitmap-accelerated aggregation — aggregate executor reads bitmap counts directly (zero doc reads)
