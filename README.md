@@ -28,25 +28,39 @@ A lightweight, high-performance JSON document database built in Rust. Designed f
 
 ## Performance
 
-Benchmarked at **3.45 million SIEM events** on a Mac Studio (M4 Max, 128GB RAM, 1.8TB SSD):
+### fjall backend
 
-| Query Type | Time | Docs Scanned | Strategy |
-|-----------|------|-------------|----------|
-| Bitmap aggregate: count by event_type | **0.096ms** | 0 | bitmap_aggregate |
-| Bitmap count: unindexed field (severity=6) | **0.17ms** | 0 | bitmap |
-| Bitmap NOT: event_type \u2260 firewall | **0.12ms** | 0 | bitmap |
-| Compound range: type + time \u2265 6h (851K matches) | **137ms** | 0 | compound_range |
-| Compound range: action + time \u2265 6h (32K matches) | **5.5ms** | 0 | compound_range |
-| Compound range: type + time \u2265 1h (0 matches) | **0.042ms** | 0 | compound_range |
-| Compound EQ: type + action (2.9M matches) | **485ms** | 0 | compound_eq |
-| Indexed equality + sort + limit 50 | **9.5ms** | 50 | index_sorted |
-| Indexed count (3M matches) | **432ms** | 0 | index_eq |
-| Distinct values (indexed field) | **8ms** | 0 | index_eq |
-| Get by ID | **<1ms** | \u2014 | primary |
-| Single doc insert throughput | **76,000+/sec** | \u2014 | \u2014 |
-| Bulk insert throughput | **278,000+ docs/sec** | \u2014 | \u2014 |
+Measured 2026-07-15 on the pre-merge live-test rig against **real production SIEM
+data**: 37.2 million documents in the database, queries targeting a completed
+**13.16-million-event** daily collection \u2014 HTTPS end-to-end, server-reported
+`meta.duration_ms`, **medians of 7 runs, with live ingest (~150 docs/s) running in
+the background** throughout. Hardware: AMD Ryzen 7 5800X (8C/16T), 128 GB DDR4,
+Samsung 980 PRO NVMe, Ubuntu 24.04.
 
-All numbers measured against 3.45 million production SIEM events (firewall, threat, DHCP, DNS, WiFi) on a Mac Studio M4 Max. Run `cargo bench` for reproducible synthetic benchmarks.
+| Query Type | Time | Matches | Strategy |
+|-----------|------|---------|----------|
+| Bitmap aggregate: count by event_type | **0.34ms** | 8 groups / 13.16M docs | bitmap_aggregate |
+| Bitmap count: unindexed field (severity=6) | **3.9ms** | 1.16M | bitmap |
+| Bitmap NOT: event_type \u2260 firewall | **8.9ms** | 2.35M | bitmap |
+| Bitmap AND count: type + action | **8.6ms** | 10.58M | bitmap |
+| Compound range: type + time \u2265 6h (2.65M matches) | **385ms** | 2.65M | compound_range |
+| Compound range: action + time \u2265 6h (64K matches) | **11.2ms** | 64K | compound_range |
+| Compound range: 0 matches | **1.2ms** | 0 | compound_range |
+| Indexed equality + sort + limit 50 | **0.92ms** | top-50 of 10.58M | index_sorted |
+| Compound EQ windowed page: limit 50 of 10.58M | **1.51s** | 10.58M | compound_eq (exact `total_count` = keys-only walk of all 10.58M index entries) |
+| Indexed count, non-bitmap field (6.1M matches) | **875ms** | 6.10M | index_eq (keys-only) |
+| Distinct values (indexed field, 13.16M keys) | **1.89s** | 2 values | index-only, `docs_scanned: 0` |
+| Get by ID (HTTPS round-trip) | **1.4ms** | \u2014 | primary |
+| Single insert (HTTPS, serial, one connection) | **~780/sec** (1.3ms/op) | \u2014 | \u2014 |
+| Bulk insert (HTTPS, 500/batch \u00d7 8 connections) | **~42,000 docs/sec** | \u2014 | \u2014 |
+
+Methodology note: earlier published numbers (3.45M events, Mac Studio M4 Max) were
+storage-layer microbenchmarks; this table is stricter \u2014 full HTTPS round trips on a
+larger dataset while the database ingests. Insert throughput here is end-to-end HTTP
+including TLS and JSON envelopes, not raw storage throughput. Run `cargo bench` for
+reproducible synthetic storage-layer benchmarks.
+
+*A matching RocksDB-backend table will be added after its live-test rig run.*
 
 ## Quick Start
 
