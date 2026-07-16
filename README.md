@@ -431,11 +431,12 @@ WardSONDB is designed for trusted network environments. Below are security consi
 - [x] Bitmap-accelerated aggregation — aggregate executor reads bitmap counts directly (zero doc reads)
 - [x] Cursor pagination — opaque `next_cursor` keyset tokens for gap-free walks (see API.md)
 - [x] Windowed page loads — index/bitmap scans with no residual filter/sort fetch only the requested `offset`/`limit` window
-- [ ] RSS memory optimization — investigate RocksDB/fjall mmap behaviour at scale
+- [x] RSS memory optimization — verified at scale during pre-merge live testing: multi-day Linux runs at 40M+ documents with RSS stable and cache-proportional (jemalloc global allocator + bounded block-cache/memtable budgets)
+- [x] Query explain — shipped as response metadata: every query reports `scan_strategy`, `index_used`, and `docs_scanned`; a dedicated no-execute explain endpoint remains a possible future addition
+- [x] Performance profiling on Linux — README performance table now measured on Linux (Ryzen 7 5800X) against a live production-scale rig
 - [ ] Streaming (NDJSON) — push large result sets over one response (cursors are the building block)
-- [ ] Query explain — show scan strategy and index usage
 - [ ] Schema validation — optional JSON Schema on collections
-- [ ] Performance profiling on Linux and Windows — current benchmarks are macOS only (Apple Silicon)
+- [ ] Performance profiling on Windows
 
 ## Built With
 
