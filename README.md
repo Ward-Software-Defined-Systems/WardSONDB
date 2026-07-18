@@ -4,9 +4,6 @@
 
 # WardSONDB
 
-> [!WARNING]
-> **This branch (`code-review`) is in its pre-merge validation phase.** The full behavior-change ledger is in [CHANGELOG.md](CHANGELOG.md). Status: the **fjall** backend has been live-tested against a production-scale SIEM workload — sustained ~12M docs/day ingest with TTL churn and rollup rewrites, daily collection rotation and drops (including a 12M-document drop triggering a live accelerator compaction rebuild that raced ingest and reconciled exactly), restarts under load, and repeated bitmap-vs-ground-truth equivalence sweeps at multi-million-document scale. Three wrong-result bugs surfaced by that testing (bitmap collection scoping, compound-index leading-field fallback, plan-dependent 404s) are fixed here with regression coverage. **RocksDB live testing and refreshed published benchmarks are still pending.** Deploy from `main` until this branch merges.
-
 A lightweight, high-performance JSON document database built in Rust. Designed for SIEM and security event workloads — fast ingest, indexed queries, aggregation pipelines, and automatic data retention in a single binary.
 
 ## Key Features
