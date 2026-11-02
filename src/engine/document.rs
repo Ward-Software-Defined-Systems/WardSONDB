@@ -872,14 +872,19 @@ mod tests {
         let doc = storage.get_document("c", "x").unwrap();
         assert_eq!(doc["a"], ROUNDS, "every patch of a landed");
         assert_eq!(doc["b"], ROUNDS, "every patch of b landed");
-        assert_eq!(doc["_rev"], 1 + 2 * ROUNDS, "every commit moved the revision");
+        assert_eq!(
+            doc["_rev"],
+            1 + 2 * ROUNDS,
+            "every commit moved the revision"
+        );
 
-        let (_, partition) = storage
-            .index_manager
-            .get_index_for_field("c", "a")
-            .unwrap();
+        let (_, partition) = storage.index_manager.get_index_for_field("c", "a").unwrap();
         let keys = crate::engine::backend::collect_keys(&storage.engine, &partition).unwrap();
-        assert_eq!(keys.len(), 1, "the index holds the current value and no other");
+        assert_eq!(
+            keys.len(),
+            1,
+            "the index holds the current value and no other"
+        );
         assert_eq!(
             crate::index::secondary::extract_doc_id_from_key(&keys[0]).as_deref(),
             Some("x")

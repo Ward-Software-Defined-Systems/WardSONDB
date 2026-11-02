@@ -376,10 +376,7 @@ mod tests {
         // by one holder would deadlock it against itself.
         let ids: Vec<String> = (0..WRITE_SHARDS * 2).map(|i| format!("d{i}")).collect();
         let guards = storage.lock_documents("c", ids.iter().map(String::as_str));
-        let mut indexes: Vec<usize> = ids
-            .iter()
-            .map(|id| Storage::shard_index("c", id))
-            .collect();
+        let mut indexes: Vec<usize> = ids.iter().map(|id| Storage::shard_index("c", id)).collect();
         indexes.sort_unstable();
         indexes.dedup();
         assert_eq!(guards.len(), indexes.len(), "each shard once");

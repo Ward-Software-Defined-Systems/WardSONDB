@@ -127,6 +127,9 @@ mod tests {
         });
         assert!(result.is_err());
         let mut seen = CHECK_EVERY - 1;
-        assert!(checkpoint(&mut seen).is_ok(), "an unwound scope left no token");
+        assert!(
+            checkpoint(&mut seen).is_ok(),
+            "an unwound scope left no token"
+        );
     }
 }

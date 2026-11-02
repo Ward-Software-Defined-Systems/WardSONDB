@@ -2210,13 +2210,25 @@ async fn test_ttl_policy_goes_with_its_collection() {
         .send()
         .await
         .unwrap();
-    let resp = client.get(format!("{base_url}/_stats")).send().await.unwrap();
+    let resp = client
+        .get(format!("{base_url}/_stats"))
+        .send()
+        .await
+        .unwrap();
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["data"]["ttl"]["active_policies"], 1);
 
-    let resp = client.delete(format!("{base_url}/events")).send().await.unwrap();
+    let resp = client
+        .delete(format!("{base_url}/events"))
+        .send()
+        .await
+        .unwrap();
     assert!(resp.status().is_success());
-    let resp = client.get(format!("{base_url}/_stats")).send().await.unwrap();
+    let resp = client
+        .get(format!("{base_url}/_stats"))
+        .send()
+        .await
+        .unwrap();
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["data"]["ttl"]["active_policies"], 0);
 
@@ -2226,11 +2238,14 @@ async fn test_ttl_policy_goes_with_its_collection() {
         .send()
         .await
         .unwrap();
-    let resp = client.get(format!("{base_url}/events/ttl")).send().await.unwrap();
+    let resp = client
+        .get(format!("{base_url}/events/ttl"))
+        .send()
+        .await
+        .unwrap();
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["data"]["enabled"], false);
 }
-
 
 #[tokio::test]
 async fn test_api_key_auth() {
@@ -10952,7 +10967,11 @@ async fn test_stats_and_metrics_fail_when_the_ttl_policies_cannot_be_read() {
     let (base_url, _tmp) = start_test_server_with_meta_entry(b"ttl:broken", b"not json").await;
     let client = Client::new();
 
-    let resp = client.get(format!("{base_url}/_stats")).send().await.unwrap();
+    let resp = client
+        .get(format!("{base_url}/_stats"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(resp.status(), 500);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["ok"], false);
@@ -10972,10 +10991,7 @@ async fn test_stats_and_metrics_fail_when_the_ttl_policies_cannot_be_read() {
         .unwrap();
     assert_eq!(resp.status(), 500, "a failed scan is not a gauge of zero");
     let text = resp.text().await.unwrap();
-    assert!(
-        !text.contains("wardsondb_ttl_active_policies 0"),
-        "{text}"
-    );
+    assert!(!text.contains("wardsondb_ttl_active_policies 0"), "{text}");
 }
 
 /// #25: a path parameter or a custom `_id` that carries a path separator,
@@ -11084,7 +11100,6 @@ async fn test_separators_and_control_characters_are_refused_in_ids_and_names() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 }
-
 
 /// The status code a request line written by hand gets back.
 async fn raw_status(addr: &str, request_line: &str, body: &str) -> u16 {
