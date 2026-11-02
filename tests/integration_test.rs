@@ -9592,10 +9592,11 @@ async fn test_fjall_full_scan_streamed_pages() {
     assert_eq!(body["meta"]["total_count"], 30);
 }
 
-/// Mutation match phases stream (matches-only resident) while the write
-/// stays one atomic batch: after delete_by_query, the docs AND their index
-/// entries are gone together — an indexed count over the deleted value
-/// finds zero entries without scanning.
+/// Mutation match phases stream (matches-only resident) and the writes
+/// commit in chunks of 256 under the chunk's write shards, each chunk one
+/// batch of docs AND index entries: after a delete_by_query whose matches
+/// span chunk boundaries, an indexed count over the deleted value finds
+/// zero entries without scanning, and the survivors are untouched.
 #[tokio::test]
 async fn test_delete_by_query_survivors_and_index_atomicity() {
     let (base_url, _tmp) = start_test_server().await;
@@ -9613,8 +9614,9 @@ async fn test_delete_by_query_survivors_and_index_atomicity() {
         .send()
         .await
         .unwrap();
-    let docs: Vec<Value> = (0..30)
-        .map(|i| json!({"kind": if i < 20 { "a" } else { "b" }, "n": i}))
+    // 400 matches = one full chunk of 256 and a partial second one.
+    let docs: Vec<Value> = (0..600)
+        .map(|i| json!({"kind": if i < 400 { "a" } else { "b" }, "n": i}))
         .collect();
     client
         .post(format!("{base_url}/dbq_stream/docs/_bulk"))
@@ -9623,7 +9625,7 @@ async fn test_delete_by_query_survivors_and_index_atomicity() {
         .await
         .unwrap();
 
-    // Match-heavy delete: 20 of 30 docs match.
+    // Match-heavy delete: 400 of 600 docs match, across two chunks.
     let resp: Value = client
         .post(format!("{base_url}/dbq_stream/docs/_delete_by_query"))
         .json(&json!({"filter": {"kind": "a"}}))
@@ -9633,11 +9635,11 @@ async fn test_delete_by_query_survivors_and_index_atomicity() {
         .json()
         .await
         .unwrap();
-    assert_eq!(resp["data"]["deleted"], 20);
+    assert_eq!(resp["data"]["deleted"], 400);
 
     // The index agrees instantly: zero entries for the deleted value,
     // counted keys-only (docs_scanned 0) — doc and index removal committed
-    // as one batch.
+    // together, chunk by chunk.
     let count: Value = client
         .post(format!("{base_url}/dbq_stream/query"))
         .json(&json!({"filter": {"kind": "a"}, "count_only": true}))
@@ -9661,7 +9663,7 @@ async fn test_delete_by_query_survivors_and_index_atomicity() {
         .json()
         .await
         .unwrap();
-    assert_eq!(survivors["meta"]["total_count"], 10);
+    assert_eq!(survivors["meta"]["total_count"], 200);
 
     // Match-light delete: nothing matches, nothing changes.
     let resp: Value = client
@@ -9685,7 +9687,7 @@ async fn test_delete_by_query_survivors_and_index_atomicity() {
         .json()
         .await
         .unwrap();
-    assert_eq!(resp["data"]["deleted"], 10);
+    assert_eq!(resp["data"]["deleted"], 200);
     let count: Value = client
         .post(format!("{base_url}/dbq_stream/query"))
         .json(&json!({"count_only": true}))
