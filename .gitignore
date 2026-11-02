@@ -40,3 +40,6 @@ DOCS-CLEANUP.md
 TASK-BITMAP-MEMORY-GOVERNANCE.md
 TASK-STORAGE-BACKEND-REWORK.md
 /WardSONDB-Performance-Optimization
+
+# Claude Code local settings (permission grants), as in embraOS
+.claude/
