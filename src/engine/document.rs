@@ -375,20 +375,38 @@ impl Storage {
                     .filter(|(_, _, _, _, custom)| *custom)
                     .map(|(_, id, _, _, _)| id.as_str()),
             );
-            let mut existing = Vec::new();
-            for (i, id, _, _, custom) in &to_write {
-                if !custom {
-                    continue;
-                }
-                match self.engine.get(&docs_partition, id.as_bytes()) {
-                    Ok(Some(_)) => {
-                        errors.push((*i, format!("Document {i}: document already exists: {id}")));
-                        existing.push(*i);
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        errors.push((*i, format!("Document {i}: {e}")));
-                        existing.push(*i);
+            // One multi-get for the custom ids: an id the collection holds
+            // leaves the batch with its error, as does every custom id when
+            // the read itself fails. The set keeps the retain linear — a
+            // re-sent 10,000-id batch of existing ids is the retry pattern
+            // of a client that chooses its own ids.
+            let mut existing: HashSet<usize> = HashSet::new();
+            {
+                let custom: Vec<(usize, &str)> = to_write
+                    .iter()
+                    .filter(|(_, _, _, _, custom)| *custom)
+                    .map(|(i, id, _, _, _)| (*i, id.as_str()))
+                    .collect();
+                if !custom.is_empty() {
+                    let keys: Vec<&[u8]> = custom.iter().map(|(_, id)| id.as_bytes()).collect();
+                    match self.engine.get_many(&docs_partition, &keys) {
+                        Ok(found) => {
+                            for ((i, id), value) in custom.iter().zip(found) {
+                                if value.is_some() {
+                                    errors.push((
+                                        *i,
+                                        format!("Document {i}: document already exists: {id}"),
+                                    ));
+                                    existing.insert(*i);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            for (i, _) in &custom {
+                                errors.push((*i, format!("Document {i}: {e}")));
+                                existing.insert(*i);
+                            }
+                        }
                     }
                 }
             }
