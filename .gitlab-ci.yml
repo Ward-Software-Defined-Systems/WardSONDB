@@ -164,9 +164,15 @@ release-smoke:
     - |
       set -eu
       B=target/release/wardsondb
+      # On any failure below, the trace must tell the story: tools, the
+      # server's own output, the listener table.
+      trap 'echo "=== smoke failed; diagnostics ==="; for f in /tmp/smoke-*/out /tmp/smoke-*/w.log; do [ -f "$f" ] && { echo "--- $f"; tail -40 "$f"; }; done; echo "--- /proc/net/tcp"; head -20 /proc/net/tcp' ERR
+      echo "tools: $(nm --version | head -1) | $(curl --version | head -1) | $(openssl version)"
       # F4: unprefixed malloc/free exported = jemalloc owns the C heap too.
+      echo "malloc/free symbols: $(nm "$B" | grep -cE ' T (malloc|free)$')"
       nm "$B" | grep -qE ' T (malloc|free)$' || { echo "jemalloc override missing (rust-rocksdb's jemalloc feature)" >&2; exit 1; }
       "$B" --help | grep -q -- '--bind'
+      "$B" --version
     - |
       set -eu
       B=target/release/wardsondb; J='Content-Type: application/json'
@@ -174,6 +180,7 @@ release-smoke:
       "$B" --storage-engine fjall --data-dir /tmp/smoke-bind --bind 127.0.0.1 --port 18090 --log-file /tmp/smoke-bind/w.log > /tmp/smoke-bind/out 2>&1 &
       P=$!
       for _ in $(seq 1 120); do curl -sf http://127.0.0.1:18090/_health >/dev/null 2>&1 && break; sleep 0.5; done
+      echo "fjall health: $(curl -s http://127.0.0.1:18090/_health || echo '(no answer)')"
       curl -sf http://127.0.0.1:18090/_health | grep -q '"healthy"'
       # Bound to loopback only: /proc/net/tcp lists 127.0.0.1 (0100007F) for
       # the port and not 0.0.0.0.
@@ -193,7 +200,9 @@ release-smoke:
       "$B" --storage-engine rocksdb --data-dir /tmp/smoke-tls --bind 127.0.0.1 --port 18443 --tls --log-file /tmp/smoke-tls/w.log > /tmp/smoke-tls/out 2>&1 &
       P=$!
       for _ in $(seq 1 120); do curl -skf https://127.0.0.1:18443/_health >/dev/null 2>&1 && break; sleep 0.5; done
+      echo "tls health: $(curl -sk https://127.0.0.1:18443/_health || echo '(no answer)')"
       curl -skf https://127.0.0.1:18443/_health | grep -q '"healthy"'
+      openssl x509 -in /tmp/smoke-tls/tls/cert.pem -noout -enddate
       curl -skv https://127.0.0.1:18443/_health 2>&1 | grep -q 'TLSv1.3'
       # Dated from generation (52bc0e0): still valid in 360 days, expired in 370.
       openssl x509 -in /tmp/smoke-tls/tls/cert.pem -noout -checkend $((360 * 86400))
