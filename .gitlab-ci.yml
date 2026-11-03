@@ -1,0 +1,201 @@
+# WardSONDB CI — the local gate, run on every push and merge request on the
+# self-hosted runner (the one embraOS uses: docker executor, untagged jobs).
+#
+# Modelled on embraOS's .gitlab-ci.yml (2026-11-02): the same
+# rust:<toolchain>-bookworm image, the same CARGO_HOME-in-project cache
+# layout, the same toolchain-pin guard. Scope: the gate CLAUDE.md names (fmt,
+# clippy -D warnings with --all-targets on the default build and on each
+# single-engine build, cargo test), the seven storage lock pins (on-disk
+# format), the RustSec audit, and a release build whose binary is smoked over
+# --bind and --tls. The benches compile under --all-targets but never run
+# here — timings on a shared runner mean nothing; the guard benches are a
+# dev-box ritual (CLAUDE.md, the deferred log).
+#
+# The toolchain is pinned HERE only. There is deliberately no
+# rust-toolchain.toml: the dev box runs whatever stable rustup gives it and CI
+# is the fixed point. Bump RUST_TOOLCHAIN deliberately, after running the
+# clippy ratchet on the new compiler locally — a new compiler brings new
+# lints, and -D warnings makes every one of them a failure.
+
+stages: [build, test]
+
+variables:
+  CARGO_TERM_COLOR: "always"
+  RUST_TOOLCHAIN: "1.98.1"
+  # The RustSec audit tool the `audit` job installs; bump deliberately.
+  CARGO_AUDIT_VERSION: "0.22.2"
+  # GitLab only caches paths inside the project dir, so cargo's home moves here.
+  CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+
+default:
+  image: "rust:${RUST_TOOLCHAIN}-bookworm"
+  interruptible: true
+  before_script:
+    # CARGO_HOME moved, but the image's PATH still points at its own
+    # /usr/local/cargo/bin — anything `cargo install` puts in the new
+    # CARGO_HOME/bin is invisible without this.
+    - export PATH="${CARGO_HOME}/bin:${PATH}"
+    # The pin is the contract: an image that isn't the pinned toolchain must
+    # fail here, not silently validate a different compiler.
+    - test "$(rustc --version | cut -d' ' -f2)" = "$RUST_TOOLCHAIN" ||
+      { echo "rustc $(rustc --version) does not match RUST_TOOLCHAIN=$RUST_TOOLCHAIN" >&2; exit 1; }
+
+workflow:
+  auto_cancel:
+    on_new_commit: interruptible
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "web"
+
+# The seven pins carry the on-disk format of every existing data directory
+# (fjall's and RocksDB's formats, the bitmap snapshots' roaring encoding, the
+# allocator). Every dependency pass so far moved everything else and left
+# these where they are; a casual `cargo update` that moves one must fail
+# loudly here — moving one is a migration decision (deferred log S8-1/S8-2),
+# not routine maintenance. The same check embraOS runs over its vendored copy.
+lock-pins:
+  stage: build
+  timeout: 10m
+  # Pure text checks over Cargo.lock — no toolchain needed, so skip the pin guard.
+  image: alpine:3.22
+  before_script: []
+  script:
+    - |
+      set -eu
+      check() {
+        name="$1"; want="$2"
+        n=$(grep -c "^name = \"$name\"\$" Cargo.lock || true)
+        if [ "$n" != "1" ]; then
+          echo "ERROR: $name: expected exactly 1 lock entry, found $n" >&2
+          return 1
+        fi
+        if ! grep -A1 "^name = \"$name\"\$" Cargo.lock | grep -q "^version = \"$want\"\$"; then
+          got=$(grep -A1 "^name = \"$name\"\$" Cargo.lock | grep '^version' || true)
+          echo "ERROR: $name pin drift: $got (expected \"$want\")" >&2
+          return 1
+        fi
+        echo "ok: $name $want"
+      }
+      fail=0
+      check fjall               2.11.2         || fail=1
+      check lsm-tree            2.10.4         || fail=1
+      check value-log           1.9.0          || fail=1
+      check rust-rocksdb        0.46.0         || fail=1
+      check rust-librocksdb-sys 0.42.0+10.10.1 || fail=1
+      check roaring             0.10.12        || fail=1
+      check tikv-jemallocator   0.6.1          || fail=1
+      exit $fail
+
+# RustSec advisories over Cargo.lock. REPORT-ONLY for now (allow_failure):
+# the lock carries 14 advisories published since July 2026 on crates the
+# engine never calls directly (rustls 0.23.41, h2, the never-built quinn
+# closure, …) — deferred log S10-1, a `cargo update` decision. When that
+# lands, delete `allow_failure` so a new advisory fails the pipeline. An
+# advisory deliberately left in place goes on the ignore list below, one id
+# per line with its reason, and the line goes when its bump lands.
+audit:
+  stage: build
+  timeout: 20m
+  allow_failure: true
+  cache:
+    - key: "audit-cargo-$CI_COMMIT_REF_SLUG"
+      paths: [.cargo/bin/, .cargo/registry/index/, .cargo/registry/cache/, .cargo/advisory-db/]
+  script:
+    - |
+      if ! cargo audit --version 2>/dev/null | grep -q "cargo-audit-audit ${CARGO_AUDIT_VERSION}\$"; then
+        cargo install cargo-audit --locked --version "${CARGO_AUDIT_VERSION}" --force
+      fi
+      cargo audit --version
+    - |
+      set -eu
+      # An id deliberately left in place goes here as one line,
+      #   ignore="$ignore --ignore RUSTSEC-YYYY-NNNN"   # <crate> <version>: <defect>; fix >=<version>
+      ignore=""
+      # shellcheck disable=SC2086
+      cargo audit $ignore
+
+# The gate from CLAUDE.md, verbatim, plus the single-engine clippy runs: every
+# variant of the engine enums is feature-gated, and a build with one engine
+# must keep compiling (an irrefutable let-else there is a warning, and
+# warnings are errors).
+gate:
+  stage: test
+  timeout: 60m
+  cache:
+    - key: "gate-cargo-$CI_COMMIT_REF_SLUG"
+      paths: [.cargo/registry/index/, .cargo/registry/cache/, .cargo/git/db/]
+    - key:
+        files: [Cargo.lock]
+        prefix: "gate-target-$RUST_TOOLCHAIN"
+      paths: [target/]
+  script:
+    # libclang for bindgen (rust-librocksdb-sys, zstd-sys). For the host
+    # target clang's builtin headers resolve through GCC's include dir, so the
+    # `clang` package itself is not needed here (it is for musl cross builds —
+    # see embraOS's pipeline).
+    - apt-get update && apt-get install -y --no-install-recommends libclang-dev
+    - rustup component add rustfmt clippy
+    - cargo fmt --check
+    - cargo clippy --all-targets --locked -- -D warnings
+    - cargo clippy --all-targets --locked --no-default-features --features fjall -- -D warnings
+    - cargo clippy --all-targets --locked --no-default-features --features rocksdb -- -D warnings
+    - cargo test --locked
+
+# The release profile is what ships, so its binary is smoked the way the
+# pre-merge checklist smokes it: the jemalloc override that routes RocksDB's
+# C++ allocations (F4 — without it RSS ratchets ~40 GB/day), --bind on
+# loopback, a refused path segment, a custom-id conflict, a by-query delete,
+# and the --tls listener with its generated certificate (the a4d6938 lesson:
+# a TLS smoke is only as good as the build that produced the binary).
+release-smoke:
+  stage: test
+  timeout: 60m
+  cache:
+    - key: "release-cargo-$CI_COMMIT_REF_SLUG"
+      paths: [.cargo/registry/index/, .cargo/registry/cache/, .cargo/git/db/]
+    - key:
+        files: [Cargo.lock]
+        prefix: "release-target-$RUST_TOOLCHAIN"
+      paths: [target/]
+  script:
+    - apt-get update && apt-get install -y --no-install-recommends libclang-dev openssl
+    - cargo build --release --locked
+    - |
+      set -eu
+      B=target/release/wardsondb
+      # F4: unprefixed malloc/free exported = jemalloc owns the C heap too.
+      nm "$B" | grep -qE ' T (malloc|free)$' || { echo "jemalloc override missing (rust-rocksdb's jemalloc feature)" >&2; exit 1; }
+      "$B" --help | grep -q -- '--bind'
+    - |
+      set -eu
+      B=target/release/wardsondb; J='Content-Type: application/json'
+      mkdir -p /tmp/smoke-bind
+      "$B" --storage-engine fjall --data-dir /tmp/smoke-bind --bind 127.0.0.1 --port 18090 --log-file /tmp/smoke-bind/w.log > /tmp/smoke-bind/out 2>&1 &
+      P=$!
+      for _ in $(seq 1 120); do curl -sf http://127.0.0.1:18090/_health >/dev/null 2>&1 && break; sleep 0.5; done
+      curl -sf http://127.0.0.1:18090/_health | grep -q '"healthy"'
+      # Bound to loopback only: /proc/net/tcp lists 127.0.0.1 (0100007F) for
+      # the port and not 0.0.0.0.
+      hex=$(printf '%04X' 18090)
+      grep -qi "0100007F:$hex" /proc/net/tcp
+      ! grep -qi "00000000:$hex" /proc/net/tcp
+      curl -s -X POST http://127.0.0.1:18090/_collections -H "$J" -d '{"name":"smoke"}' >/dev/null
+      test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:18090/smoke/docs/a%2Fb)" = 400
+      test "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18090/smoke/docs -H "$J" -d '{"_id":"one","k":1}')" = 201
+      test "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18090/smoke/docs -H "$J" -d '{"_id":"one","k":1}')" = 409
+      curl -sf -X POST http://127.0.0.1:18090/smoke/docs/_delete_by_query -H "$J" -d '{"filter":{"k":1}}' | grep -q '"deleted":1'
+      kill "$P"; wait "$P" || true
+    - |
+      set -eu
+      B=target/release/wardsondb
+      mkdir -p /tmp/smoke-tls
+      "$B" --storage-engine rocksdb --data-dir /tmp/smoke-tls --bind 127.0.0.1 --port 18443 --tls --log-file /tmp/smoke-tls/w.log > /tmp/smoke-tls/out 2>&1 &
+      P=$!
+      for _ in $(seq 1 120); do curl -skf https://127.0.0.1:18443/_health >/dev/null 2>&1 && break; sleep 0.5; done
+      curl -skf https://127.0.0.1:18443/_health | grep -q '"healthy"'
+      curl -skv https://127.0.0.1:18443/_health 2>&1 | grep -q 'TLSv1.3'
+      # Dated from generation (52bc0e0): still valid in 360 days, expired in 370.
+      openssl x509 -in /tmp/smoke-tls/tls/cert.pem -noout -checkend $((360 * 86400))
+      ! openssl x509 -in /tmp/smoke-tls/tls/cert.pem -noout -checkend $((370 * 86400))
+      kill "$P"; wait "$P" || true
