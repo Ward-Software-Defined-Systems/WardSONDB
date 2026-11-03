@@ -87,17 +87,16 @@ lock-pins:
       check tikv-jemallocator   0.6.1          || fail=1
       exit $fail
 
-# RustSec advisories over Cargo.lock. REPORT-ONLY for now (allow_failure):
-# the lock carries 14 advisories published since July 2026 on crates the
-# engine never calls directly (rustls 0.23.41, h2, the never-built quinn
-# closure, …) — deferred log S10-1, a `cargo update` decision. When that
-# lands, delete `allow_failure` so a new advisory fails the pipeline. An
-# advisory deliberately left in place goes on the ignore list below, one id
-# per line with its reason, and the line goes when its bump lands.
+# RustSec advisories over Cargo.lock. A vulnerability fails the pipeline
+# (report-only between a245d6b and the cargo update of 2026-11-02 that
+# cleared the 14 post-July advisories — deferred log S10-1). An advisory
+# deliberately left in place goes on the ignore list below, one id per line
+# with its reason, and the line goes when its bump lands. A fix that would
+# move one of the seven storage pins is a migration decision, not a bump:
+# it goes on the list and the pin stays (lock-pins enforces that).
 audit:
   stage: build
   timeout: 20m
-  allow_failure: true
   cache:
     - key: "audit-cargo-$CI_COMMIT_REF_SLUG"
       paths: [.cargo/bin/, .cargo/registry/index/, .cargo/registry/cache/, .cargo/advisory-db/]
