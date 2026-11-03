@@ -223,6 +223,19 @@ Behavior changes an existing client could observe, most significant first.
 
 ### Security
 
+- **Dependency refresh clearing the 14 RustSec advisories published since the
+  July audit** (none in code the engine calls directly): `rustls` 0.23.41 →
+  0.23.46 (4 advisories; the `--tls` path), `rustls-webpki` 0.103.13 →
+  0.103.16 and `webpki-roots` 1.0.7 → 1.0.11 (distrusted intermediates),
+  `h2` 0.4.15 → 0.4.20, `libz-sys` 1.1.29 → 1.1.31, `zstd-sys` 2.0.16 →
+  2.1.2 (same bundled zstd 1.5.7), `quinn-proto` 0.11.16 → 0.11.19 (5; in a
+  never-built closure), plus ~120 semver-compatible minors (`aws-lc-rs` 1.19
+  / `aws-lc-sys` 0.47 under rustls among them). The seven storage-engine
+  pins — fjall 2.11.2, lsm-tree 2.10.4, value-log 1.9.0, rust-rocksdb
+  0.46.0, rust-librocksdb-sys 0.42.0+10.10.1, roaring 0.10.12,
+  tikv-jemallocator 0.6.1 — did not move, so on-disk formats are untouched.
+  `cargo audit`: 0 vulnerabilities across 305 crates. The CI `audit` job
+  fails the pipeline again from here on.
 - **axum-server 0.7 → 0.8** drops `rustls-pemfile` (RUSTSEC-2025-0134,
   unmaintained) from the dependency tree; TLS configuration and the two
   calls the server makes are unchanged.
